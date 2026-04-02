@@ -212,3 +212,32 @@ def test_pty_mode_exposes_terminal_semantics(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert result.stdout.strip() == "True"
     assert result.stderr == ""
+
+
+def test_pty_timeout_preserves_termination_output(tmp_path: Path) -> None:
+    runtime, _workspace_root = _runtime(tmp_path)
+    request = _python_request(
+        """
+        import signal
+        import time
+
+        def handle_term(_signum, _frame):
+            print("terminated", flush=True)
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, handle_term)
+        print("started", flush=True)
+        time.sleep(30)
+        """,
+        mode=ExecutionMode.PTY,
+        timeout_seconds=1,
+    )
+
+    with pytest.raises(ShellExecutionTimeout) as exc_info:
+        runtime.execute(request)
+
+    result = exc_info.value.result
+    assert result is not None
+    assert result.timed_out is True
+    assert "started" in result.stdout
+    assert "terminated" in result.stdout

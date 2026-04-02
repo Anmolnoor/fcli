@@ -18,7 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, PositiveInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator
 
 logger = logging.getLogger("foundation.services.shell")
 
@@ -48,6 +48,8 @@ class ShellOutputEvent(BaseModel):
 
 class ShellCommandRequest(BaseModel):
     """A normalized shell command execution request."""
+
+    model_config = ConfigDict(extra="forbid")
 
     command: str = Field(min_length=1)
     args: list[str] = Field(default_factory=list)
@@ -558,7 +560,14 @@ class ShellRuntime:
 
         try:
             while True:
-                self._raise_for_pty_timeout(prepared, started_at, process, capture)
+                self._raise_for_pty_timeout(
+                    prepared,
+                    started_at,
+                    process,
+                    master_fd,
+                    capture,
+                    on_event,
+                )
                 if process.poll() is not None and not self._pty_has_data(master_fd):
                     break
 
@@ -582,8 +591,7 @@ class ShellRuntime:
                 if on_event is not None:
                     on_event(ShellOutputEvent(stream=OutputStream.PTY, text=text))
         except KeyboardInterrupt as exc:
-            self._terminate_sync_process(process)
-            self._drain_pty(master_fd, capture, on_event)
+            self._terminate_pty_process(process, master_fd, capture, on_event)
             result = self._build_result(
                 prepared,
                 duration_seconds=time.monotonic() - started_at,
@@ -663,11 +671,13 @@ class ShellRuntime:
         prepared: _PreparedCommand,
         started_at: float,
         process: subprocess.Popen[bytes],
+        master_fd: int,
         capture: _TextCapture,
+        on_event: OutputCallback | None,
     ) -> None:
         if time.monotonic() - started_at <= prepared.timeout_seconds:
             return
-        self._terminate_sync_process(process)
+        self._terminate_pty_process(process, master_fd, capture, on_event)
         result = self._build_result(
             prepared,
             duration_seconds=time.monotonic() - started_at,
@@ -703,15 +713,96 @@ class ShellRuntime:
         master_fd: int,
         capture: _TextCapture,
         on_event: OutputCallback | None,
+        *,
+        settle_timeout_seconds: float = 0.0,
     ) -> None:
-        while self._pty_has_data(master_fd):
+        last_activity = time.monotonic()
+        while True:
+            if settle_timeout_seconds > 0:
+                quiet_period = time.monotonic() - last_activity
+                timeout = max(0.0, min(0.05, settle_timeout_seconds - quiet_period))
+                if timeout == 0.0 and not self._pty_has_data(master_fd):
+                    return
+                ready, _, _ = select.select([master_fd], [], [], timeout)
+                if not ready:
+                    if time.monotonic() - last_activity >= settle_timeout_seconds:
+                        return
+                    continue
+            elif not self._pty_has_data(master_fd):
+                return
+
             data = self._read_pty_chunk(master_fd)
             if not data:
+                if settle_timeout_seconds == 0 or (
+                    time.monotonic() - last_activity >= settle_timeout_seconds
+                ):
+                    return
+                continue
+            self._record_pty_output(data, capture, on_event)
+            last_activity = time.monotonic()
+
+    def _terminate_pty_process(
+        self,
+        process: subprocess.Popen[bytes],
+        master_fd: int,
+        capture: _TextCapture,
+        on_event: OutputCallback | None,
+    ) -> None:
+        if process.poll() is None:
+            self._signal_process_group(process.pid, signal.SIGTERM)
+            deadline = time.monotonic() + self._termination_grace_seconds
+            self._pump_pty_until(process, master_fd, capture, on_event, deadline=deadline)
+            if process.poll() is None:
+                self._signal_process_group(process.pid, signal.SIGKILL)
+                self._pump_pty_until(
+                    process,
+                    master_fd,
+                    capture,
+                    on_event,
+                    deadline=time.monotonic() + 0.1,
+                )
+                process.wait()
+
+        self._drain_pty(
+            master_fd,
+            capture,
+            on_event,
+            settle_timeout_seconds=min(0.1, self._termination_grace_seconds),
+        )
+
+    def _pump_pty_until(
+        self,
+        process: subprocess.Popen[bytes],
+        master_fd: int,
+        capture: _TextCapture,
+        on_event: OutputCallback | None,
+        *,
+        deadline: float,
+    ) -> None:
+        while time.monotonic() < deadline:
+            if process.poll() is not None and not self._pty_has_data(master_fd):
                 return
-            text = data.decode("utf-8", errors="replace")
-            capture.append(text)
-            if on_event is not None:
-                on_event(ShellOutputEvent(stream=OutputStream.PTY, text=text))
+            timeout = min(0.05, max(0.0, deadline - time.monotonic()))
+            ready, _, _ = select.select([master_fd], [], [], timeout)
+            if not ready:
+                continue
+            data = self._read_pty_chunk(master_fd)
+            if not data:
+                if process.poll() is not None:
+                    return
+                continue
+            self._record_pty_output(data, capture, on_event)
+
+    def _record_pty_output(
+        self,
+        data: bytes,
+        capture: _TextCapture,
+        on_event: OutputCallback | None,
+    ) -> None:
+        text = data.decode("utf-8", errors="replace")
+        capture.append(text)
+        if on_event is not None:
+            on_event(ShellOutputEvent(stream=OutputStream.PTY, text=text))
 
     def _read_pty_chunk(self, master_fd: int) -> bytes:
         try:

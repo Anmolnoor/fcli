@@ -1,5 +1,20 @@
 """Service-layer package for Foundation CLI."""
 
+from foundation.services.approval import ApprovalPrompt, ApprovalService
+from foundation.services.guardrails import GuardrailPolicyEngine, SimplePolicyEngine
+from foundation.services.history import HistoryStore
+from foundation.services.orchestrator import (
+    OrchestrationError,
+    OrchestrationPlanError,
+    RequestOrchestrator,
+)
+from foundation.services.provider import (
+    OpenAIResponsesAdapter,
+    ProviderAdapter,
+    ProviderError,
+    ProviderErrorCode,
+    build_provider_adapter,
+)
 from foundation.services.shell import (
     ExecutionMode,
     OutputStream,
@@ -12,10 +27,60 @@ from foundation.services.shell import (
     ShellOutputEvent,
     ShellRuntime,
 )
+from foundation.services.staging import WorkspaceRewriteStager
+from foundation.services.tools import (
+    FileDiscoveryRequest,
+    FileDiscoveryResult,
+    FileDiscoveryType,
+    GitCommitSummary,
+    GitContextRequest,
+    GitContextResult,
+    GitDiffStat,
+    GitStatusEntry,
+    HelpLookupRequest,
+    HelpLookupResult,
+    HelpLookupSource,
+    LocalToolService,
+    SearchMatch,
+    SearchRequest,
+    SearchResult,
+    ToolAvailabilityStatus,
+    ToolBinaryStatus,
+    ToolError,
+    ToolErrorCode,
+    ToolExecutionError,
+    WorkspacePathFilter,
+)
 
 __all__ = [
+    "ApprovalPrompt",
+    "ApprovalService",
     "ExecutionMode",
+    "FileDiscoveryRequest",
+    "FileDiscoveryResult",
+    "FileDiscoveryType",
+    "GitCommitSummary",
+    "GuardrailPolicyEngine",
+    "GitContextRequest",
+    "GitContextResult",
+    "GitDiffStat",
+    "GitStatusEntry",
+    "HelpLookupRequest",
+    "HelpLookupResult",
+    "HelpLookupSource",
+    "HistoryStore",
+    "LocalToolService",
+    "OpenAIResponsesAdapter",
+    "OrchestrationError",
+    "OrchestrationPlanError",
     "OutputStream",
+    "ProviderAdapter",
+    "ProviderError",
+    "ProviderErrorCode",
+    "RequestOrchestrator",
+    "SearchMatch",
+    "SearchRequest",
+    "SearchResult",
     "ShellCommandRequest",
     "ShellCommandResult",
     "ShellExecutionCancelled",
@@ -24,4 +89,13 @@ __all__ = [
     "ShellExecutionTimeout",
     "ShellOutputEvent",
     "ShellRuntime",
+    "SimplePolicyEngine",
+    "ToolAvailabilityStatus",
+    "ToolBinaryStatus",
+    "ToolError",
+    "ToolErrorCode",
+    "ToolExecutionError",
+    "WorkspaceRewriteStager",
+    "WorkspacePathFilter",
+    "build_provider_adapter",
 ]

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,15 @@ from keyring.errors import NoKeyringError
 from typer.testing import CliRunner
 
 from foundation.cli import app
+from foundation.models import (
+    AssistantMessage,
+    AssistantPlan,
+    ContextSnapshot,
+    OrchestrationResult,
+    OrchestrationSummary,
+    ProviderResponseMetadata,
+    UserRequest,
+)
 
 runner = CliRunner()
 
@@ -41,6 +52,54 @@ def _write_stage_2_config(tmp_path: Path) -> Path:
     return config_path
 
 
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(
+        f"#!{sys.executable}\n{textwrap.dedent(content)}",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _tool_env(tmp_path: Path, scripts: dict[str, str]) -> dict[str, str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name, script in scripts.items():
+        _write_executable(bin_dir / name, script)
+    return {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+
+
+def _chat_result(message: str) -> OrchestrationResult:
+    return OrchestrationResult(
+        request=UserRequest(message=message),
+        context=ContextSnapshot(
+            workspace_root="/tmp/workspace",
+            request_cwd="/tmp/workspace",
+            approval_mode="prompt",
+            available_tools=["git", "rg"],
+        ),
+        plan=AssistantPlan(
+            assistant_message="I will inspect the repository state.",
+            actions=[],
+        ),
+        planning_metadata=ProviderResponseMetadata(
+            provider="stub",
+            model="stub-model",
+            latency_seconds=0.01,
+        ),
+        policy_decisions=[],
+        execution_results=[],
+        assistant_message=AssistantMessage(content="I will inspect the repository state."),
+        summary=OrchestrationSummary(
+            executed_actions=0,
+            pending_approval_actions=0,
+            blocked_actions=0,
+            failed_actions=0,
+            skipped_actions=0,
+            text="No actions were needed for this request.",
+        ),
+    )
+
+
 def test_cli_help_displays_core_commands() -> None:
     result = runner.invoke(app, ["--help"])
 
@@ -49,6 +108,7 @@ def test_cli_help_displays_core_commands() -> None:
     assert "run" in result.stdout
     assert "chat" in result.stdout
     assert "config" in result.stdout
+    assert "tools" in result.stdout
     assert "history" in result.stdout
     assert "doctor" in result.stdout
 
@@ -187,3 +247,147 @@ def test_run_rejects_out_of_workspace_cwd(
 
     assert result.exit_code == 2
     assert "workspace root" in result.stdout
+
+
+def test_tools_search_emits_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    env = _tool_env(
+        tmp_path,
+        {
+            "rg": """
+                import json
+
+                payload = {
+                    "type": "match",
+                    "data": {
+                        "path": {"text": "src/example.py"},
+                        "lines": {"text": "print('stage4')\\n"},
+                        "line_number": 3,
+                        "submatches": [{"start": 7, "end": 13}],
+                    },
+                }
+                print(json.dumps(payload))
+            """,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "tools", "search", "stage4", "--json"],
+        env=env,
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["matches"][0]["path"] == "src/example.py"
+    assert payload["matches"][0]["line_number"] == 3
+
+
+def test_chat_emits_json_for_one_shot_orchestration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    class StubOrchestrator:
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            return _chat_result(request.message)
+
+    monkeypatch.setattr("foundation.cli._build_orchestrator", lambda _settings: StubOrchestrator())
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "chat",
+            "--json",
+            "summarize",
+            "git",
+            "status",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["request"]["message"] == "summarize git status"
+    assert payload["assistant_message"]["content"] == "I will inspect the repository state."
+
+
+def test_history_lists_audited_run_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    run_result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "run",
+            "--mode",
+            "buffered",
+            "--",
+            sys.executable,
+            "-c",
+            "print('history-run')",
+        ],
+    )
+    assert run_result.exit_code == 0
+
+    history_result = runner.invoke(
+        app,
+        ["--config", str(config_path), "history", "--json"],
+    )
+
+    assert history_result.exit_code == 0
+    payload = json.loads(history_result.stdout)
+    assert payload[0]["kind"] == "run"
+    assert "python" in payload[0]["command_preview"]
+
+
+def test_history_can_render_session_detail_as_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    run_result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "run",
+            "--mode",
+            "buffered",
+            "--",
+            sys.executable,
+            "-c",
+            "print('detail-run')",
+        ],
+    )
+    assert run_result.exit_code == 0
+
+    history_result = runner.invoke(
+        app,
+        ["--config", str(config_path), "history", "--json"],
+    )
+    session_id = json.loads(history_result.stdout)[0]["session_id"]
+
+    detail_result = runner.invoke(
+        app,
+        ["--config", str(config_path), "history", "--session", session_id, "--json"],
+    )
+
+    assert detail_result.exit_code == 0
+    payload = json.loads(detail_result.stdout)
+    assert payload["session_id"] == session_id
+    assert payload["commands"][0]["source"] == "cli.run"

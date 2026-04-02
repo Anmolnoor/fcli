@@ -1,4 +1,4 @@
-"""Doctor checks for Stage 2 environment and config readiness."""
+"""Doctor checks for Foundation CLI environment and config readiness."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from foundation.services import LocalToolService, ToolAvailabilityStatus
 from foundation.settings import (
     AppSettings,
     SecretResolutionStatus,
@@ -175,13 +176,70 @@ def _secret_lookup_check(
     )
 
 
+def _external_tools_check(
+    settings: AppSettings,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> DoctorCheck:
+    service = LocalToolService(
+        workspace_root=settings.workspace_root,
+        default_timeout_seconds=min(settings.shell.default_timeout_seconds, 30),
+        capture_limit_kb=settings.shell.capture_limit_kb,
+        environment=environment,
+    )
+    availability = service.availability_report()
+
+    missing_required = [
+        item
+        for item in availability
+        if item.required and item.status is not ToolAvailabilityStatus.AVAILABLE
+    ]
+    missing_optional = [
+        item
+        for item in availability
+        if not item.required and item.status is not ToolAvailabilityStatus.AVAILABLE
+    ]
+
+    detail_lines = []
+    for item in availability:
+        state = "available" if item.status is ToolAvailabilityStatus.AVAILABLE else "missing"
+        resolved = f" ({item.resolved_command}: {item.path})" if item.path is not None else ""
+        line = f"{item.name}: {state}{resolved}"
+        if item.status is not ToolAvailabilityStatus.AVAILABLE and item.install_hint:
+            line = f"{line} | {item.install_hint}"
+        detail_lines.append(line)
+
+    if missing_required:
+        return DoctorCheck(
+            name="External tools",
+            status=DoctorStatus.FAIL,
+            summary="Required Stage 4 tool binaries are missing.",
+            detail="\n".join(detail_lines),
+        )
+
+    if missing_optional:
+        return DoctorCheck(
+            name="External tools",
+            status=DoctorStatus.WARN,
+            summary="Some optional Stage 4 tool binaries are missing.",
+            detail="\n".join(detail_lines),
+        )
+
+    return DoctorCheck(
+        name="External tools",
+        status=DoctorStatus.PASS,
+        summary="All configured Stage 4 tool binaries are available.",
+        detail="\n".join(detail_lines),
+    )
+
+
 def run_doctor(
     config_path: Path | None = None,
     *,
     overrides: Mapping[str, Any] | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> DoctorReport:
-    """Run the Stage 2 doctor checks."""
+    """Run the current Foundation CLI doctor checks."""
     checks = [_python_version_check()]
 
     try:
@@ -200,4 +258,5 @@ def run_doctor(
     checks.append(_config_check(settings))
     checks.append(_required_directories_check(settings))
     checks.append(_secret_lookup_check(settings, environment=environment))
+    checks.append(_external_tools_check(settings, environment=environment))
     return DoctorReport(checks=checks)

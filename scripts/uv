@@ -13,4 +13,10 @@ fi
 export UV_CACHE_DIR="${ROOT_DIR}/.uv-cache"
 mkdir -p "${UV_CACHE_DIR}"
 
+if [[ "${1:-}" == "run" && "${FOUNDATION_UV_RUN_SYNC:-0}" != "1" && -z "${UV_NO_SYNC:-}" ]]; then
+  # Keep repeated verification commands offline-friendly. Use `uv sync` or
+  # set FOUNDATION_UV_RUN_SYNC=1 when you intentionally want a fresh sync.
+  export UV_NO_SYNC=1
+fi
+
 exec "${UV_BIN}" "$@"
