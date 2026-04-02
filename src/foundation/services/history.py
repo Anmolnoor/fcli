@@ -262,10 +262,12 @@ class HistoryStore:
                     created_at,
                 ),
             )
+        actions = plan.get("actions")
+        action_count = len(actions) if isinstance(actions, list) else 0
         self.record_event(
             session_id,
             "plan_recorded",
-            {"assistant_message": assistant_message, "action_count": len(plan.get("actions", []))},
+            {"assistant_message": assistant_message, "action_count": action_count},
         )
 
     def record_tool_call(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
+from typing import TypedDict
 
 from foundation.models import (
     ActionKind,
@@ -53,6 +54,17 @@ _UNSAFE_GIT_OPTIONS = {
     "--work-tree",
 }
 _RECURSIVE_FLAGS = {"-R", "-r", "--recursive"}
+
+
+class PathClassification(TypedDict):
+    paths: list[str]
+    risk_categories: list[str]
+
+
+class GitClassification(TypedDict):
+    decision: PolicyDecisionType
+    reason: str
+    risk_categories: list[str]
 
 
 class GuardrailPolicyEngine:
@@ -179,7 +191,7 @@ class GuardrailPolicyEngine:
             return None
         return resolved
 
-    def _classify_paths(self, shell: ShellAction, *, base_cwd: Path) -> dict[str, list[str]]:
+    def _classify_paths(self, shell: ShellAction, *, base_cwd: Path) -> PathClassification:
         risk_categories: list[str] = []
         paths: list[str] = []
         for raw_path in self._candidate_paths(shell):
@@ -277,7 +289,7 @@ class GuardrailPolicyEngine:
             )
         return False
 
-    def _classify_git(self, args: list[str]) -> dict[str, object]:
+    def _classify_git(self, args: list[str]) -> GitClassification:
         if not args:
             return {
                 "decision": PolicyDecisionType.REQUIRE_APPROVAL,
