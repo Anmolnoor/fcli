@@ -14,6 +14,7 @@ from foundation.models import (
     ProviderPrompt,
     ProviderResponse,
     ProviderResponseMetadata,
+    SessionStatus,
     UserRequest,
 )
 from foundation.services import ApprovalService, HistoryStore, LocalToolService, ShellRuntime
@@ -86,6 +87,7 @@ def _orchestrator(
     scripts: dict[str, str] | None = None,
     approval_service: ApprovalService | None = None,
     history_store: HistoryStore | None = None,
+    shell_output_callback: Any | None = None,
 ) -> tuple[RequestOrchestrator, CountingShellRuntime, Path]:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -105,6 +107,7 @@ def _orchestrator(
         tool_service=tool_service,
         approval_service=approval_service,
         history_store=history_store,
+        shell_output_callback=shell_output_callback,
     )
     return orchestrator, runtime, workspace_root
 
@@ -398,6 +401,45 @@ def test_orchestrator_executes_risky_shell_commands_after_prompt_approval(
     assert (workspace_root / "approved.txt").exists()
 
 
+def test_orchestrator_streams_shell_output_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Streaming the current directory.",
+                    "actions": [
+                        {
+                            "id": "show_cwd_stream",
+                            "kind": "shell",
+                            "summary": "Show the current directory with streaming output",
+                            "shell": {
+                                "command": "pwd",
+                                "mode": "stream",
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    streamed_chunks: list[str] = []
+    orchestrator, runtime, workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        shell_output_callback=lambda event: streamed_chunks.append(event.text),
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="where am I"))
+
+    assert runtime.calls == 1
+    assert result.execution_results[0].status is ExecutionStatus.EXECUTED
+    assert "".join(streamed_chunks) == f"{workspace_root}\n"
+
+
 def test_orchestrator_blocks_risky_shell_commands_when_prompt_is_denied(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -483,3 +525,48 @@ def test_orchestrator_persists_sessions_commands_and_summaries(
     assert detail.summary_text is not None
     assert detail.commands[0].command == "pwd"
     assert detail.commands[0].stdout == f"{workspace_root}\n"
+
+
+def test_orchestrator_persists_pending_approval_session_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "I can create that file after approval.",
+                    "actions": [
+                        {
+                            "id": "create_file",
+                            "kind": "shell",
+                            "summary": "Create a file in the workspace",
+                            "shell": {
+                                "command": "touch",
+                                "args": ["manual.txt"],
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
+    orchestrator, runtime, _workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        approval_service=ApprovalService(mode=ApprovalMode.MANUAL),
+        history_store=history_store,
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="create manual.txt"))
+
+    assert runtime.calls == 0
+    assert result.execution_results[0].status is ExecutionStatus.PENDING_APPROVAL
+    sessions = history_store.list_sessions(limit=5)
+    assert sessions[0].status is SessionStatus.PENDING_APPROVAL
+
+    detail = history_store.get_session(result.session_id or "")
+    assert detail is not None
+    assert detail.status is SessionStatus.PENDING_APPROVAL

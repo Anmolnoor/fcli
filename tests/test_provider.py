@@ -12,6 +12,7 @@ from foundation.models import (
     ProviderResponseFormat,
 )
 from foundation.services.provider import (
+    OllamaChatAdapter,
     OpenAIResponsesAdapter,
     ProviderError,
     ProviderErrorCode,
@@ -166,3 +167,72 @@ def test_openai_adapter_does_not_retry_non_retryable_failures() -> None:
 
     assert exc_info.value.code is ProviderErrorCode.AUTHENTICATION
     assert len(transport.calls) == 1
+
+
+def test_ollama_adapter_parses_structured_output_without_api_key() -> None:
+    transport = FakeTransport(
+        [
+            {
+                "model": "gpt-oss:120b-cloud",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"assistant_message":"hello","actions":[]}',
+                },
+                "prompt_eval_count": 21,
+                "eval_count": 9,
+            }
+        ]
+    )
+    adapter = OllamaChatAdapter(
+        model="gpt-oss:120b-cloud",
+        base_url="http://localhost:11434/api",
+        transport=transport,
+    )
+
+    response = adapter.complete(_structured_prompt())
+
+    assert response.structured_output == {"assistant_message": "hello", "actions": []}
+    assert response.metadata.provider == "ollama"
+    assert response.metadata.model == "gpt-oss:120b-cloud"
+    assert response.metadata.usage is not None
+    assert response.metadata.usage.input_tokens == 21
+    assert response.metadata.usage.output_tokens == 9
+    assert response.metadata.usage.total_tokens == 30
+    assert transport.calls[0]["url"] == "http://localhost:11434/api/chat"
+    assert transport.calls[0]["headers"] == {}
+    assert transport.calls[0]["payload"]["format"] == {"type": "object"}
+
+
+def test_ollama_adapter_sends_authorization_when_api_key_is_configured() -> None:
+    transport = FakeTransport(
+        [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "plain text response",
+                }
+            }
+        ]
+    )
+    adapter = OllamaChatAdapter(
+        model="glm-4.7:cloud",
+        api_key="ollama-secret",
+        base_url="https://ollama.com/api",
+        transport=transport,
+    )
+    prompt = ProviderPrompt(
+        messages=[
+            ProviderMessage(
+                role=ProviderMessageRole.USER,
+                content="Say hi.",
+            )
+        ]
+    )
+
+    response = adapter.complete(prompt)
+
+    assert response.content == "plain text response"
+    assert transport.calls[0]["url"] == "https://ollama.com/api/chat"
+    assert transport.calls[0]["headers"] == {
+        "Authorization": "Bearer ollama-secret",
+    }

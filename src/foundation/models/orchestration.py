@@ -143,6 +143,7 @@ class UserRequest(StrictModel):
     """One user request submitted to the orchestrator."""
 
     message: str = Field(min_length=1)
+    conversation_history: list[ProviderMessage] = Field(default_factory=list)
     cwd: Path | None = None
     plan_only: bool = False
 

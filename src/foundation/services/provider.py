@@ -1,4 +1,4 @@
-"""Provider adapter contracts and the first OpenAI implementation."""
+"""Provider adapter contracts and supported provider implementations."""
 
 from __future__ import annotations
 
@@ -17,6 +17,14 @@ from foundation.models import (
     ProviderResponseFormat,
     ProviderResponseMetadata,
     ProviderUsage,
+)
+from foundation.observability import (
+    EVENT_PROVIDER_CALL_FAILED,
+    EVENT_PROVIDER_CALL_FINISHED,
+    EVENT_PROVIDER_CALL_RETRY,
+    EVENT_PROVIDER_CALL_STARTED,
+    emit_event,
+    emit_exception,
 )
 from foundation.settings import AppSettings, SecretResolutionStatus
 
@@ -205,6 +213,7 @@ class OpenAIResponsesAdapter:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
         }
+        attempt_started_at = started_at
 
         logger.info(
             "provider_request_started provider=openai model=%s format=%s",
@@ -215,6 +224,17 @@ class OpenAIResponsesAdapter:
         last_error: ProviderError | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
+                emit_event(
+                    EVENT_PROVIDER_CALL_STARTED,
+                    payload={
+                        "provider": "openai",
+                        "model": self._model,
+                        "attempt": attempt,
+                        "prompt_message_count": len(prompt.messages),
+                        "response_format": prompt.response_format.value,
+                    },
+                    logger_name="foundation.services.provider",
+                )
                 response_payload = self._transport.post_json(
                     url=endpoint,
                     headers=headers,
@@ -240,6 +260,16 @@ class OpenAIResponsesAdapter:
                     attempt,
                     metadata.latency_seconds,
                 )
+                emit_event(
+                    EVENT_PROVIDER_CALL_FINISHED,
+                    payload={
+                        "provider": "openai",
+                        "model": self._model,
+                        "attempt": attempt,
+                        "latency_seconds": metadata.latency_seconds,
+                    },
+                    logger_name="foundation.services.provider",
+                )
                 return ProviderResponse(
                     content=content,
                     structured_output=structured_output,
@@ -247,6 +277,7 @@ class OpenAIResponsesAdapter:
                 )
             except ProviderError as exc:
                 last_error = exc
+                retry_requested = exc.retryable and attempt < self._max_attempts
                 logger.warning(
                     (
                         "provider_request_failed provider=openai model=%s "
@@ -257,8 +288,34 @@ class OpenAIResponsesAdapter:
                     exc.code.value,
                     exc.retryable,
                 )
-                if not exc.retryable or attempt >= self._max_attempts:
+                if not retry_requested:
+                    emit_exception(
+                        EVENT_PROVIDER_CALL_FAILED,
+                        exc,
+                        payload={
+                            "provider": "openai",
+                            "model": self._model,
+                            "attempt": attempt,
+                            "code": exc.code.value,
+                            "retryable": exc.retryable,
+                            "status_code": exc.status_code,
+                            "latency_seconds": time.monotonic() - attempt_started_at,
+                        },
+                        logger_name="foundation.services.provider",
+                    )
                     raise
+                emit_event(
+                    EVENT_PROVIDER_CALL_RETRY,
+                    payload={
+                        "provider": "openai",
+                        "model": self._model,
+                        "attempt": attempt,
+                        "code": exc.code.value,
+                        "status_code": exc.status_code,
+                    },
+                    logger_name="foundation.services.provider",
+                )
+                attempt_started_at = time.monotonic()
                 time.sleep(self._retry_backoff_seconds * (2 ** (attempt - 1)))
 
         assert last_error is not None
@@ -349,6 +406,198 @@ class OpenAIResponsesAdapter:
         return payload
 
 
+class OllamaChatAdapter:
+    """Ollama chat API adapter with retry handling and structured output support."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None = None,
+        base_url: str = "http://localhost:11434/api",
+        timeout_seconds: int = 60,
+        max_attempts: int = 3,
+        retry_backoff_seconds: float = 0.25,
+        transport: JsonTransport | None = None,
+    ) -> None:
+        self._model = model
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+        self._max_attempts = max_attempts
+        self._retry_backoff_seconds = retry_backoff_seconds
+        self._transport = transport or UrllibJsonTransport()
+
+    def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
+        started_at = time.monotonic()
+        endpoint = self._base_url if self._base_url.endswith("/chat") else f"{self._base_url}/chat"
+        payload = self._build_payload(prompt)
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        attempt_started_at = started_at
+
+        logger.info(
+            "provider_request_started provider=ollama model=%s format=%s",
+            self._model,
+            prompt.response_format.value,
+        )
+
+        last_error: ProviderError | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                emit_event(
+                    EVENT_PROVIDER_CALL_STARTED,
+                    payload={
+                        "provider": "ollama",
+                        "model": self._model,
+                        "attempt": attempt,
+                        "prompt_message_count": len(prompt.messages),
+                        "response_format": prompt.response_format.value,
+                    },
+                    logger_name="foundation.services.provider",
+                )
+                response_payload = self._transport.post_json(
+                    url=endpoint,
+                    headers=headers,
+                    payload=payload,
+                    timeout_seconds=self._timeout_seconds,
+                )
+                content = self._extract_content(response_payload)
+                structured_output: dict[str, Any] | None = None
+                if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
+                    structured_output = self._parse_json_object(content)
+
+                metadata = ProviderResponseMetadata(
+                    provider="ollama",
+                    model=self._model,
+                    response_id=_coerce_optional_string(response_payload.get("id")),
+                    latency_seconds=time.monotonic() - started_at,
+                    attempts=attempt,
+                    usage=_parse_ollama_usage(response_payload),
+                )
+                logger.info(
+                    "provider_request_finished provider=ollama model=%s attempts=%s latency=%.3f",
+                    self._model,
+                    attempt,
+                    metadata.latency_seconds,
+                )
+                emit_event(
+                    EVENT_PROVIDER_CALL_FINISHED,
+                    payload={
+                        "provider": "ollama",
+                        "model": self._model,
+                        "attempt": attempt,
+                        "latency_seconds": metadata.latency_seconds,
+                    },
+                    logger_name="foundation.services.provider",
+                )
+                return ProviderResponse(
+                    content=content,
+                    structured_output=structured_output,
+                    metadata=metadata,
+                )
+            except ProviderError as exc:
+                last_error = exc
+                retry_requested = exc.retryable and attempt < self._max_attempts
+                logger.warning(
+                    (
+                        "provider_request_failed provider=ollama model=%s "
+                        "attempt=%s code=%s retryable=%s"
+                    ),
+                    self._model,
+                    attempt,
+                    exc.code.value,
+                    exc.retryable,
+                )
+                if not retry_requested:
+                    emit_exception(
+                        EVENT_PROVIDER_CALL_FAILED,
+                        exc,
+                        payload={
+                            "provider": "ollama",
+                            "model": self._model,
+                            "attempt": attempt,
+                            "code": exc.code.value,
+                            "retryable": exc.retryable,
+                            "status_code": exc.status_code,
+                            "latency_seconds": time.monotonic() - attempt_started_at,
+                        },
+                        logger_name="foundation.services.provider",
+                    )
+                    raise
+                emit_event(
+                    EVENT_PROVIDER_CALL_RETRY,
+                    payload={
+                        "provider": "ollama",
+                        "model": self._model,
+                        "attempt": attempt,
+                        "code": exc.code.value,
+                        "status_code": exc.status_code,
+                    },
+                    logger_name="foundation.services.provider",
+                )
+                attempt_started_at = time.monotonic()
+                time.sleep(self._retry_backoff_seconds * (2 ** (attempt - 1)))
+
+        assert last_error is not None
+        raise last_error
+
+    def _build_payload(self, prompt: ProviderPrompt) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": message.role.value,
+                    "content": message.content,
+                }
+                for message in prompt.messages
+            ],
+            "stream": False,
+        }
+        if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
+            assert prompt.output_schema is not None
+            payload["format"] = prompt.output_schema
+            payload["options"] = {
+                "temperature": 0,
+            }
+        return payload
+
+    def _extract_content(self, payload: Mapping[str, Any]) -> str:
+        message = payload.get("message")
+        if not isinstance(message, Mapping):
+            raise ProviderError(
+                "Provider returned a chat response without a message payload.",
+                code=ProviderErrorCode.INVALID_RESPONSE,
+            )
+
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        raise ProviderError(
+            "Provider returned an empty chat response.",
+            code=ProviderErrorCode.INVALID_RESPONSE,
+        )
+
+    def _parse_json_object(self, text: str) -> dict[str, Any]:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                "Provider returned invalid JSON for a structured response.",
+                code=ProviderErrorCode.INVALID_RESPONSE,
+                response_text=text,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ProviderError(
+                "Provider returned structured output that was not a JSON object.",
+                code=ProviderErrorCode.INVALID_RESPONSE,
+                response_text=text,
+            )
+        return payload
+
+
 def _coerce_optional_string(value: object) -> str | None:
     if value is None:
         return None
@@ -374,30 +623,66 @@ def _parse_usage(value: object) -> ProviderUsage | None:
     )
 
 
+def _parse_ollama_usage(payload: Mapping[str, Any]) -> ProviderUsage | None:
+    input_tokens = payload.get("prompt_eval_count")
+    output_tokens = payload.get("eval_count")
+    if input_tokens is not None and not isinstance(input_tokens, int):
+        input_tokens = None
+    if output_tokens is not None and not isinstance(output_tokens, int):
+        output_tokens = None
+    if input_tokens is None and output_tokens is None:
+        return None
+    total_tokens = None
+    if input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return ProviderUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
 def build_provider_adapter(
     settings: AppSettings,
     *,
     transport: JsonTransport | None = None,
 ) -> ProviderAdapter:
     """Build the configured provider adapter for Stage 5."""
-    provider_name = settings.provider.name.strip().lower()
-    if provider_name != "openai":
+    provider_name = settings.provider.normalized_name()
+    if provider_name not in {"openai", "ollama"}:
         raise ProviderError(
-            f"Provider {settings.provider.name!r} is not supported in Stage 5.",
+            (
+                f"Provider {settings.provider.name!r} is not supported in Foundation CLI v0.1. "
+                "Supported providers: openai, ollama."
+            ),
             code=ProviderErrorCode.UNSUPPORTED_PROVIDER,
         )
 
-    resolution = settings.provider.resolve_api_key()
-    if resolution.status is not SecretResolutionStatus.RESOLVED or resolution.value is None:
+    resolution = settings.provider.resolve_api_key(
+        environment=settings.provider_environment(),
+    )
+    api_key: str | None = None
+    if resolution.status is SecretResolutionStatus.RESOLVED and resolution.value is not None:
+        api_key = resolution.value.get_secret_value()
+    elif settings.provider.credentials_required():
         raise ProviderError(
             resolution.detail,
             code=ProviderErrorCode.AUTHENTICATION,
         )
 
+    if provider_name == "ollama":
+        return OllamaChatAdapter(
+            model=settings.provider.model,
+            api_key=api_key,
+            base_url=settings.provider.effective_base_url(),
+            timeout_seconds=settings.provider.request_timeout_seconds,
+            transport=transport,
+        )
+
     return OpenAIResponsesAdapter(
         model=settings.provider.model,
-        api_key=resolution.value.get_secret_value(),
-        base_url=str(settings.provider.base_url or "https://api.openai.com/v1"),
+        api_key=api_key or "",
+        base_url=settings.provider.effective_base_url(),
         timeout_seconds=settings.provider.request_timeout_seconds,
         transport=transport,
     )

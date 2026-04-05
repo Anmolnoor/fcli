@@ -1,0 +1,16 @@
+#!/Users/anmolnoor/Developer/fcli/.venv/bin/python
+
+import sys
+args = sys.argv[1:]
+if args[:2] == ["branch", "--show-current"]:
+    print("main")
+elif args[:2] == ["status", "--short"]:
+    print("R  old_name.py -> new_name.py")
+elif args[:3] == ["diff", "--numstat", "--cached"]:
+    print("1	0	old_name.py => new_name.py")
+elif args[:2] == ["diff", "--numstat"]:
+    print("2	1	src/{old.py => new.py}")
+elif args[:1] == ["log"]:
+    print("0123456789abcdef	0123456	Rename file")
+else:
+    raise SystemExit(2)

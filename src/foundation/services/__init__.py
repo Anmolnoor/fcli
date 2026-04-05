@@ -9,6 +9,7 @@ from foundation.services.orchestrator import (
     RequestOrchestrator,
 )
 from foundation.services.provider import (
+    OllamaChatAdapter,
     OpenAIResponsesAdapter,
     ProviderAdapter,
     ProviderError,
@@ -71,6 +72,7 @@ __all__ = [
     "HistoryStore",
     "LocalToolService",
     "OpenAIResponsesAdapter",
+    "OllamaChatAdapter",
     "OrchestrationError",
     "OrchestrationPlanError",
     "OutputStream",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -35,12 +36,33 @@ from foundation.models import (
     ToolName,
     UserRequest,
 )
+from foundation.observability import (
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_APPROVAL_RESOLVED,
+    EVENT_EXCEPTION,
+    EVENT_PLAN_FAILED,
+    EVENT_PLAN_FINISHED,
+    EVENT_PLAN_STARTED,
+    EVENT_RETRY,
+    EVENT_SESSION_END,
+    EVENT_SESSION_START,
+    EVENT_TOOL_CALL_FAILED,
+    EVENT_TOOL_CALL_FINISHED,
+    EVENT_TOOL_CALL_STARTED,
+    EVENT_TOOL_EXECUTION_FAILED,
+    EVENT_TOOL_EXECUTION_FINISHED,
+    EVENT_TOOL_EXECUTION_STARTED,
+    EVENT_USER_REQUEST,
+    emit_event,
+    emit_exception,
+)
 from foundation.services.approval import ApprovalService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
 from foundation.services.provider import ProviderAdapter, ProviderError, ProviderErrorCode
 from foundation.services.shell import (
     ExecutionMode,
+    OutputCallback,
     ShellCommandRequest,
     ShellExecutionCancelled,
     ShellExecutionSpawnError,
@@ -90,6 +112,7 @@ class RequestOrchestrator:
         policy_engine: GuardrailPolicyEngine | None = None,
         approval_service: ApprovalService | None = None,
         history_store: HistoryStore | None = None,
+        shell_output_callback: OutputCallback | None = None,
         max_plan_attempts: int = 2,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
@@ -102,12 +125,25 @@ class RequestOrchestrator:
         )
         self._approval_service = approval_service or ApprovalService(mode=approval_mode)
         self._history_store = history_store
+        self._shell_output_callback = shell_output_callback
         self._max_plan_attempts = max_plan_attempts
 
     def orchestrate(self, request: UserRequest) -> OrchestrationResult:
         """Run the Stage 6 orchestration flow for one user request."""
+        request_id = f"req-{uuid.uuid4().hex}"
         resolved_request_cwd = self._resolve_request_cwd(request.cwd)
         session_id: str | None = None
+        emit_event(
+            EVENT_USER_REQUEST,
+            payload={
+                "request_id": request_id,
+                "request_text": request.message,
+                "request_cwd": str(resolved_request_cwd),
+                "plan_only": request.plan_only,
+                "approval_mode": self._approval_mode.value,
+            },
+            logger_name="foundation.services.orchestrator",
+        )
         if self._history_store is not None:
             session_id = self._history_store.start_session(
                 kind=SessionKind.CHAT,
@@ -117,10 +153,29 @@ class RequestOrchestrator:
                 plan_only=request.plan_only,
                 request_text=request.message,
             )
+        emit_event(
+            EVENT_SESSION_START,
+            payload={
+                "request_id": request_id,
+                "session_id": session_id,
+                "plan_only": request.plan_only,
+                "approval_mode": self._approval_mode.value,
+            },
+            logger_name="foundation.services.orchestrator",
+        )
 
         try:
             context = self._gather_context(resolved_request_cwd)
-            plan, planning_metadata = self._request_plan(request, context)
+            emit_event(
+                EVENT_PLAN_STARTED,
+                payload={"request_id": request_id, "request_text": request.message},
+                logger_name="foundation.services.orchestrator",
+            )
+            plan, planning_metadata = self._request_plan(
+                request,
+                context,
+                request_id=request_id,
+            )
 
             if self._history_store is not None and session_id is not None:
                 self._history_store.record_plan(
@@ -136,6 +191,18 @@ class RequestOrchestrator:
                 len(plan.actions),
                 self._approval_mode.value,
             )
+            emit_event(
+                EVENT_PLAN_FINISHED,
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "action_count": len(plan.actions),
+                    "approval_mode": self._approval_mode.value,
+                    "provider": planning_metadata.provider,
+                    "model": planning_metadata.model,
+                },
+                logger_name="foundation.services.orchestrator",
+            )
 
             decisions = [
                 self._policy_engine.decide(action, request_cwd=resolved_request_cwd)
@@ -148,6 +215,7 @@ class RequestOrchestrator:
                     decision,
                     request=request,
                     resolved_request_cwd=resolved_request_cwd,
+                    request_id=request_id,
                 )
                 execution_results.append(execution_result)
                 if self._history_store is not None and session_id is not None:
@@ -166,6 +234,20 @@ class RequestOrchestrator:
                     )
 
             summary = self._build_summary(plan, execution_results, plan_only=request.plan_only)
+            emit_event(
+                EVENT_SESSION_END,
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "status": self._session_status_for_summary(summary).value,
+                    "executed_actions": summary.executed_actions,
+                    "pending_approval_actions": summary.pending_approval_actions,
+                    "blocked_actions": summary.blocked_actions,
+                    "failed_actions": summary.failed_actions,
+                    "skipped_actions": summary.skipped_actions,
+                },
+                logger_name="foundation.services.orchestrator",
+            )
             assistant_message = AssistantMessage(content=plan.assistant_message)
             if self._history_store is not None and session_id is not None:
                 self._history_store.record_summary(
@@ -180,11 +262,7 @@ class RequestOrchestrator:
                 )
                 self._history_store.finalize_session(
                     session_id,
-                    status=(
-                        SessionStatus.FAILED
-                        if summary.failed_actions > 0
-                        else SessionStatus.COMPLETED
-                    ),
+                    status=self._session_status_for_summary(summary),
                 )
 
             return OrchestrationResult(
@@ -199,6 +277,33 @@ class RequestOrchestrator:
                 summary=summary,
             )
         except Exception as exc:
+            emit_exception(
+                EVENT_EXCEPTION,
+                exc,
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "request_text": request.message,
+                },
+                logger_name="foundation.services.orchestrator",
+            )
+            emit_exception(
+                EVENT_PLAN_FAILED,
+                exc,
+                payload={"request_id": request_id, "session_id": session_id},
+                logger_name="foundation.services.orchestrator",
+            )
+            emit_event(
+                EVENT_SESSION_END,
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "status": SessionStatus.FAILED.value,
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+                logger_name="foundation.services.orchestrator",
+            )
             if self._history_store is not None and session_id is not None:
                 self._history_store.record_event(
                     session_id,
@@ -214,9 +319,7 @@ class RequestOrchestrator:
     def _gather_context(self, request_cwd: Path) -> ContextSnapshot:
         availability = self._tool_service.availability_report()
         available_tools = [
-            item.name
-            for item in availability
-            if item.status is ToolAvailabilityStatus.AVAILABLE
+            item.name for item in availability if item.status is ToolAvailabilityStatus.AVAILABLE
         ]
         notes: list[str] = []
         git_context: dict[str, object] | None = None
@@ -247,6 +350,7 @@ class RequestOrchestrator:
         self,
         request: UserRequest,
         context: ContextSnapshot,
+        request_id: str,
     ) -> tuple[AssistantPlan, ProviderResponseMetadata]:
         base_messages = self._base_plan_messages(request, context)
         supplemental_messages: list[ProviderMessage] = []
@@ -267,6 +371,24 @@ class RequestOrchestrator:
                     exc.code is ProviderErrorCode.INVALID_RESPONSE
                     and attempt < self._max_plan_attempts
                 ):
+                    emit_event(
+                        EVENT_RETRY,
+                        payload={
+                            "request_id": request_id,
+                            "attempt": attempt,
+                            "error": str(exc),
+                        },
+                        logger_name="foundation.services.orchestrator",
+                    )
+                    emit_event(
+                        EVENT_PLAN_FAILED,
+                        payload={
+                            "request_id": request_id,
+                            "attempt": attempt,
+                            "error": str(exc),
+                        },
+                        logger_name="foundation.services.orchestrator",
+                    )
                     supplemental_messages = self._repair_messages(
                         "The previous response was not valid JSON.",
                         invalid_output=exc.response_text,
@@ -279,6 +401,24 @@ class RequestOrchestrator:
                     "Provider did not return structured output for the plan request."
                 )
                 if attempt < self._max_plan_attempts:
+                    emit_event(
+                        EVENT_RETRY,
+                        payload={
+                            "request_id": request_id,
+                            "attempt": attempt,
+                            "error": str(last_error),
+                        },
+                        logger_name="foundation.services.orchestrator",
+                    )
+                    emit_event(
+                        EVENT_PLAN_FAILED,
+                        payload={
+                            "request_id": request_id,
+                            "attempt": attempt,
+                            "error": str(last_error),
+                        },
+                        logger_name="foundation.services.orchestrator",
+                    )
                     supplemental_messages = self._repair_messages(
                         "The previous response omitted the required JSON object."
                     )
@@ -290,6 +430,25 @@ class RequestOrchestrator:
                 self._validate_supported_actions(plan)
             except (ValidationError, OrchestrationPlanError) as exc:
                 last_error = exc
+                if attempt < self._max_plan_attempts:
+                    emit_event(
+                        EVENT_RETRY,
+                        payload={
+                            "request_id": request_id,
+                            "attempt": attempt,
+                            "error": str(exc),
+                        },
+                        logger_name="foundation.services.orchestrator",
+                    )
+                    emit_event(
+                        EVENT_PLAN_FAILED,
+                        payload={
+                            "request_id": request_id,
+                            "attempt": attempt,
+                            "error": str(exc),
+                        },
+                        logger_name="foundation.services.orchestrator",
+                    )
                 if attempt < self._max_plan_attempts:
                     supplemental_messages = self._repair_messages(
                         f"The previous JSON failed validation: {exc}",
@@ -356,10 +515,23 @@ class RequestOrchestrator:
             "Context JSON:\n"
             f"{json.dumps(context.model_dump(mode='json'), indent=2)}"
         )
+        conversation_messages = [
+            message
+            for message in request.conversation_history
+            if message.role in {ProviderMessageRole.USER, ProviderMessageRole.ASSISTANT}
+        ]
         return [
             ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=instructions),
+            *conversation_messages,
             ProviderMessage(role=ProviderMessageRole.USER, content=request.message),
         ]
+
+    def _session_status_for_summary(self, summary: OrchestrationSummary) -> SessionStatus:
+        if summary.failed_actions > 0:
+            return SessionStatus.FAILED
+        if summary.pending_approval_actions > 0:
+            return SessionStatus.PENDING_APPROVAL
+        return SessionStatus.COMPLETED
 
     def _repair_messages(
         self,
@@ -409,6 +581,7 @@ class RequestOrchestrator:
         *,
         request: UserRequest,
         resolved_request_cwd: Path,
+        request_id: str,
     ) -> tuple[ExecutionResult, ApprovalRequest | None, ApprovalResolution | None]:
         if request.plan_only:
             return (
@@ -439,7 +612,26 @@ class RequestOrchestrator:
                 decision,
                 request_cwd=resolved_request_cwd,
             )
+            emit_event(
+                EVENT_APPROVAL_REQUESTED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "risk_categories": list(decision.risk_categories),
+                    "mode": approval_resolution.mode,
+                },
+                logger_name="foundation.services.approval",
+            )
             if approval_resolution.status is ApprovalDecisionStatus.PENDING:
+                emit_event(
+                    EVENT_APPROVAL_RESOLVED,
+                    payload={
+                        "request_id": request_id,
+                        "action_id": action.id,
+                        "status": approval_resolution.status.value,
+                    },
+                    logger_name="foundation.services.approval",
+                )
                 return (
                     ExecutionResult(
                         action_id=action.id,
@@ -450,6 +642,15 @@ class RequestOrchestrator:
                     approval_resolution,
                 )
             if approval_resolution.status is ApprovalDecisionStatus.DENIED:
+                emit_event(
+                    EVENT_APPROVAL_RESOLVED,
+                    payload={
+                        "request_id": request_id,
+                        "action_id": action.id,
+                        "status": approval_resolution.status.value,
+                    },
+                    logger_name="foundation.services.approval",
+                )
                 return (
                     ExecutionResult(
                         action_id=action.id,
@@ -480,14 +681,22 @@ class RequestOrchestrator:
         if action.kind is ActionKind.TOOL_CALL:
             assert action.tool_call is not None
             return (
-                self._execute_tool_call(action, action.tool_call),
+                self._execute_tool_call(
+                    action,
+                    action.tool_call,
+                    request_id=request_id,
+                ),
                 approval_request,
                 approval_resolution,
             )
 
         assert action.shell is not None
         return (
-            self._execute_shell_action(action, request_cwd=resolved_request_cwd),
+            self._execute_shell_action(
+                action,
+                request_cwd=resolved_request_cwd,
+                request_id=request_id,
+            ),
             approval_request,
             approval_resolution,
         )
@@ -571,7 +780,31 @@ class RequestOrchestrator:
             },
         )
 
-    def _execute_tool_call(self, action: PlannedAction, tool_call: ToolCall) -> ExecutionResult:
+    def _execute_tool_call(
+        self,
+        action: PlannedAction,
+        tool_call: ToolCall,
+        *,
+        request_id: str,
+    ) -> ExecutionResult:
+        emit_event(
+            EVENT_TOOL_CALL_STARTED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "tool": tool_call.tool.value,
+            },
+            logger_name="foundation.services.orchestrator",
+        )
+        emit_event(
+            EVENT_TOOL_EXECUTION_STARTED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "tool": tool_call.tool.value,
+            },
+            logger_name="foundation.services.orchestrator",
+        )
         result: SearchResult | FileDiscoveryResult | GitContextResult | HelpLookupResult
         try:
             if tool_call.tool is ToolName.SEARCH:
@@ -609,6 +842,28 @@ class RequestOrchestrator:
                 )
                 artifact_type = ExecutionArtifactType.TLDR
         except ToolExecutionError as exc:
+            emit_event(
+                EVENT_TOOL_EXECUTION_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "tool": tool_call.tool.value,
+                    "error": exc.error.message,
+                    "code": exc.error.code.value,
+                },
+                logger_name="foundation.services.orchestrator",
+            )
+            emit_event(
+                EVENT_TOOL_CALL_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "tool": tool_call.tool.value,
+                    "error": exc.error.message,
+                    "code": exc.error.code.value,
+                },
+                logger_name="foundation.services.orchestrator",
+            )
             return ExecutionResult(
                 action_id=action.id,
                 status=ExecutionStatus.FAILED,
@@ -617,6 +872,25 @@ class RequestOrchestrator:
             )
 
         summary = f"Executed tool `{tool_call.tool.value}` for action {action.id}."
+        emit_event(
+            EVENT_TOOL_EXECUTION_FINISHED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "tool": tool_call.tool.value,
+                "artifact_type": artifact_type.value,
+            },
+            logger_name="foundation.services.orchestrator",
+        )
+        emit_event(
+            EVENT_TOOL_CALL_FINISHED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "tool": tool_call.tool.value,
+            },
+            logger_name="foundation.services.orchestrator",
+        )
         return ExecutionResult(
             action_id=action.id,
             status=ExecutionStatus.EXECUTED,
@@ -625,7 +899,13 @@ class RequestOrchestrator:
             artifact=result.model_dump(mode="json"),
         )
 
-    def _execute_shell_action(self, action: PlannedAction, *, request_cwd: Path) -> ExecutionResult:
+    def _execute_shell_action(
+        self,
+        action: PlannedAction,
+        *,
+        request_cwd: Path,
+        request_id: str,
+    ) -> ExecutionResult:
         assert action.shell is not None
         shell_action = action.shell
         shell_cwd = request_cwd if shell_action.cwd is None else Path(shell_action.cwd)
@@ -640,8 +920,10 @@ class RequestOrchestrator:
                     approval_context={
                         "source": "orchestrator",
                         "action_id": action.id,
+                        "request_id": request_id,
                     },
-                )
+                ),
+                on_event=self._shell_output_callback,
             )
         except ValueError as exc:
             return ExecutionResult(

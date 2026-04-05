@@ -111,9 +111,9 @@ async def test_streaming_execution_preserves_stdout_order(tmp_path: Path) -> Non
 
     result = await runtime.execute_streaming(
         request,
-        on_event=lambda event: events.append(event.text)
-        if event.stream is OutputStream.STDOUT
-        else None,
+        on_event=lambda event: (
+            events.append(event.text) if event.stream is OutputStream.STDOUT else None
+        ),
     )
 
     assert result.exit_code == 0

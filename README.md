@@ -1,6 +1,6 @@
 # Foundation CLI
 
-Foundation CLI is a local-first, shell-native assistant that follows an explicit `plan -> approve -> execute -> observe` loop. This repository now includes Stage 6 of the roadmap: typed configuration, config inspection and validation commands, environment readiness checks, a real shell runtime with buffered, streaming, and PTY-backed execution, typed local-context tooling, a first model adapter and one-shot orchestrator, plus SQLite-backed history, approval flows, and workspace guardrails.
+Foundation CLI is a local-first, shell-native assistant that follows an explicit `plan -> approve -> execute -> observe` loop. This repository now includes the Stage 6 foundation plus the first Stage 7 interactive chat slice: typed configuration, config inspection and validation commands, environment readiness checks, a real shell runtime with buffered, streaming, and PTY-backed execution, typed local-context tooling, model adapters for OpenAI and Ollama, a one-shot orchestrator, SQLite-backed history, approval flows, workspace guardrails, and an interactive `foundation chat` session loop.
 
 ## Requirements
 - Python 3.12
@@ -39,6 +39,37 @@ pytest
 ./scripts/uv run python -m coverage report
 ```
 
+## Stage 8 Developer Workflow
+```bash
+./scripts/uv run ruff check src tests
+./scripts/uv run ruff format --check src tests
+./scripts/uv run mypy src
+./scripts/uv run pytest
+./scripts/uv run pytest -m "asyncio"
+./scripts/uv run python -m coverage run -m pytest
+./scripts/uv run python -m coverage report
+```
+
+Use this loop while implementing changes:
+1. `ruff check src tests`
+2. `ruff format src tests` while editing, or `ruff format --check src tests` when verifying
+3. `mypy src`
+4. `pytest`
+5. `python -m coverage run -m pytest && python -m coverage report`
+
+## Stage 8 Benchmark Guidance
+Use these commands to spot latency regressions in common paths:
+```bash
+/usr/bin/time -p ./scripts/uv run foundation --help
+/usr/bin/time -p ./scripts/uv run foundation run --mode buffered -- python -c "print('foundation run')"
+/usr/bin/time -p ./scripts/uv run foundation tools availability
+/usr/bin/time -p ./scripts/uv run foundation doctor
+```
+For richer startup timing, track import and startup separately:
+```bash
+./scripts/uv run python -X importtime -m foundation.cli --help
+```
+
 ## Repository Layout
 ```text
 src/foundation/         Application package
@@ -47,12 +78,13 @@ plans/                  Stage-by-stage implementation plans
 ```
 
 ## Current CLI Surface
-Stage 6 keeps `foundation chat` as a one-shot orchestration command while the fully interactive REPL still waits for Stage 7.
+`foundation chat` now supports both an interactive Stage 7 session loop and the Stage 6 one-shot orchestration flow when a request is passed explicitly.
 
 ```bash
 foundation run -- pwd
 foundation run --mode buffered -- python -c "print('hello')"
 foundation run --mode pty -- python -c "import sys; print(sys.stdout.isatty())"
+foundation chat
 foundation chat summarize the current git status
 foundation chat --plan-only find TODO comments under src
 foundation chat --json inspect the workspace root
@@ -72,15 +104,27 @@ foundation history --session <session-id>
 foundation doctor
 ```
 
-`foundation chat` now gathers local context, asks the configured provider for a structured plan, validates it through Pydantic contracts, auto-executes allowed actions, prompts or defers when approval is required, and persists the request, plan, approvals, and outcomes into the history database. `foundation run` is also audited into history, and `foundation history` can list recent sessions or render one session in detail. `foundation tools availability` still shows which local binaries are present, and `search`, `files`, and `git` remain available as direct subcommands.
+`foundation chat` now opens an interactive session when no request is supplied. Inside the session, natural-language requests still use the structured planner, `!` runs a direct shell command through the same guardrail and approval flow, prompt history persists to disk, and slash commands such as `/help`, `/history`, `/config`, `/cwd`, `/approval`, `/clear`, and `/reset` provide session-local controls. When a request is supplied explicitly, `foundation chat` still gathers local context, asks the configured provider for a structured plan, validates it through Pydantic contracts, auto-executes allowed actions, prompts or defers when approval is required, and persists the request, plan, approvals, and outcomes into the history database. `foundation run` is also audited into history, and `foundation history` can list recent sessions or render one session in detail. `foundation tools availability` still shows which local binaries are present, and `search`, `files`, and `git` remain available as direct subcommands.
 
 ## Configuration
 Foundation reads settings in this order:
 1. Code defaults
 2. TOML config file
-3. Environment variables
-4. Keychain or environment secret resolution
-5. Explicit CLI overrides such as `--config`, `--workspace-root`, `--approval-mode`, and `--debug`
+3. Paired env file (`foundation.env` next to the active config file)
+4. Environment variables
+5. Keychain or environment secret resolution
+6. Explicit CLI overrides such as `--config`, `--workspace-root`, `--approval-mode`, and `--debug`
+
+Provider selection does not need to live in environment variables. Persist `provider.name`,
+`provider.model`, `provider.base_url`, and `provider.request_timeout_seconds` in the TOML config,
+or override them per invocation with `--provider`, `--model`, `--base-url`, and
+`--provider-timeout`. Foundation CLI currently supports:
+- `openai` via the OpenAI Responses API
+- `ollama` via the Ollama Chat API, including local Ollama at `http://localhost:11434/api` and Ollama Cloud at `https://ollama.com/api`
+
+The environment variable path is mainly for credentials unless you prefer using a keychain entry.
+When present, `foundation.env` next to the active config file is loaded automatically before
+process environment variables, so real exported env vars still win.
 
 Example `~/.config/foundation/config.toml`:
 
@@ -108,18 +152,43 @@ max_timeout_seconds = 3600
 mode = "prompt"
 ```
 
+Example Ollama Cloud config:
+
+```toml
+[provider]
+name = "ollama"
+model = "gpt-oss:120b-cloud"
+base_url = "https://ollama.com/api"
+api_key_env_var = "OLLAMA_API_KEY"
+
+[provider.api_key_keychain]
+service = "foundation"
+username = "ollama_api_key"
+```
+
 Representative environment overrides:
 
 ```bash
 FOUNDATION_APP__WORKSPACE_ROOT=/tmp/workspace
 FOUNDATION_LOGGING__LEVEL=DEBUG
 FOUNDATION_APPROVAL__MODE=manual
+FOUNDATION_PROVIDER__MODEL=gpt-5
+OLLAMA_API_KEY=your-ollama-cloud-api-key
 ```
 
-`foundation config show` prints the effective configuration without exposing secret values. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, and Stage 4 tool binary availability.
+Representative CLI overrides:
+
+```bash
+foundation --model gpt-5 chat summarize the current git status
+foundation --base-url https://api.openai.com/v1 --provider-timeout 90 doctor
+foundation --provider ollama --model gpt-oss:20b chat inspect the workspace root
+foundation --provider ollama --model gpt-oss:120b-cloud --base-url https://ollama.com/api doctor
+```
+
+`foundation config show` prints the effective configuration without exposing secret values, including the resolved provider base URL. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, and Stage 4 tool binary availability.
 
 ## Known Limitations
-- `foundation chat` is a one-shot Stage 6 command, not the interactive REPL planned for Stage 7.
+- The Stage 7 interactive chat loop is an MVP slice. Per-turn planner requests and direct `!` shell commands are persisted, but the full long-lived conversational memory model is not implemented yet.
 - Approval decisions are per-action and per-invocation. Persistent allowlists or reusable approval rules are not implemented yet.
 - Secret lookup is read-only in Stage 2. The CLI can validate and consume keychain or environment credentials, but it does not write credentials yet.
 - `foundation doctor` reports missing-but-creatable directories as warnings rather than mutating the filesystem.
@@ -130,7 +199,7 @@ FOUNDATION_APPROVAL__MODE=manual
 - `src/foundation/settings.py` owns the typed Stage 2 configuration model and precedence rules.
 - `src/foundation/logging.py` provides a small stdlib logging baseline that later stages can replace or expand.
 - `src/foundation/services/tools.py` owns the typed Stage 4 local-context wrappers and shared ignore-rule filtering.
-- `src/foundation/services/provider.py` owns the Stage 5 provider adapter contract and the first OpenAI responses implementation.
+- `src/foundation/services/provider.py` owns the Stage 5 provider adapter contract plus the OpenAI and Ollama implementations.
 - `src/foundation/services/orchestrator.py` owns the structured planning, approval, execution, and audit loop.
 - `src/foundation/services/history.py` owns the Stage 6 SQLite persistence and history queries.
 - `src/foundation/services/guardrails.py` owns Stage 6 shell-action classification and workspace guardrails.

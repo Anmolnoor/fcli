@@ -745,9 +745,9 @@ class HistoryStore:
             ]
 
         summary = self._summary_from_row(session_row)
-        assistant_message = session_row["summary_assistant_message"] or session_row[
-            "plan_assistant_message"
-        ]
+        assistant_message = (
+            session_row["summary_assistant_message"] or session_row["plan_assistant_message"]
+        )
         return HistorySessionDetail(
             **summary.model_dump(),
             assistant_message=assistant_message,
@@ -830,8 +830,10 @@ class HistoryStore:
 
     def _prune(self) -> None:
         cutoff = (
-            datetime.now(tz=UTC).replace(microsecond=0) - timedelta(days=self._retention_days)
-        ).isoformat().replace("+00:00", "Z")
+            (datetime.now(tz=UTC).replace(microsecond=0) - timedelta(days=self._retention_days))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM sessions WHERE completed_at IS NOT NULL AND completed_at < ?",

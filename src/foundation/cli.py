@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shlex
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -19,14 +22,23 @@ from foundation import __version__
 from foundation.doctor import DoctorReport, DoctorStatus, run_doctor
 from foundation.logging import configure_logging
 from foundation.models import (
+    ActionKind,
+    ApprovalDecisionStatus,
     ApprovalRequest,
     ExecutionArtifactType,
     ExecutionResult,
     HistorySessionDetail,
     HistorySessionSummary,
     OrchestrationResult,
+    PlannedAction,
+    PolicyDecision,
+    PolicyDecisionType,
+    ProviderMessage,
+    ProviderMessageRole,
     SessionKind,
     SessionStatus,
+    ShellAction,
+    ShellActionMode,
     UserRequest,
 )
 from foundation.services import (
@@ -37,6 +49,7 @@ from foundation.services import (
     FileDiscoveryType,
     GitContextRequest,
     GitContextResult,
+    GuardrailPolicyEngine,
     HelpLookupRequest,
     HelpLookupResult,
     HelpLookupSource,
@@ -95,6 +108,30 @@ console = Console()
 stderr_console = Console(stderr=True)
 logger = logging.getLogger("foundation.cli")
 
+_REPL_DEFAULT_HISTORY_LIMIT = 10
+_REPL_HISTORY_FILENAME = "repl-history.txt"
+_REPL_TRANSCRIPT_FILENAME = "repl-transcript.json"
+_REPL_MAX_TRANSCRIPT_MESSAGES = 40
+_REPL_TRANSCRIPT_OUTPUT_PREVIEW_CHARACTERS = 1200
+_REPL_SHELL_PREFIX = "!"
+_REPL_COMMAND_COMPLETIONS: dict[str, dict[str, None] | None] = {
+    "/approval": {
+        "auto": None,
+        "manual": None,
+        "prompt": None,
+    },
+    "/clear": None,
+    "/config": {
+        "locations": None,
+    },
+    "/cwd": None,
+    "/exit": None,
+    "/help": None,
+    "/history": None,
+    "/quit": None,
+    "/reset": None,
+}
+
 
 @dataclass(slots=True)
 class CLIContext:
@@ -102,6 +139,16 @@ class CLIContext:
 
     config_path: Path | None = None
     overrides: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class InteractiveChatState:
+    """Session-local state for the Stage 7 interactive chat loop."""
+
+    initial_cwd: Path
+    current_cwd: Path
+    approval_mode: ApprovalMode
+    transcript: list[ProviderMessage] = field(default_factory=list)
 
 
 def _nested_override(root: dict[str, Any], dotted_path: str, value: Any) -> None:
@@ -138,7 +185,11 @@ def _load_runtime_settings(ctx: typer.Context) -> AppSettings:
         console.print(f"[bold red]Configuration error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    configure_logging(settings.logging.level.value)
+    configure_logging(
+        settings.logging.level.value,
+        log_path=settings.app.log_dir / "foundation.log",
+        structured=settings.logging.structured,
+    )
     logger.info(
         "settings_loaded command=%s config_path=%s config_exists=%s",
         ctx.command_path,
@@ -209,19 +260,751 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
     return typer.confirm("Approve this action?", default=False)
 
 
-def _build_orchestrator(settings: AppSettings) -> RequestOrchestrator:
+def _build_orchestrator(
+    settings: AppSettings,
+    *,
+    approval_mode: ApprovalMode | None = None,
+    shell_output_callback: Any | None = None,
+) -> RequestOrchestrator:
+    effective_approval_mode = approval_mode or settings.approval.mode
     return RequestOrchestrator(
         workspace_root=settings.workspace_root,
-        approval_mode=settings.approval.mode,
+        approval_mode=effective_approval_mode,
         provider=build_provider_adapter(settings),
         shell_runtime=_build_shell_runtime(settings),
         tool_service=_build_tool_service(settings),
         approval_service=ApprovalService(
-            mode=settings.approval.mode,
+            mode=effective_approval_mode,
             prompt_callback=_prompt_for_approval,
         ),
         history_store=_build_history_store(settings),
+        shell_output_callback=shell_output_callback,
     )
+
+
+def _chat_history_path(settings: AppSettings) -> Path:
+    history_path = settings.app.state_dir / _REPL_HISTORY_FILENAME
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    return history_path
+
+
+def _chat_transcript_path(settings: AppSettings) -> Path:
+    transcript_path = settings.app.state_dir / _REPL_TRANSCRIPT_FILENAME
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    return transcript_path
+
+
+def _trim_chat_transcript(transcript: list[ProviderMessage]) -> list[ProviderMessage]:
+    return list(transcript[-_REPL_MAX_TRANSCRIPT_MESSAGES:])
+
+
+def _load_chat_transcript(settings: AppSettings) -> list[ProviderMessage]:
+    transcript_path = _chat_transcript_path(settings)
+    if not transcript_path.exists():
+        return []
+    try:
+        payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "chat_transcript_load_failed path=%s error=%s",
+            transcript_path,
+            exc,
+        )
+        return []
+    if not isinstance(payload, list):
+        logger.warning("chat_transcript_load_failed path=%s error=invalid-payload", transcript_path)
+        return []
+    try:
+        transcript = [ProviderMessage.model_validate(item) for item in payload]
+    except ValidationError as exc:
+        logger.warning(
+            "chat_transcript_load_failed path=%s error=%s",
+            transcript_path,
+            exc,
+        )
+        return []
+    return _trim_chat_transcript(transcript)
+
+
+def _persist_chat_transcript(settings: AppSettings, transcript: list[ProviderMessage]) -> None:
+    transcript_path = _chat_transcript_path(settings)
+    trimmed_transcript = _trim_chat_transcript(transcript)
+    try:
+        transcript_path.write_text(
+            json.dumps(
+                [message.model_dump(mode="json") for message in trimmed_transcript],
+                ensure_ascii=True,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning(
+            "chat_transcript_persist_failed path=%s error=%s",
+            transcript_path,
+            exc,
+        )
+
+
+def _append_transcript_messages(
+    settings: AppSettings,
+    state: InteractiveChatState,
+    *,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    state.transcript.extend(
+        [
+            ProviderMessage(role=ProviderMessageRole.USER, content=user_message),
+            ProviderMessage(role=ProviderMessageRole.ASSISTANT, content=assistant_message),
+        ]
+    )
+    state.transcript = _trim_chat_transcript(state.transcript)
+    _persist_chat_transcript(settings, state.transcript)
+
+
+def _preview_transcript_text(value: str) -> str:
+    trimmed = value.strip()
+    if not trimmed:
+        return ""
+    if len(trimmed) <= _REPL_TRANSCRIPT_OUTPUT_PREVIEW_CHARACTERS:
+        return trimmed
+    return trimmed[:_REPL_TRANSCRIPT_OUTPUT_PREVIEW_CHARACTERS].rstrip() + "\n...[truncated]"
+
+
+def _build_chat_prompt_session(settings: AppSettings) -> Any:
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+        from prompt_toolkit.completion import NestedCompleter
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.key_binding import KeyBindings
+    except ImportError as exc:
+        raise RuntimeError(
+            "Interactive chat requires prompt_toolkit. Reinstall dependencies with "
+            "`./scripts/uv sync --extra dev`."
+        ) from exc
+
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "enter")
+    def _submit_multiline_input(event: Any) -> None:
+        event.current_buffer.validate_and_handle()
+
+    return PromptSession(
+        history=FileHistory(str(_chat_history_path(settings))),
+        auto_suggest=AutoSuggestFromHistory(),
+        completer=NestedCompleter.from_nested_dict(_REPL_COMMAND_COMPLETIONS),
+        complete_while_typing=True,
+        key_bindings=bindings,
+        multiline=True,
+        reserve_space_for_menu=6,
+    )
+
+
+def _resolve_chat_session_cwd(workspace_root: Path, cwd: Path | None) -> Path:
+    resolved_workspace_root = workspace_root.resolve()
+    resolved = _resolve_cli_request_cwd(resolved_workspace_root, cwd)
+    try:
+        resolved.relative_to(resolved_workspace_root)
+    except ValueError as exc:
+        raise ValueError(
+            "Interactive chat cwd must stay within the configured workspace root."
+        ) from exc
+    if not resolved.exists():
+        raise ValueError(f"Interactive chat cwd does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"Interactive chat cwd is not a directory: {resolved}")
+    return resolved
+
+
+def _format_repl_cwd(workspace_root: Path, cwd: Path) -> str:
+    try:
+        relative = cwd.relative_to(workspace_root)
+    except ValueError:
+        return str(cwd)
+    return "." if str(relative) == "." else str(relative)
+
+
+def _chat_prompt(state: InteractiveChatState, *, settings: AppSettings, plan_only: bool) -> str:
+    mode_suffix = " plan-only" if plan_only else ""
+    return (
+        f"foundation[{_format_repl_cwd(settings.workspace_root, state.current_cwd)} "
+        f"{state.approval_mode.value}{mode_suffix}]> "
+    )
+
+
+def _render_interactive_chat_help() -> None:
+    help_text = (
+        "Natural-language request: send it directly\n"
+        f"Direct shell command: prefix with `{_REPL_SHELL_PREFIX}`\n"
+        "Insert newline: press Enter\n"
+        "Submit multiline input: press Esc then Enter\n"
+        "/help: show this help\n"
+        "/history [limit]: list recent persisted sessions\n"
+        "/config [locations]: inspect effective config or paths\n"
+        "/cwd [path]: show or update the interactive working directory\n"
+        "/approval [auto|manual|prompt]: inspect or change session approval mode\n"
+        "/clear: clear the terminal and redraw the session header\n"
+        "/reset: reset session-local cwd, approval mode, and transcript state\n"
+        "/exit or /quit: leave interactive chat"
+    )
+    console.print(
+        Panel.fit(
+            Text(help_text),
+            title="Interactive Chat Help",
+        )
+    )
+
+
+def _render_interactive_chat_welcome(
+    settings: AppSettings,
+    state: InteractiveChatState,
+    *,
+    plan_only: bool,
+) -> None:
+    plan_only_text = "enabled" if plan_only else "disabled"
+    console.print(
+        Panel.fit(
+            f"Workspace root: [cyan]{escape(str(settings.workspace_root))}[/cyan]\n"
+            f"Request cwd: [cyan]{escape(str(state.current_cwd))}[/cyan]\n"
+            f"Approval mode: [cyan]{state.approval_mode.value}[/cyan]\n"
+            f"Plan-only default: [cyan]{plan_only_text}[/cyan]\n"
+            f"Prompt history: [cyan]{escape(str(_chat_history_path(settings)))}[/cyan]\n\n"
+            "Enter a request to use the planner, prefix with `!` for a direct shell command, "
+            "or use `/help` for session commands.",
+            title="Interactive Chat",
+        )
+    )
+
+
+def _record_repl_shell_session(
+    history_store: HistoryStore,
+    session_id: str,
+    *,
+    request: ShellCommandRequest,
+    request_cwd: Path,
+    decision: PolicyDecision,
+    result: ShellCommandResult | None,
+    execution_status: str,
+    summary_text: str,
+    error: str | None,
+) -> None:
+    history_store.record_command(
+        session_id,
+        action_id=None,
+        source="chat.repl",
+        command=request.command,
+        args=list(request.args),
+        cwd=str(result.cwd if result is not None else request_cwd),
+        mode=result.mode.value if result is not None else request.mode.value,
+        policy_decision=decision.decision.value,
+        policy_reason=decision.reason,
+        risk_categories=list(decision.risk_categories),
+        execution_status=execution_status,
+        exit_code=None if result is None else result.exit_code,
+        duration_seconds=None if result is None else result.duration_seconds,
+        stdout="" if result is None else result.stdout,
+        stderr="" if result is None else result.stderr,
+        stdout_truncated=False if result is None else result.stdout_truncated,
+        stderr_truncated=False if result is None else result.stderr_truncated,
+        error=error,
+    )
+    history_store.record_summary(
+        session_id,
+        assistant_message=None,
+        summary_text=summary_text,
+        executed_actions=1 if execution_status == "executed" else 0,
+        pending_approval_actions=1 if execution_status == "pending_approval" else 0,
+        blocked_actions=1 if execution_status == "blocked" else 0,
+        failed_actions=1 if execution_status == "failed" else 0,
+        skipped_actions=0,
+    )
+    history_store.finalize_session(
+        session_id,
+        status=(
+            SessionStatus.FAILED
+            if execution_status == "failed"
+            else (
+                SessionStatus.PENDING_APPROVAL
+                if execution_status == "pending_approval"
+                else SessionStatus.COMPLETED
+            )
+        ),
+    )
+
+
+def _execute_repl_shell_command(
+    *,
+    raw_command: str,
+    settings: AppSettings,
+    state: InteractiveChatState,
+    history_store: HistoryStore,
+    shell_runtime: ShellRuntime,
+    policy_engine: GuardrailPolicyEngine,
+) -> None:
+    request_id = f"req-{uuid.uuid4().hex}"
+
+    def _append_shell_transcript(
+        *,
+        summary_text: str,
+        execution_status: str,
+        result: ShellCommandResult | None = None,
+        error: str | None = None,
+    ) -> None:
+        lines = [
+            f"Direct shell command: `{shlex.join(request.argv)}`",
+            f"Status: {execution_status}",
+            f"Outcome: {summary_text}",
+        ]
+        if result is not None:
+            stdout_preview = _preview_transcript_text(result.stdout)
+            stderr_preview = _preview_transcript_text(result.stderr)
+            if stdout_preview:
+                lines.append(f"stdout:\n{stdout_preview}")
+            if stderr_preview:
+                lines.append(f"stderr:\n{stderr_preview}")
+        elif error:
+            lines.append(f"Error: {error}")
+        _append_transcript_messages(
+            settings,
+            state,
+            user_message=f"{_REPL_SHELL_PREFIX}{raw_command}",
+            assistant_message="\n".join(lines),
+        )
+
+    try:
+        argv = shlex.split(raw_command)
+    except ValueError as exc:
+        console.print(f"[bold red]Shell parse error:[/bold red] {exc}")
+        return
+    if not argv:
+        console.print(Text("No shell command was supplied after '!'.", style="dim"))
+        return
+
+    request_cwd = state.current_cwd
+    request = ShellCommandRequest(
+        command=argv[0],
+        args=argv[1:],
+        cwd=request_cwd,
+        approval_context={"source": "chat.repl", "request_id": request_id},
+        mode=ExecutionMode.STREAM,
+    )
+    action = PlannedAction(
+        id="repl_shell",
+        kind=ActionKind.SHELL,
+        summary=f"Run `{shlex.join(request.argv)}` from the interactive session.",
+        shell=ShellAction(
+            command=request.command,
+            args=request.args,
+            cwd=str(request_cwd),
+            mode=ShellActionMode.STREAM,
+        ),
+    )
+    decision = policy_engine.decide(action, request_cwd=request_cwd)
+    session_id = history_store.start_session(
+        kind=SessionKind.RUN,
+        workspace_root=settings.workspace_root,
+        request_cwd=request_cwd,
+        approval_mode=state.approval_mode.value,
+        command_preview=shlex.join(request.argv),
+    )
+
+    if decision.decision is PolicyDecisionType.BLOCK:
+        console.print(f"[bold red]Execution blocked:[/bold red] {decision.reason}")
+        _record_repl_shell_session(
+            history_store,
+            session_id,
+            request=request,
+            request_cwd=request_cwd,
+            decision=decision,
+            result=None,
+            execution_status="blocked",
+            summary_text=decision.reason,
+            error=decision.reason,
+        )
+        _append_shell_transcript(
+            summary_text=decision.reason,
+            execution_status="blocked",
+            error=decision.reason,
+        )
+        return
+
+    if decision.decision is PolicyDecisionType.REQUIRE_APPROVAL:
+        approval_request, approval_resolution = ApprovalService(
+            mode=state.approval_mode,
+            prompt_callback=_prompt_for_approval,
+        ).resolve(
+            action,
+            decision,
+            request_cwd=request_cwd,
+        )
+        history_store.record_approval(
+            session_id,
+            request=approval_request,
+            resolution=approval_resolution,
+        )
+        if approval_resolution.status is ApprovalDecisionStatus.PENDING:
+            console.print(
+                f"[bold yellow]Approval pending:[/bold yellow] {approval_resolution.reason}"
+            )
+            _record_repl_shell_session(
+                history_store,
+                session_id,
+                request=request,
+                request_cwd=request_cwd,
+                decision=decision,
+                result=None,
+                execution_status="pending_approval",
+                summary_text=approval_resolution.reason,
+                error=None,
+            )
+            _append_shell_transcript(
+                summary_text=approval_resolution.reason,
+                execution_status="pending_approval",
+            )
+            return
+        if approval_resolution.status is ApprovalDecisionStatus.DENIED:
+            console.print(f"[bold red]Execution blocked:[/bold red] {approval_resolution.reason}")
+            _record_repl_shell_session(
+                history_store,
+                session_id,
+                request=request,
+                request_cwd=request_cwd,
+                decision=decision,
+                result=None,
+                execution_status="blocked",
+                summary_text=approval_resolution.reason,
+                error=approval_resolution.reason,
+            )
+            _append_shell_transcript(
+                summary_text=approval_resolution.reason,
+                execution_status="blocked",
+                error=approval_resolution.reason,
+            )
+            return
+
+    try:
+        result = shell_runtime.execute(request, on_event=_emit_output_event)
+    except ValueError as exc:
+        console.print(f"[bold red]Execution error:[/bold red] {exc}")
+        _record_repl_shell_session(
+            history_store,
+            session_id,
+            request=request,
+            request_cwd=request_cwd,
+            decision=decision,
+            result=None,
+            execution_status="failed",
+            summary_text=f"Shell execution was rejected: {exc}",
+            error=str(exc),
+        )
+        _append_shell_transcript(
+            summary_text=f"Shell execution was rejected: {exc}",
+            execution_status="failed",
+            error=str(exc),
+        )
+        return
+    except ShellExecutionSpawnError as exc:
+        console.print(f"[bold red]Execution error:[/bold red] {exc}")
+        _record_repl_shell_session(
+            history_store,
+            session_id,
+            request=request,
+            request_cwd=request_cwd,
+            decision=decision,
+            result=None,
+            execution_status="failed",
+            summary_text=f"Shell execution failed to start: {exc}",
+            error=str(exc),
+        )
+        _append_shell_transcript(
+            summary_text=f"Shell execution failed to start: {exc}",
+            execution_status="failed",
+            error=str(exc),
+        )
+        return
+    except ShellExecutionTimeout as exc:
+        if exc.result is not None:
+            _render_execution_summary(exc.result)
+        console.print(f"[bold red]Execution error:[/bold red] {exc}")
+        _record_repl_shell_session(
+            history_store,
+            session_id,
+            request=request,
+            request_cwd=request_cwd,
+            decision=decision,
+            result=exc.result,
+            execution_status="failed",
+            summary_text=f"Shell execution timed out: {exc}",
+            error=str(exc),
+        )
+        _append_shell_transcript(
+            summary_text=f"Shell execution timed out: {exc}",
+            execution_status="failed",
+            result=exc.result,
+            error=str(exc),
+        )
+        return
+    except ShellExecutionCancelled as exc:
+        if exc.result is not None:
+            _render_execution_summary(exc.result)
+        console.print(f"[bold red]Execution cancelled:[/bold red] {exc}")
+        _record_repl_shell_session(
+            history_store,
+            session_id,
+            request=request,
+            request_cwd=request_cwd,
+            decision=decision,
+            result=exc.result,
+            execution_status="failed",
+            summary_text=f"Shell execution was cancelled: {exc}",
+            error=str(exc),
+        )
+        _append_shell_transcript(
+            summary_text=f"Shell execution was cancelled: {exc}",
+            execution_status="failed",
+            result=exc.result,
+            error=str(exc),
+        )
+        return
+
+    _render_execution_summary(result)
+    execution_status = "executed" if result.ok else "failed"
+    summary_text = (
+        f"Executed shell command `{result.display_command}`."
+        if result.ok
+        else result.stderr or f"Shell command `{result.display_command}` failed."
+    )
+    _record_repl_shell_session(
+        history_store,
+        session_id,
+        request=request,
+        request_cwd=request_cwd,
+        decision=decision,
+        result=result,
+        execution_status=execution_status,
+        summary_text=summary_text,
+        error=None if result.ok else result.stderr or f"Exit code {result.exit_code}",
+    )
+    _append_shell_transcript(
+        summary_text=summary_text,
+        execution_status=execution_status,
+        result=result,
+        error=None if result.ok else result.stderr or f"Exit code {result.exit_code}",
+    )
+
+
+def _execute_chat_request(
+    settings: AppSettings,
+    *,
+    message: str,
+    conversation_history: list[ProviderMessage] | None = None,
+    cwd: Path | None,
+    plan_only: bool,
+    approval_mode: ApprovalMode | None = None,
+    shell_output_callback: Any | None = None,
+) -> OrchestrationResult:
+    orchestrator = _build_orchestrator(
+        settings,
+        approval_mode=approval_mode,
+        shell_output_callback=shell_output_callback,
+    )
+    return orchestrator.orchestrate(
+        UserRequest(
+            message=message,
+            conversation_history=list(conversation_history or []),
+            cwd=cwd,
+            plan_only=plan_only,
+        )
+    )
+
+
+def _build_transcript_assistant_message(result: OrchestrationResult) -> str:
+    lines = [result.assistant_message.content, f"Outcome: {result.summary.text}"]
+    for execution_result in result.execution_results:
+        lines.append(
+            f"{execution_result.action_id}: {execution_result.status.value} - "
+            f"{execution_result.summary}"
+        )
+    return "\n".join(lines)
+
+
+def _append_chat_transcript_turn(
+    settings: AppSettings,
+    state: InteractiveChatState,
+    *,
+    user_message: str,
+    result: OrchestrationResult,
+) -> None:
+    _append_transcript_messages(
+        settings,
+        state,
+        user_message=user_message,
+        assistant_message=_build_transcript_assistant_message(result),
+    )
+
+
+def _run_interactive_chat(
+    settings: AppSettings,
+    *,
+    initial_cwd: Path,
+    plan_only: bool,
+) -> None:
+    try:
+        prompt_session = _build_chat_prompt_session(settings)
+    except RuntimeError as exc:
+        console.print(f"[bold red]Interactive chat error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    state = InteractiveChatState(
+        initial_cwd=initial_cwd,
+        current_cwd=initial_cwd,
+        approval_mode=settings.approval.mode,
+        transcript=_load_chat_transcript(settings),
+    )
+    history_store = _build_history_store(settings)
+    shell_runtime = _build_shell_runtime(settings)
+    policy_engine = GuardrailPolicyEngine(workspace_root=settings.workspace_root)
+
+    _render_interactive_chat_welcome(settings, state, plan_only=plan_only)
+
+    while True:
+        try:
+            raw_input = prompt_session.prompt(
+                _chat_prompt(state, settings=settings, plan_only=plan_only)
+            )
+        except KeyboardInterrupt:
+            console.print(
+                Text("Input cancelled. Use /exit or Ctrl-D to leave the session.", style="dim")
+            )
+            continue
+        except EOFError:
+            console.print(Text("Interactive chat closed.", style="dim"))
+            return
+
+        text = raw_input.strip()
+        if not text:
+            continue
+        command, _, argument = text.partition(" ")
+        argument = argument.strip()
+
+        if command in {"/exit", "/quit"}:
+            console.print(Text("Interactive chat closed.", style="dim"))
+            return
+        if command == "/help":
+            _render_interactive_chat_help()
+            continue
+        if command == "/history":
+            try:
+                limit = _REPL_DEFAULT_HISTORY_LIMIT if not argument else int(argument)
+            except ValueError:
+                console.print("[bold red]History error:[/bold red] Expected an integer limit.")
+                continue
+            if limit <= 0:
+                console.print("[bold red]History error:[/bold red] Limit must be positive.")
+                continue
+            _render_history_list(history_store.list_sessions(limit=limit))
+            continue
+        if command == "/config":
+            if argument and argument != "locations":
+                console.print(
+                    "[bold red]Config error:[/bold red] Use `/config` or `/config locations`."
+                )
+                continue
+            payload = (
+                settings.config_locations()
+                if argument == "locations"
+                else render_settings_payload(settings)
+            )
+            console.print_json(data=payload)
+            continue
+        if command == "/cwd":
+            if not argument:
+                console.print(Text(f"Current cwd: {state.current_cwd}", style="dim"))
+                continue
+            try:
+                state.current_cwd = _resolve_chat_session_cwd(
+                    settings.workspace_root,
+                    Path(argument),
+                )
+            except ValueError as exc:
+                console.print(f"[bold red]Cwd error:[/bold red] {exc}")
+                continue
+            console.print(Text(f"Interactive cwd set to {state.current_cwd}.", style="dim"))
+            continue
+        if command == "/approval":
+            argument = argument.lower()
+            if not argument:
+                console.print(
+                    Text(f"Current approval mode: {state.approval_mode.value}", style="dim")
+                )
+                continue
+            try:
+                state.approval_mode = ApprovalMode(argument)
+            except ValueError:
+                choices = ", ".join(mode.value for mode in ApprovalMode)
+                console.print(f"[bold red]Approval error:[/bold red] Expected one of: {choices}.")
+                continue
+            console.print(
+                Text(
+                    f"Interactive approval mode set to {state.approval_mode.value}.",
+                    style="dim",
+                )
+            )
+            continue
+        if command == "/clear":
+            console.clear()
+            _render_interactive_chat_welcome(settings, state, plan_only=plan_only)
+            continue
+        if command == "/reset":
+            state.current_cwd = state.initial_cwd
+            state.approval_mode = settings.approval.mode
+            state.transcript.clear()
+            _persist_chat_transcript(settings, state.transcript)
+            console.print(Text("Session-local state reset.", style="dim"))
+            continue
+        if command.startswith("/"):
+            console.print(f"[bold yellow]Unknown command:[/bold yellow] {text}. Use `/help`.")
+            continue
+        if text.startswith(_REPL_SHELL_PREFIX):
+            _execute_repl_shell_command(
+                raw_command=text.removeprefix(_REPL_SHELL_PREFIX).strip(),
+                settings=settings,
+                state=state,
+                history_store=history_store,
+                shell_runtime=shell_runtime,
+                policy_engine=policy_engine,
+            )
+            continue
+
+        try:
+            result = _execute_chat_request(
+                settings,
+                message=text,
+                conversation_history=state.transcript,
+                cwd=state.current_cwd,
+                plan_only=plan_only,
+                approval_mode=state.approval_mode,
+                shell_output_callback=_emit_output_event,
+            )
+        except ProviderError as exc:
+            console.print(f"[bold red]Provider error:[/bold red] {exc}")
+            continue
+        except OrchestrationPlanError as exc:
+            console.print(f"[bold red]Planning error:[/bold red] {exc}")
+            continue
+        except OrchestrationError as exc:
+            console.print(f"[bold red]Orchestration error:[/bold red] {exc}")
+            continue
+
+        _render_assistant_message(result)
+        _render_action_plan(result)
+        for execution_result in result.execution_results:
+            _render_chat_execution_result(execution_result, streamed_shell_output=True)
+        _render_orchestration_summary(result)
+        _append_chat_transcript_turn(settings, state, user_message=text, result=result)
 
 
 def _parse_env_overlays(values: list[str]) -> dict[str, str]:
@@ -283,8 +1066,7 @@ def _render_execution_summary(result: ShellCommandResult) -> None:
         truncated_streams.append("stderr")
     if truncated_streams:
         lines.append(
-            "Captured output truncated: "
-            f"[yellow]{escape(', '.join(truncated_streams))}[/yellow]"
+            f"Captured output truncated: [yellow]{escape(', '.join(truncated_streams))}[/yellow]"
         )
 
     console.print(Panel.fit("\n".join(lines), title="Execution Summary"))
@@ -314,8 +1096,7 @@ def _render_availability(availability: list[ToolBinaryStatus]) -> None:
         resolved = f" ({item.resolved_command}: {item.path})" if item.path else ""
         required = "required" if item.required else "optional"
         console.print(
-            f"[{style}]{item.status.value.upper():<9}[/{style}] "
-            f"{item.name}: {required}{resolved}"
+            f"[{style}]{item.status.value.upper():<9}[/{style}] {item.name}: {required}{resolved}"
         )
         if item.status is ToolAvailabilityStatus.MISSING and item.install_hint:
             console.print(Text(item.install_hint, style="dim"))
@@ -360,8 +1141,7 @@ def _render_file_result(result: FileDiscoveryResult) -> None:
 def _render_git_context(result: GitContextResult) -> None:
     console.print(
         Panel.fit(
-            f"Scope: [cyan]{result.scope}[/cyan]\n"
-            f"Branch: [cyan]{result.branch}[/cyan]",
+            f"Scope: [cyan]{result.scope}[/cyan]\nBranch: [cyan]{result.branch}[/cyan]",
             title="Git Context",
         )
     )
@@ -449,7 +1229,11 @@ def _render_action_plan(result: OrchestrationResult) -> None:
     console.print(table)
 
 
-def _render_chat_execution_result(result: ExecutionResult) -> None:
+def _render_chat_execution_result(
+    result: ExecutionResult,
+    *,
+    streamed_shell_output: bool = False,
+) -> None:
     status_styles = {
         "executed": "green",
         "not_executed": "yellow",
@@ -469,7 +1253,10 @@ def _render_chat_execution_result(result: ExecutionResult) -> None:
 
     if result.artifact_type is ExecutionArtifactType.SHELL:
         shell_result = ShellCommandResult.model_validate(result.artifact)
-        _render_result_output(shell_result, streamed=False)
+        _render_result_output(
+            shell_result,
+            streamed=(streamed_shell_output and shell_result.mode is not ExecutionMode.BUFFERED),
+        )
         _render_execution_summary(shell_result)
         return
     if result.artifact_type is ExecutionArtifactType.SEARCH:
@@ -653,8 +1440,7 @@ def _record_run_history(
     summary_text = (
         f"Executed shell command `{result.display_command}`."
         if result is not None and result.ok
-        else error
-        or f"Shell command `{shlex.join(request.argv)}` failed."
+        else error or f"Shell command `{shlex.join(request.argv)}` failed."
     )
     history_store.record_summary(
         session_id,
@@ -701,6 +1487,35 @@ def callback(
             help="Override the approval mode for this invocation.",
         ),
     ] = None,
+    provider_name: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Override the configured provider name for this invocation.",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Override the configured provider model for this invocation.",
+        ),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        typer.Option(
+            "--base-url",
+            help="Override the configured provider base URL for this invocation.",
+        ),
+    ] = None,
+    provider_timeout: Annotated[
+        int | None,
+        typer.Option(
+            "--provider-timeout",
+            min=1,
+            help="Override the configured provider request timeout in seconds.",
+        ),
+    ] = None,
     debug: Annotated[
         bool,
         typer.Option(
@@ -719,6 +1534,14 @@ def callback(
         _nested_override(overrides, "app.workspace_root", workspace_root)
     if approval_mode is not None:
         _nested_override(overrides, "approval.mode", approval_mode)
+    if provider_name is not None:
+        _nested_override(overrides, "provider.name", provider_name)
+    if model is not None:
+        _nested_override(overrides, "provider.model", model)
+    if base_url is not None:
+        _nested_override(overrides, "provider.base_url", base_url)
+    if provider_timeout is not None:
+        _nested_override(overrides, "provider.request_timeout_seconds", provider_timeout)
     if debug:
         _nested_override(overrides, "logging.level", LogLevel.DEBUG)
 
@@ -781,15 +1604,16 @@ def run(
         console.print(f"[bold red]Execution error:[/bold red] {exc}")
         raise typer.Exit(code=2) from exc
 
+    request_id = f"req-{uuid.uuid4().hex}"
     runtime = _build_shell_runtime(settings)
     request = ShellCommandRequest(
         command=command_argv[0],
         args=command_argv[1:],
+        approval_context={"source": "cli.run", "request_id": request_id},
         cwd=cwd,
         env_overlay=env_overlay,
         timeout_seconds=timeout_seconds,
         mode=mode,
-        approval_context={"source": "cli.run"},
     )
     request_cwd = _resolve_cli_request_cwd(settings.workspace_root, cwd)
     session_id = history_store.start_session(
@@ -913,7 +1737,7 @@ def chat(
         ),
     ] = False,
 ) -> None:
-    """Run the Stage 5 one-shot planning and execution flow."""
+    """Run the Stage 7 interactive chat loop or the one-shot planning flow."""
     settings = _load_runtime_settings(ctx)
     request_parts = list(ctx.args)
     if request_parts and request_parts[0] == "--":
@@ -923,25 +1747,25 @@ def chat(
     logger.info("command_invoked name=chat plan_only=%s cwd=%s", plan_only, cwd)
 
     if not request_text:
-        _render_placeholder(
-            "chat",
-            (
-                "Interactive chat will be implemented in stage 7.\n"
-                "Stage 5 supports one-shot requests, for example:\n"
-                "`foundation chat summarize the current git status`"
-            ),
-            settings,
-        )
+        if as_json:
+            console.print(
+                "[bold red]Chat error:[/bold red] `foundation chat --json` requires a request."
+            )
+            raise typer.Exit(code=2)
+        try:
+            initial_cwd = _resolve_chat_session_cwd(settings.workspace_root, cwd)
+        except ValueError as exc:
+            console.print(f"[bold red]Chat error:[/bold red] {exc}")
+            raise typer.Exit(code=2) from exc
+        _run_interactive_chat(settings, initial_cwd=initial_cwd, plan_only=plan_only)
         return
 
-    orchestrator = _build_orchestrator(settings)
     try:
-        result = orchestrator.orchestrate(
-            UserRequest(
-                message=request_text,
-                cwd=cwd,
-                plan_only=plan_only,
-            )
+        result = _execute_chat_request(
+            settings,
+            message=request_text,
+            cwd=cwd,
+            plan_only=plan_only,
         )
     except ProviderError as exc:
         console.print(f"[bold red]Provider error:[/bold red] {exc}")
@@ -987,6 +1811,10 @@ def config_validate(ctx: typer.Context) -> None:
     console.print("[green]Configuration is valid.[/green]")
     console.print(f"Config path: [cyan]{settings.config_path}[/cyan]")
     console.print(f"Workspace root: [cyan]{settings.workspace_root}[/cyan]")
+    console.print(f"Provider: [cyan]{settings.provider.name}[/cyan]")
+    console.print(f"Model: [cyan]{settings.provider.model}[/cyan]")
+    console.print(f"Base URL: [cyan]{settings.provider.effective_base_url()}[/cyan]")
+    console.print(f"Request timeout: [cyan]{settings.provider.request_timeout_seconds}s[/cyan]")
     console.print(
         "Provider credential sources: "
         f"[cyan]{', '.join(settings.provider.credential_source_order()) or 'none'}[/cyan]"

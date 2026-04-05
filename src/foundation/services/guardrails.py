@@ -122,8 +122,7 @@ class GuardrailPolicyEngine:
                 action_id=action.id,
                 decision=PolicyDecisionType.REQUIRE_APPROVAL,
                 reason=(
-                    action.approval_reason
-                    or "The model marked this action as approval-required."
+                    action.approval_reason or "The model marked this action as approval-required."
                 ),
                 risk_categories=sorted(set(risk_categories)),
                 command_preview=command_preview,
@@ -267,18 +266,12 @@ class GuardrailPolicyEngine:
         if command in _SIMPLE_NO_ARG_COMMANDS:
             return not shell.args
         if command in _READ_ONLY_PATH_COMMANDS:
-            return bool(paths) and all(
-                self._is_within_workspace(Path(path)) for path in paths
-            )
+            return bool(paths) and all(self._is_within_workspace(Path(path)) for path in paths)
         if command in _QUERY_THEN_PATH_COMMANDS:
             positional = [
-                argument
-                for argument in shell.args
-                if argument and not argument.startswith("-")
+                argument for argument in shell.args if argument and not argument.startswith("-")
             ]
-            return bool(positional) and all(
-                self._is_within_workspace(Path(path)) for path in paths
-            )
+            return bool(positional) and all(self._is_within_workspace(Path(path)) for path in paths)
         if command == "which":
             return bool(shell.args) and all(
                 argument

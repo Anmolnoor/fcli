@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 import keyring
 from keyring.errors import KeyringError, NoKeyringError
@@ -24,31 +25,100 @@ from pydantic import (
 )
 from pydantic_settings import (
     BaseSettings,
+    DotEnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
 
 ENV_PREFIX = "FOUNDATION_"
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/api"
+OPENAI_DEFAULT_API_KEY_ENV_VAR = "OPENAI_API_KEY"
+OLLAMA_DEFAULT_API_KEY_ENV_VAR = "OLLAMA_API_KEY"
+DEFAULT_KEYCHAIN_SERVICE = "foundation"
+OPENAI_DEFAULT_KEYCHAIN_USERNAME = "openai_api_key"
+OLLAMA_DEFAULT_KEYCHAIN_USERNAME = "ollama_api_key"
+DEFAULT_ENV_FILE_NAME = "foundation.env"
+
+
+def _provider_default_base_url(provider_name: str) -> str:
+    normalized = provider_name.strip().lower()
+    if normalized == "ollama":
+        return OLLAMA_DEFAULT_BASE_URL
+    return OPENAI_DEFAULT_BASE_URL
+
+
+def _provider_default_api_key_env_var(provider_name: str) -> str:
+    normalized = provider_name.strip().lower()
+    if normalized == "ollama":
+        return OLLAMA_DEFAULT_API_KEY_ENV_VAR
+    return OPENAI_DEFAULT_API_KEY_ENV_VAR
+
+
+def _provider_default_keychain_ref(provider_name: str) -> KeychainSecretRef:
+    normalized = provider_name.strip().lower()
+    username = (
+        OLLAMA_DEFAULT_KEYCHAIN_USERNAME
+        if normalized == "ollama"
+        else OPENAI_DEFAULT_KEYCHAIN_USERNAME
+    )
+    return KeychainSecretRef(
+        service=DEFAULT_KEYCHAIN_SERVICE,
+        username=username,
+    )
+
+
+def _is_local_base_url(url: str) -> bool:
+    host = urlparse(url).hostname
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 def _resolve_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _platform_base_dirs() -> tuple[Path, Path, Path]:
+    """Return (config_dir, data_dir, state_dir) defaults via platformdirs when available."""
+    try:
+        from platformdirs import user_config_dir, user_data_dir, user_state_dir
+
+        return (
+            Path(user_config_dir("foundation")),
+            Path(user_data_dir("foundation")),
+            Path(user_state_dir("foundation")),
+        )
+    except Exception:
+        fallback = Path.home()
+        return (
+            fallback / ".config" / "foundation",
+            fallback / ".local" / "share" / "foundation",
+            fallback / ".local" / "state" / "foundation",
+        )
+
+
+_PLATFORM_CONFIG_DIR, _PLATFORM_DATA_DIR, _PLATFORM_STATE_DIR = _platform_base_dirs()
+
+
 def default_config_path() -> Path:
     """Return the default config file path for local development."""
-    return Path.home() / ".config" / "foundation" / "config.toml"
+    return _PLATFORM_CONFIG_DIR / "config.toml"
+
+
+def default_env_file_path(config_path: Path | None = None) -> Path:
+    """Return the default env file path paired with the active config."""
+    resolved_config_path = _resolve_path(config_path or default_config_path())
+    return resolved_config_path.parent / DEFAULT_ENV_FILE_NAME
 
 
 def default_data_dir() -> Path:
     """Return the default data directory."""
-    return Path.home() / ".local" / "share" / "foundation"
+    return _PLATFORM_DATA_DIR
 
 
 def default_state_dir() -> Path:
     """Return the default state directory."""
-    return Path.home() / ".local" / "state" / "foundation"
+    return _PLATFORM_STATE_DIR
 
 
 def default_log_dir() -> Path:
@@ -113,8 +183,8 @@ class AppSection(BaseModel):
 class KeychainSecretRef(BaseModel):
     """Keychain lookup coordinates for a provider credential."""
 
-    service: str = "foundation"
-    username: str = "openai_api_key"
+    service: str = DEFAULT_KEYCHAIN_SERVICE
+    username: str = OPENAI_DEFAULT_KEYCHAIN_USERNAME
 
 
 class ProviderSection(BaseModel):
@@ -124,30 +194,69 @@ class ProviderSection(BaseModel):
     model: str = "gpt-5-mini"
     base_url: AnyUrl | None = None
     request_timeout_seconds: PositiveInt = 60
-    api_key_env_var: str | None = "OPENAI_API_KEY"
+    api_key_env_var: str | None = OPENAI_DEFAULT_API_KEY_ENV_VAR
     api_key_keychain: KeychainSecretRef | None = Field(default_factory=KeychainSecretRef)
+
+    def normalized_name(self) -> str:
+        """Return the normalized provider name."""
+        return self.name.strip().lower()
+
+    def effective_base_url(self) -> str:
+        """Return the provider base URL with the provider default endpoint applied."""
+        return str(self.base_url or _provider_default_base_url(self.normalized_name()))
+
+    def effective_api_key_env_var(self) -> str | None:
+        """Return the provider credential environment variable."""
+        if self.api_key_env_var is None:
+            return None
+        if (
+            self.normalized_name() == "ollama"
+            and self.api_key_env_var == OPENAI_DEFAULT_API_KEY_ENV_VAR
+        ):
+            return OLLAMA_DEFAULT_API_KEY_ENV_VAR
+        return self.api_key_env_var
+
+    def effective_api_key_keychain(self) -> KeychainSecretRef | None:
+        """Return the provider credential keychain coordinates."""
+        if self.api_key_keychain is None:
+            return None
+        if (
+            self.normalized_name() == "ollama"
+            and self.api_key_keychain.service == DEFAULT_KEYCHAIN_SERVICE
+            and self.api_key_keychain.username == OPENAI_DEFAULT_KEYCHAIN_USERNAME
+        ):
+            return _provider_default_keychain_ref("ollama")
+        return self.api_key_keychain
+
+    def credentials_required(self) -> bool:
+        """Return whether the configured provider requires credentials."""
+        if self.normalized_name() == "ollama":
+            return not _is_local_base_url(self.effective_base_url())
+        return True
 
     def credential_source_order(self) -> list[str]:
         """Return the configured secret source priority."""
         sources: list[str] = []
-        if self.api_key_keychain is not None:
-            sources.append(
-                f"keychain:{self.api_key_keychain.service}/{self.api_key_keychain.username}"
-            )
-        if self.api_key_env_var:
-            sources.append(f"env:{self.api_key_env_var}")
+        keychain_ref = self.effective_api_key_keychain()
+        if keychain_ref is not None:
+            sources.append(f"keychain:{keychain_ref.service}/{keychain_ref.username}")
+        env_var = self.effective_api_key_env_var()
+        if env_var:
+            sources.append(f"env:{env_var}")
         return sources
 
     def resolve_api_key(self, environment: Mapping[str, str] | None = None) -> SecretResolution:
         """Resolve provider credentials without exposing the resulting value by default."""
         env = environment or os.environ
         keychain_failure: str | None = None
+        keychain_ref = self.effective_api_key_keychain()
+        env_var = self.effective_api_key_env_var()
 
-        if self.api_key_keychain is not None:
+        if keychain_ref is not None:
             try:
                 value = keyring.get_password(
-                    self.api_key_keychain.service,
-                    self.api_key_keychain.username,
+                    keychain_ref.service,
+                    keychain_ref.username,
                 )
             except NoKeyringError as exc:
                 keychain_failure = f"Keychain backend unavailable: {exc}"
@@ -160,18 +269,18 @@ class ProviderSection(BaseModel):
                         source="keychain",
                         detail=(
                             "Resolved provider credentials from "
-                            f"{self.api_key_keychain.service}/{self.api_key_keychain.username}."
+                            f"{keychain_ref.service}/{keychain_ref.username}."
                         ),
                         value=SecretStr(value),
                     )
 
-        if self.api_key_env_var:
-            value = env.get(self.api_key_env_var)
+        if env_var:
+            value = env.get(env_var)
             if value:
                 return SecretResolution(
                     status=SecretResolutionStatus.RESOLVED,
                     source="environment",
-                    detail=f"Resolved provider credentials from ${self.api_key_env_var}.",
+                    detail=f"Resolved provider credentials from ${env_var}.",
                     value=SecretStr(value),
                 )
 
@@ -256,8 +365,12 @@ class AppSettings(BaseSettings):
     )
 
     _toml_file_path: ClassVar[Path | None] = None
+    _dotenv_file_path: ClassVar[Path | None] = None
     _config_path: Path = PrivateAttr(default_factory=default_config_path)
     _config_exists: bool = PrivateAttr(default=False)
+    _env_file_path: Path = PrivateAttr(default_factory=default_env_file_path)
+    _env_file_exists: bool = PrivateAttr(default=False)
+    _env_file_values: dict[str, str] = PrivateAttr(default_factory=dict)
     _cli_overrides: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     @classmethod
@@ -270,8 +383,10 @@ class AppSettings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         config_path = cls._toml_file_path or default_config_path()
+        env_file_path = cls._dotenv_file_path or default_env_file_path(config_path)
         toml_source = TomlConfigSettingsSource(settings_cls, toml_file=config_path)
-        return (init_settings, env_settings, toml_source)
+        dotenv_source = DotEnvSettingsSource(settings_cls, env_file=env_file_path)
+        return (init_settings, env_settings, dotenv_source, toml_source)
 
     @property
     def app_name(self) -> str:
@@ -294,6 +409,16 @@ class AppSettings(BaseSettings):
         return self._config_exists
 
     @property
+    def env_file_path(self) -> Path:
+        """Return the env file path paired with the active config."""
+        return self._env_file_path
+
+    @property
+    def env_file_exists(self) -> bool:
+        """Return whether the selected env file exists."""
+        return self._env_file_exists
+
+    @property
     def cli_overrides(self) -> dict[str, Any]:
         """Return the active CLI overrides used to build these settings."""
         return dict(self._cli_overrides)
@@ -307,6 +432,7 @@ class AppSettings(BaseSettings):
         """Return key filesystem locations relevant to the current settings."""
         return {
             "config_path": str(self.config_path),
+            "env_file_path": str(self.env_file_path),
             "workspace_root": str(self.app.workspace_root),
             "data_dir": str(self.app.data_dir),
             "state_dir": str(self.app.state_dir),
@@ -319,14 +445,35 @@ class AppSettings(BaseSettings):
         return {
             "config_path": str(self.config_path),
             "config_exists": self.config_exists,
+            "env_file_path": str(self.env_file_path),
+            "env_file_exists": self.env_file_exists,
             "env_prefix": ENV_PREFIX,
             "cli_overrides": self.cli_overrides,
         }
+
+    def provider_environment(
+        self,
+        environment: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Return environment variables merged with the paired env file."""
+        merged = dict(self._env_file_values)
+        if environment is None:
+            merged.update(os.environ)
+        else:
+            merged.update(environment)
+        return merged
 
     def safe_dump(self) -> dict[str, Any]:
         """Return a safe rendering of the effective config without secret values."""
         payload = self.model_dump(mode="json")
         payload["provider"]["api_key"] = "[redacted]"
+        payload["provider"]["api_key_env_var"] = self.provider.effective_api_key_env_var()
+        payload["provider"]["api_key_keychain"] = (
+            self.provider.effective_api_key_keychain().model_dump(mode="json")
+            if self.provider.effective_api_key_keychain() is not None
+            else None
+        )
+        payload["provider"]["resolved_base_url"] = self.provider.effective_base_url()
         payload["provider"]["credential_source_order"] = self.provider.credential_source_order()
         return payload
 
@@ -337,6 +484,56 @@ class SettingsLoadError(RuntimeError):
     def __init__(self, message: str, *, config_path: Path):
         super().__init__(message)
         self.config_path = config_path
+
+
+def _read_env_file(
+    env_file_path: Path,
+    *,
+    config_path: Path,
+) -> dict[str, str]:
+    if not env_file_path.exists():
+        return {}
+
+    try:
+        lines = env_file_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SettingsLoadError(
+            f"Could not read env file {env_file_path}: {exc}",
+            config_path=config_path,
+        ) from exc
+
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped.removeprefix("export ").strip()
+        if "=" not in stripped:
+            raise SettingsLoadError(
+                (
+                    f"Invalid env assignment in {env_file_path} at line {line_number}: "
+                    f"{line!r}"
+                ),
+                config_path=config_path,
+            )
+
+        key, raw_value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SettingsLoadError(
+                (
+                    f"Invalid env assignment in {env_file_path} at line {line_number}: "
+                    f"{line!r}"
+                ),
+                config_path=config_path,
+            )
+
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
 
 
 def _validate_config_file(config_path: Path) -> bool:
@@ -384,11 +581,17 @@ def load_settings(
 ) -> AppSettings:
     """Load typed settings using defaults, TOML, environment variables, and CLI overrides."""
     resolved_config_path = _resolve_path(config_path or default_config_path())
+    resolved_env_file_path = default_env_file_path(resolved_config_path)
     config_exists = _validate_config_file(resolved_config_path)
+    env_file_values = _read_env_file(
+        resolved_env_file_path,
+        config_path=resolved_config_path,
+    )
     init_overrides = dict(overrides or {})
 
     try:
         AppSettings._toml_file_path = resolved_config_path
+        AppSettings._dotenv_file_path = resolved_env_file_path
         settings = AppSettings(**init_overrides)
     except ValidationError as exc:
         raise SettingsLoadError(
@@ -397,9 +600,13 @@ def load_settings(
         ) from exc
     finally:
         AppSettings._toml_file_path = None
+        AppSettings._dotenv_file_path = None
 
     settings._config_path = resolved_config_path
     settings._config_exists = config_exists
+    settings._env_file_path = resolved_env_file_path
+    settings._env_file_exists = resolved_env_file_path.exists()
+    settings._env_file_values = env_file_values
     settings._cli_overrides = _flatten_overrides(init_overrides)
     return settings
 

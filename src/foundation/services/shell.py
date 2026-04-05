@@ -20,6 +20,15 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator
 
+from foundation.observability import (
+    EVENT_EXCEPTION,
+    EVENT_SHELL_EXECUTION_FAILED,
+    EVENT_SHELL_EXECUTION_FINISHED,
+    EVENT_SHELL_EXECUTION_STARTED,
+    emit_event,
+    emit_exception,
+)
+
 logger = logging.getLogger("foundation.services.shell")
 
 
@@ -229,19 +238,95 @@ class ShellRuntime:
         on_event: OutputCallback | None = None,
     ) -> ShellCommandResult:
         """Execute a request using the requested execution mode."""
-        prepared = self._prepare_request(request)
-        logger.info(
+        try:
+            prepared = self._prepare_request(request)
+        except ValueError as exc:
+            self._emit_shell_execution_event(
+                EVENT_SHELL_EXECUTION_FAILED,
+                request=request,
+                cwd=request.cwd,
+                error=str(exc),
+                error_type="validation_error",
+            )
+            raise
+
+        logger.debug(
             "shell_execute_started mode=%s cwd=%s argv=%s timeout_seconds=%s",
             prepared.request.mode.value,
             prepared.cwd,
             prepared.argv,
             prepared.timeout_seconds,
         )
-        if prepared.request.mode is ExecutionMode.BUFFERED:
-            return self._execute_buffered(prepared)
-        if prepared.request.mode is ExecutionMode.STREAM:
-            return asyncio.run(self._execute_streaming(prepared, on_event=on_event))
-        return self._execute_pty(prepared, on_event=on_event)
+        self._emit_shell_execution_event(
+            EVENT_SHELL_EXECUTION_STARTED,
+            request=prepared.request,
+            cwd=prepared.cwd,
+        )
+
+        try:
+            if prepared.request.mode is ExecutionMode.BUFFERED:
+                result = self._execute_buffered(prepared)
+            elif prepared.request.mode is ExecutionMode.STREAM:
+                result = asyncio.run(self._execute_streaming(prepared, on_event=on_event))
+            else:
+                result = self._execute_pty(prepared, on_event=on_event)
+        except ShellExecutionSpawnError as exc:
+            self._emit_shell_execution_event(
+                EVENT_SHELL_EXECUTION_FAILED,
+                request=prepared.request,
+                cwd=prepared.cwd,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        except ShellExecutionTimeout as exc:
+            self._emit_shell_execution_event(
+                EVENT_SHELL_EXECUTION_FAILED,
+                request=prepared.request,
+                cwd=prepared.cwd,
+                result=exc.result,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        except ShellExecutionCancelled as exc:
+            self._emit_shell_execution_event(
+                EVENT_SHELL_EXECUTION_FAILED,
+                request=prepared.request,
+                cwd=prepared.cwd,
+                result=exc.result,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            raise
+        except Exception as exc:
+            self._emit_shell_execution_event(
+                EVENT_SHELL_EXECUTION_FAILED,
+                request=prepared.request,
+                cwd=prepared.cwd,
+                error=str(exc),
+                error_type=exc.__class__.__name__,
+            )
+            emit_exception(
+                EVENT_EXCEPTION,
+                exc,
+                payload={
+                    "command": prepared.request.command,
+                    "cwd": str(prepared.cwd),
+                    "mode": prepared.request.mode.value,
+                },
+                logger_name="foundation.services.shell",
+            )
+            raise
+
+        self._emit_shell_execution_event(
+            EVENT_SHELL_EXECUTION_FINISHED,
+            request=prepared.request,
+            cwd=prepared.cwd,
+            result=result,
+            error_type=None,
+        )
+        return result
 
     async def execute_streaming(
         self,
@@ -254,6 +339,53 @@ class ShellRuntime:
         if prepared.request.mode is not ExecutionMode.STREAM:
             raise ValueError("execute_streaming requires ExecutionMode.STREAM")
         return await self._execute_streaming(prepared, on_event=on_event)
+
+    def _emit_shell_execution_event(
+        self,
+        event_name: str,
+        *,
+        request: ShellCommandRequest,
+        cwd: Path | None,
+        result: ShellCommandResult | None = None,
+        error: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        approval_context = request.approval_context if request.approval_context else {}
+        payload = {
+            "source": approval_context.get("source"),
+            "request_id": approval_context.get("request_id"),
+            "action_id": approval_context.get("action_id"),
+            "command": request.command,
+            "arg_count": len(request.args),
+            "mode": request.mode.value,
+        }
+        if cwd is not None:
+            payload["cwd"] = str(cwd)
+
+        if error is not None:
+            payload["error"] = error
+        if error_type is not None:
+            payload["error_type"] = error_type
+
+        if result is not None:
+            payload.update(
+                {
+                    "duration_seconds": result.duration_seconds,
+                    "timed_out": result.timed_out,
+                    "cancelled": result.cancelled,
+                    "exit_code": result.exit_code,
+                    "stdout_truncated": result.stdout_truncated,
+                    "stderr_truncated": result.stderr_truncated,
+                    "stdout_bytes": len(result.stdout.encode("utf-8")),
+                    "stderr_bytes": len(result.stderr.encode("utf-8")),
+                }
+            )
+
+        emit_event(
+            event_name,
+            payload=payload,
+            logger_name="foundation.services.shell",
+        )
 
     def _prepare_request(self, request: ShellCommandRequest) -> _PreparedCommand:
         timeout_seconds = request.timeout_seconds or self._default_timeout_seconds

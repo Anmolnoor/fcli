@@ -771,10 +771,13 @@ class LocalToolService:
                 message=f"`{tool}` failed with exit code {completed.returncode}.",
                 detail=detail,
                 command=command,
-                install_hint=self._binary_status.get(tool, ToolBinaryStatus(
-                    name=tool,
-                    status=ToolAvailabilityStatus.MISSING,
-                )).install_hint,
+                install_hint=self._binary_status.get(
+                    tool,
+                    ToolBinaryStatus(
+                        name=tool,
+                        status=ToolAvailabilityStatus.MISSING,
+                    ),
+                ).install_hint,
             )
         )
 
@@ -1007,7 +1010,7 @@ class LocalToolService:
             inner = candidate[start + 1 : end]
             if " => " in inner:
                 _old, new = inner.split(" => ", 1)
-                return f"{candidate[:start]}{new}{candidate[end + 1:]}"
+                return f"{candidate[:start]}{new}{candidate[end + 1 :]}"
         return candidate.rsplit(" => ", 1)[1]
 
     def _normalize_output_path(self, raw_path: str, *, cwd: Path) -> str:

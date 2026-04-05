@@ -11,7 +11,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from foundation.observability import emit_event
 from foundation.services import LocalToolService, ToolAvailabilityStatus
+from foundation.services.history import HistoryStore
 from foundation.settings import (
     AppSettings,
     SecretResolutionStatus,
@@ -146,18 +148,133 @@ def _required_directories_check(settings: AppSettings) -> DoctorCheck:
     )
 
 
+def _provider_readiness_check(settings: AppSettings) -> DoctorCheck:
+    provider_name = settings.provider.normalized_name()
+    credential_sources = ", ".join(settings.provider.credential_source_order()) or "none"
+    if not provider_name:
+        return DoctorCheck(
+            name="Provider readiness",
+            status=DoctorStatus.FAIL,
+            summary="Provider name is missing.",
+            detail="Set [provider].name to a supported provider.",
+        )
+    if provider_name not in {"openai", "ollama"}:
+        return DoctorCheck(
+            name="Provider readiness",
+            status=DoctorStatus.FAIL,
+            summary=f"Provider {settings.provider.name!r} is not supported.",
+            detail="Supported providers: openai, ollama.",
+        )
+    if not settings.provider.model.strip():
+        return DoctorCheck(
+            name="Provider readiness",
+            status=DoctorStatus.FAIL,
+            summary="Provider model is empty.",
+            detail="Set [provider].model to a non-empty value.",
+        )
+    return DoctorCheck(
+        name="Provider readiness",
+        status=DoctorStatus.PASS,
+        summary="Provider configuration is supported.",
+        detail=(
+            f"Provider: {settings.provider.name}\n"
+            f"Model: {settings.provider.model}\n"
+            f"Base URL: {settings.provider.effective_base_url()}\n"
+            f"Request timeout: {settings.provider.request_timeout_seconds}s\n"
+            f"Credentials required: {'yes' if settings.provider.credentials_required() else 'no'}\n"
+            f"Credential sources: {credential_sources}"
+        ),
+    )
+
+
+def _database_health_check(settings: AppSettings) -> DoctorCheck:
+    try:
+        store = HistoryStore(
+            database_path=settings.history.database_path,
+            retention_days=settings.history.retention_days,
+            max_entries=settings.history.max_entries,
+        )
+        store.list_sessions(limit=1)
+    except Exception as exc:
+        return DoctorCheck(
+            name="History database",
+            status=DoctorStatus.FAIL,
+            summary="History database is not queryable.",
+            detail=f"{settings.history.database_path}: {exc}",
+        )
+
+    return DoctorCheck(
+        name="History database",
+        status=DoctorStatus.PASS,
+        summary="History database is available and queryable.",
+        detail=f"Database path: {settings.history.database_path}",
+    )
+
+
+def _log_path_check(settings: AppSettings) -> DoctorCheck:
+    log_file = settings.app.log_dir / "foundation.log"
+    if settings.app.log_dir.exists():
+        if not settings.app.log_dir.is_dir():
+            return DoctorCheck(
+                name="Log path",
+                status=DoctorStatus.FAIL,
+                summary="Configured log directory is not a directory.",
+                detail=f"{settings.app.log_dir} exists but is not a directory.",
+            )
+        if not os.access(settings.app.log_dir, os.W_OK):
+            return DoctorCheck(
+                name="Log path",
+                status=DoctorStatus.FAIL,
+                summary="Configured log directory is not writable.",
+                detail=f"Cannot write logs under {settings.app.log_dir}.",
+            )
+        if log_file.exists() and not log_file.is_file():
+            return DoctorCheck(
+                name="Log path",
+                status=DoctorStatus.WARN,
+                summary="Expected log file path exists but is not a regular file.",
+                detail=f"Expected a file at {log_file}.",
+            )
+        return DoctorCheck(
+            name="Log path",
+            status=DoctorStatus.PASS,
+            summary="Log path is writable.",
+            detail=f"Log file target: {log_file}",
+        )
+
+    parent = _nearest_existing_parent(settings.app.log_dir)
+    if os.access(parent, os.W_OK):
+        return DoctorCheck(
+            name="Log path",
+            status=DoctorStatus.WARN,
+            summary="Log directory is missing but creatable.",
+            detail=f"Expected log directory: {settings.app.log_dir}",
+        )
+    return DoctorCheck(
+        name="Log path",
+        status=DoctorStatus.FAIL,
+        summary="Log directory is blocked by filesystem permissions.",
+        detail=f"Cannot create log directory under {parent}.",
+    )
+
+
 def _secret_lookup_check(
     settings: AppSettings,
     *,
     environment: Mapping[str, str] | None = None,
 ) -> DoctorCheck:
-    resolution = settings.provider.resolve_api_key(environment=environment)
+    resolution = settings.provider.resolve_api_key(
+        environment=settings.provider_environment(environment),
+    )
+    credential_sources = ", ".join(settings.provider.credential_source_order()) or "none"
+    credentials_required = settings.provider.credentials_required()
 
     if resolution.status is SecretResolutionStatus.RESOLVED:
         return DoctorCheck(
             name="Secret lookup health",
             status=DoctorStatus.PASS,
             summary=resolution.detail,
+            detail=f"Credential sources: {credential_sources}",
         )
 
     if resolution.status is SecretResolutionStatus.UNAVAILABLE:
@@ -165,14 +282,22 @@ def _secret_lookup_check(
             name="Secret lookup health",
             status=DoctorStatus.FAIL,
             summary="Provider credentials could not be checked through the keychain.",
-            detail=resolution.detail,
+            detail=f"{resolution.detail}\nCredential sources: {credential_sources}",
+        )
+
+    if not credentials_required:
+        return DoctorCheck(
+            name="Secret lookup health",
+            status=DoctorStatus.PASS,
+            summary="Provider credentials are optional for the configured provider endpoint.",
+            detail=f"{resolution.detail}\nCredential sources: {credential_sources}",
         )
 
     return DoctorCheck(
         name="Secret lookup health",
         status=DoctorStatus.FAIL,
         summary="Provider credentials are not configured.",
-        detail=resolution.detail,
+        detail=f"{resolution.detail}\nCredential sources: {credential_sources}",
     )
 
 
@@ -255,8 +380,20 @@ def run_doctor(
         )
         return DoctorReport(checks=checks)
 
+    emit_event(
+        "doctor_check_start",
+        payload={
+            "config_path": str(settings.config_path),
+            "provider_name": settings.provider.name,
+            "log_dir": str(settings.app.log_dir),
+        },
+        logger_name="foundation.doctor",
+    )
     checks.append(_config_check(settings))
     checks.append(_required_directories_check(settings))
+    checks.append(_provider_readiness_check(settings))
     checks.append(_secret_lookup_check(settings, environment=environment))
+    checks.append(_database_health_check(settings))
+    checks.append(_log_path_check(settings))
     checks.append(_external_tools_check(settings, environment=environment))
     return DoctorReport(checks=checks)

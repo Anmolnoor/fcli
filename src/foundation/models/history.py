@@ -22,10 +22,11 @@ class SessionKind(StrEnum):
 
 
 class SessionStatus(StrEnum):
-    """Terminal session lifecycle states."""
+    """Persisted session lifecycle states."""
 
     COMPLETED = "completed"
     FAILED = "failed"
+    PENDING_APPROVAL = "pending_approval"
 
 
 class ApprovalDecisionStatus(StrEnum):

@@ -91,9 +91,7 @@ class ApprovalService:
         return request, ApprovalResolution(
             action_id=action.id,
             mode=self._mode.value,
-            status=(
-                ApprovalDecisionStatus.APPROVED if approved else ApprovalDecisionStatus.DENIED
-            ),
+            status=(ApprovalDecisionStatus.APPROVED if approved else ApprovalDecisionStatus.DENIED),
             reason=(
                 "Approved by the user at the prompt."
                 if approved
