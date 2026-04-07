@@ -15,6 +15,7 @@ from foundation.models import (
     ProviderResponse,
     ProviderResponseMetadata,
     SessionStatus,
+    TraceQuery,
     UserRequest,
 )
 from foundation.services import ApprovalService, HistoryStore, LocalToolService, ShellRuntime
@@ -127,7 +128,7 @@ def test_orchestrator_executes_tool_calls(
                             "kind": "tool_call",
                             "summary": "Search for the requested text",
                             "tool_call": {
-                                "tool": "search",
+                                "capability_id": "foundation.search",
                                 "arguments": {
                                     "query": "needle",
                                     "max_results": 5,
@@ -173,6 +174,44 @@ def test_orchestrator_executes_tool_calls(
     assert result.execution_results[0].artifact is not None
     assert result.execution_results[0].artifact["matches"][0]["path"] == "src/example.py"
     assert result.summary.executed_actions == 1
+
+
+def test_orchestrator_executes_shell_runtime_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Showing the current directory through the shell runtime.",
+                    "actions": [
+                        {
+                            "id": "show_cwd",
+                            "kind": "tool_call",
+                            "summary": "Show the current directory",
+                            "tool_call": {
+                                "capability_id": "foundation.shell.command",
+                                "arguments": {
+                                    "command": "pwd",
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    orchestrator, runtime, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="where am I"))
+
+    assert runtime.calls == 1
+    assert result.execution_results[0].status is ExecutionStatus.EXECUTED
+    assert result.execution_results[0].artifact_type is not None
+    assert result.execution_results[0].artifact_type.value == "shell"
+    assert result.execution_results[0].artifact is not None
+    assert result.execution_results[0].artifact["stdout"] == f"{workspace_root}\n"
 
 
 def test_orchestrator_retries_invalid_plans_without_duplicate_shell_execution(
@@ -257,7 +296,7 @@ def test_orchestrator_marks_risky_shell_commands_as_pending_approval(
     assert result.summary.pending_approval_actions == 1
 
 
-def test_orchestrator_keeps_out_of_workspace_shell_reads_pending_approval(
+def test_orchestrator_blocks_out_of_workspace_shell_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -288,8 +327,8 @@ def test_orchestrator_keeps_out_of_workspace_shell_reads_pending_approval(
     result = orchestrator.orchestrate(UserRequest(message="read the outside file"))
 
     assert runtime.calls == 0
-    assert result.execution_results[0].status is ExecutionStatus.PENDING_APPROVAL
-    assert result.summary.pending_approval_actions == 1
+    assert result.execution_results[0].status is ExecutionStatus.BLOCKED
+    assert result.summary.blocked_actions == 1
 
 
 def test_orchestrator_keeps_environment_dump_pending_approval(
@@ -336,7 +375,7 @@ def test_orchestrator_fails_visibly_on_invalid_tool_arguments(
                 "kind": "tool_call",
                 "summary": "Bad search request",
                 "tool_call": {
-                    "tool": "search",
+                    "capability_id": "foundation.search",
                     "arguments": {
                         "query": "needle",
                         "unknown_flag": True,
@@ -523,8 +562,35 @@ def test_orchestrator_persists_sessions_commands_and_summaries(
     assert detail is not None
     assert detail.request_text == "where am I"
     assert detail.summary_text is not None
+    assert detail.policy_evaluations[0].capability_id == "foundation.shell.command"
     assert detail.commands[0].command == "pwd"
     assert detail.commands[0].stdout == f"{workspace_root}\n"
+
+    trace = history_store.get_trace(
+        TraceQuery(
+            session_id=result.session_id or "",
+            include_predecessors=True,
+        )
+    )
+    assert trace is not None
+    assert len(trace.steps) == 2
+    planning_step = trace.steps[0]
+    execution_step = trace.steps[1]
+    assert planning_step.step_type.value == "planning"
+    assert execution_step.step_type.value == "execution"
+    assert execution_step.capability_id == "foundation.shell.command"
+    assert execution_step.manifest_fingerprint is not None
+    assert execution_step.selection_reason.selected_capability_id == "foundation.shell.command"
+    assert trace.edges[0].edge_kind.value == "planned"
+
+    audit_report = history_store.get_audit_report(
+        TraceQuery(
+            session_id=result.session_id or "",
+        )
+    )
+    assert audit_report is not None
+    assert audit_report.completeness_passed is True
+    assert audit_report.missing_fields_by_step == {}
 
 
 def test_orchestrator_persists_pending_approval_session_status(
@@ -570,3 +636,97 @@ def test_orchestrator_persists_pending_approval_session_status(
     detail = history_store.get_session(result.session_id or "")
     assert detail is not None
     assert detail.status is SessionStatus.PENDING_APPROVAL
+    assert detail.policy_evaluations[0].capability_id == "foundation.shell.command"
+    assert detail.approvals[0].capability_id == "foundation.shell.command"
+    assert "workspace_write" in detail.approvals[0].requested_side_effects
+
+    trace = history_store.get_trace(
+        TraceQuery(
+            session_id=result.session_id or "",
+            step_id="action:create_file",
+            include_predecessors=True,
+        )
+    )
+    assert trace is not None
+    assert len(trace.steps) == 2
+    execution_step = trace.steps[-1]
+    assert execution_step.step_type.value == "execution"
+    assert execution_step.status is ExecutionStatus.PENDING_APPROVAL
+
+    audit_report = history_store.get_audit_report(
+        TraceQuery(
+            session_id=result.session_id or "",
+            step_id="action:create_file",
+            include_predecessors=True,
+        )
+    )
+    assert audit_report is not None
+    assert audit_report.completeness_passed is True
+
+
+def test_orchestrator_persists_failed_execution_trace_as_audit_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Running the requested command.",
+                    "actions": [
+                        {
+                            "id": "failing_command",
+                            "kind": "shell",
+                            "summary": "Run a command that exits with failure",
+                            "shell": {
+                                "command": "false",
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
+    orchestrator, runtime, _workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        history_store=history_store,
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="run the failing command"))
+
+    assert runtime.calls == 1
+    assert result.execution_results[0].status is ExecutionStatus.FAILED
+    assert result.summary.failed_actions == 1
+    sessions = history_store.list_sessions(limit=5)
+    assert sessions[0].status is SessionStatus.FAILED
+
+    trace = history_store.get_trace(
+        TraceQuery(
+            session_id=result.session_id or "",
+            step_id="action:failing_command",
+            include_predecessors=True,
+        )
+    )
+    assert trace is not None
+    assert len(trace.steps) == 2
+    execution_step = trace.steps[-1]
+    assert execution_step.step_type.value == "execution"
+    assert execution_step.status is ExecutionStatus.FAILED
+    assert execution_step.capability_id == "foundation.shell.command"
+    assert execution_step.policy_evaluation is not None
+    assert execution_step.manifest_fingerprint is not None
+    assert execution_step.artifacts
+
+    audit_report = history_store.get_audit_report(
+        TraceQuery(
+            session_id=result.session_id or "",
+            step_id="action:failing_command",
+            include_predecessors=True,
+        )
+    )
+    assert audit_report is not None
+    assert audit_report.completeness_passed is True
+    assert audit_report.missing_fields_by_step == {}

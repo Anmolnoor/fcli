@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator, model_validator
 
+from foundation.models.capability import CapabilitySnapshot, PolicyEvaluationRecord
+
 
 class StrictModel(BaseModel):
     """Base model that rejects undeclared fields."""
@@ -45,16 +47,6 @@ class ActionKind(StrEnum):
     EXPLANATION = "explanation"
     SHELL = "shell"
     TOOL_CALL = "tool_call"
-
-
-class ToolName(StrEnum):
-    """Local context tools supported by Stage 5 planning."""
-
-    SEARCH = "search"
-    FILES = "files"
-    GIT = "git"
-    MAN = "man"
-    TLDR = "tldr"
 
 
 class PolicyDecisionType(StrEnum):
@@ -156,10 +148,24 @@ class UserRequest(StrictModel):
 
 
 class ToolCall(StrictModel):
-    """One typed local tool invocation proposed by the model."""
+    """One capability invocation proposed by the planning model."""
 
-    tool: ToolName
+    capability_id: str = Field(
+        min_length=1,
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$",
+    )
+    version: str | None = Field(
+        default=None,
+        pattern=r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$",
+    )
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("capability_id", mode="before")
+    @classmethod
+    def _normalize_capability_id(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise TypeError("capability_id must be a string")
+        return value.strip().lower()
 
 
 class ShellAction(StrictModel):
@@ -240,6 +246,7 @@ class ContextSnapshot(StrictModel):
     request_cwd: str
     approval_mode: str
     available_tools: list[str] = Field(default_factory=list)
+    available_capabilities: list[CapabilitySnapshot] = Field(default_factory=list)
     git_context: dict[str, Any] | None = None
     notes: list[str] = Field(default_factory=list)
 
@@ -292,6 +299,7 @@ class OrchestrationResult(StrictModel):
     plan: AssistantPlan
     planning_metadata: ProviderResponseMetadata
     policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+    policy_evaluations: list[PolicyEvaluationRecord] = Field(default_factory=list)
     execution_results: list[ExecutionResult] = Field(default_factory=list)
     assistant_message: AssistantMessage
     summary: OrchestrationSummary

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import textwrap
 from pathlib import Path
@@ -37,17 +36,22 @@ def _install_binaries(
     bin_dir.mkdir()
     for name, script in scripts.items():
         _write_executable(bin_dir / name, script)
-    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("PATH", str(bin_dir))
     return bin_dir
 
 
-def _service(tmp_path: Path) -> tuple[LocalToolService, Path]:
+def _service(
+    tmp_path: Path,
+    *,
+    path: str | None = None,
+) -> tuple[LocalToolService, Path]:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     service = LocalToolService(
         workspace_root=workspace_root,
         default_timeout_seconds=5,
         capture_limit_kb=64,
+        environment=None if path is None else {"PATH": path},
     )
     return service, workspace_root
 
@@ -267,7 +271,7 @@ def test_git_context_normalizes_renamed_paths(
 
 
 def test_lookup_help_raises_missing_binary_with_install_hint(tmp_path: Path) -> None:
-    service, _workspace_root = _service(tmp_path)
+    service, _workspace_root = _service(tmp_path, path="")
 
     with pytest.raises(ToolExecutionError) as exc_info:
         service.lookup_help(

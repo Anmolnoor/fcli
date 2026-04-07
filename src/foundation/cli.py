@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import shlex
 import uuid
@@ -11,7 +10,6 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -25,24 +23,43 @@ from foundation.models import (
     ActionKind,
     ApprovalDecisionStatus,
     ApprovalRequest,
+    AuditDetailRef,
+    AuditReport,
+    BrainSession,
+    ChatNotice,
+    ChatSurfacePolicy,
+    ChatTurnPresentation,
     ExecutionArtifactType,
     ExecutionResult,
     HistorySessionDetail,
     HistorySessionSummary,
+    InteractiveDetailCommand,
+    MemoryEnvelope,
+    MemoryLayer,
+    MemorySource,
     OrchestrationResult,
     PlannedAction,
     PolicyDecision,
     PolicyDecisionType,
+    PresentationNoticeLevel,
     ProviderMessage,
-    ProviderMessageRole,
+    RenderMode,
+    ResumeTarget,
     SessionKind,
+    SessionSnapshot,
     SessionStatus,
     ShellAction,
     ShellActionMode,
+    TerminalLogRouting,
+    TraceQuery,
+    TraceRecord,
+    TraceSummary,
     UserRequest,
 )
 from foundation.services import (
     ApprovalService,
+    CapabilityRegistry,
+    CapabilityStore,
     ExecutionMode,
     FileDiscoveryRequest,
     FileDiscoveryResult,
@@ -62,6 +79,7 @@ from foundation.services import (
     RequestOrchestrator,
     SearchRequest,
     SearchResult,
+    SessionManager,
     ShellCommandRequest,
     ShellCommandResult,
     ShellExecutionCancelled,
@@ -73,6 +91,7 @@ from foundation.services import (
     ToolBinaryStatus,
     ToolErrorCode,
     ToolExecutionError,
+    TraceStore,
     build_provider_adapter,
 )
 from foundation.settings import (
@@ -110,17 +129,18 @@ logger = logging.getLogger("foundation.cli")
 
 _REPL_DEFAULT_HISTORY_LIMIT = 10
 _REPL_HISTORY_FILENAME = "repl-history.txt"
-_REPL_TRANSCRIPT_FILENAME = "repl-transcript.json"
-_REPL_MAX_TRANSCRIPT_MESSAGES = 40
+_REPL_SESSION_DB_FILENAME = "chat-sessions.sqlite3"
 _REPL_TRANSCRIPT_OUTPUT_PREVIEW_CHARACTERS = 1200
 _REPL_SHELL_PREFIX = "!"
-_REPL_COMMAND_COMPLETIONS: dict[str, dict[str, None] | None] = {
+_REPL_COMMAND_COMPLETIONS: dict[str, Any] = {
+    "/actions": None,
     "/approval": {
         "auto": None,
         "manual": None,
         "prompt": None,
     },
     "/clear": None,
+    "/compact": None,
     "/config": {
         "locations": None,
     },
@@ -128,8 +148,31 @@ _REPL_COMMAND_COMPLETIONS: dict[str, dict[str, None] | None] = {
     "/exit": None,
     "/help": None,
     "/history": None,
+    "/memory": {
+        "append": {
+            "global": None,
+            "project": None,
+        },
+        "set": {
+            "global": None,
+            "project": None,
+        },
+        "show": {
+            "global": None,
+            "project": None,
+            "session": None,
+            "summary": None,
+            "turns": None,
+        },
+    },
+    "/model": None,
+    "/plan": None,
     "/quit": None,
     "/reset": None,
+    "/resume": None,
+    "/sessions": None,
+    "/summary": None,
+    "/tools": None,
 }
 
 
@@ -143,12 +186,76 @@ class CLIContext:
 
 @dataclass(slots=True)
 class InteractiveChatState:
-    """Session-local state for the Stage 7 interactive chat loop."""
+    """Mutable interactive state backed by a persistent brain session."""
 
-    initial_cwd: Path
-    current_cwd: Path
-    approval_mode: ApprovalMode
-    transcript: list[ProviderMessage] = field(default_factory=list)
+    session: BrainSession
+    last_result: OrchestrationResult | None = None
+
+    @property
+    def session_id(self) -> str:
+        """Return the stable session id."""
+        return self.session.session_id
+
+    @property
+    def initial_cwd(self) -> Path:
+        """Return the initial cwd recorded for this session."""
+        return Path(self.session.initial_cwd)
+
+    @property
+    def current_cwd(self) -> Path:
+        """Return the active cwd for this interactive shell."""
+        return Path(self.session.current_cwd)
+
+    @current_cwd.setter
+    def current_cwd(self, value: Path) -> None:
+        self.session.current_cwd = str(value)
+
+    @property
+    def approval_mode(self) -> ApprovalMode:
+        """Return the current approval mode."""
+        return ApprovalMode(self.session.approval_mode)
+
+    @approval_mode.setter
+    def approval_mode(self, value: ApprovalMode) -> None:
+        self.session.approval_mode = value.value
+
+    @property
+    def model(self) -> str:
+        """Return the persisted model override for this session."""
+        return self.session.model
+
+    @model.setter
+    def model(self, value: str) -> None:
+        self.session.model = value
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider recorded for this session."""
+        return self.session.provider_name
+
+    @property
+    def transcript(self) -> list[ProviderMessage]:
+        """Return the bounded recent turn window."""
+        return self.session.recent_turns
+
+    @transcript.setter
+    def transcript(self, value: list[ProviderMessage]) -> None:
+        self.session.recent_turns = value
+
+    @property
+    def summary_text(self) -> str:
+        """Return the compacted summary for older turns."""
+        return self.session.summary_text
+
+    @property
+    def recovered_from_interruption(self) -> bool:
+        """Return whether resume restored the last clean checkpoint."""
+        return self.session.recovered_from_interruption
+
+    @property
+    def interrupted_turn(self) -> str | None:
+        """Return the interrupted user input when the prior run did not finish cleanly."""
+        return self.session.interrupted_turn
 
 
 def _nested_override(root: dict[str, Any], dotted_path: str, value: Any) -> None:
@@ -189,6 +296,11 @@ def _load_runtime_settings(ctx: typer.Context) -> AppSettings:
         settings.logging.level.value,
         log_path=settings.app.log_dir / "foundation.log",
         structured=settings.logging.structured,
+        routing=(
+            TerminalLogRouting.FILE_AND_TERMINAL
+            if settings.logging.level is LogLevel.DEBUG
+            else TerminalLogRouting.FILE_ONLY
+        ),
     )
     logger.info(
         "settings_loaded command=%s config_path=%s config_exists=%s",
@@ -235,10 +347,31 @@ def _build_tool_service(settings: AppSettings) -> LocalToolService:
 
 
 def _build_history_store(settings: AppSettings) -> HistoryStore:
-    return HistoryStore(
+    return TraceStore(
         database_path=settings.history.database_path,
         retention_days=settings.history.retention_days,
         max_entries=settings.history.max_entries,
+    )
+
+
+def _build_capability_registry(
+    settings: AppSettings,
+    *,
+    tool_service: LocalToolService | None = None,
+) -> CapabilityRegistry:
+    service = tool_service or _build_tool_service(settings)
+    return CapabilityRegistry(
+        store=CapabilityStore(settings.app.data_dir / "capabilities"),
+        tool_service=service,
+    )
+
+
+def _build_session_manager(settings: AppSettings) -> SessionManager:
+    return SessionManager(
+        database_path=settings.app.state_dir / _REPL_SESSION_DB_FILENAME,
+        workspace_root=settings.workspace_root,
+        config_dir=settings.config_path.parent,
+        provider_name=settings.provider.name,
     )
 
 
@@ -246,17 +379,50 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
     risk_text = ", ".join(request.risk_categories) if request.risk_categories else "unknown"
     lines = [
         f"Action: [cyan]{escape(request.action_id)}[/cyan]",
+        (
+            f"Capability: [cyan]{escape(request.capability_id)}[/cyan]"
+            if request.capability_id
+            else None
+        ),
         f"Summary: {escape(request.summary)}",
         f"Reason: {escape(request.reason)}",
         f"Risk: [yellow]{escape(risk_text)}[/yellow]",
     ]
+    if request.risk_class is not None:
+        lines.append(f"Risk class: [yellow]{escape(request.risk_class.value)}[/yellow]")
+    if request.trust_tier is not None:
+        lines.append(f"Trust tier: [cyan]{escape(request.trust_tier.value)}[/cyan]")
     if request.command_preview:
         lines.append(f"Command: [cyan]{escape(request.command_preview)}[/cyan]")
     if request.cwd:
         lines.append(f"Cwd: [cyan]{escape(request.cwd)}[/cyan]")
     if request.paths:
         lines.append(f"Paths: [cyan]{escape(', '.join(request.paths))}[/cyan]")
-    console.print(Panel.fit("\n".join(lines), title="Approval Required"))
+    if request.network_hosts:
+        lines.append(f"Network: [cyan]{escape(', '.join(request.network_hosts))}[/cyan]")
+    if request.requested_side_effects:
+        lines.append(
+            "Side effects: "
+            f"[yellow]{escape(', '.join(request.requested_side_effects))}[/yellow]"
+        )
+    if request.reason_codes:
+        reason_text = ", ".join(code.value for code in request.reason_codes)
+        lines.append(
+            f"Policy reasons: [magenta]{escape(reason_text)}[/magenta]"
+        )
+    if request.constraints is not None and request.constraints.invocation_budget is not None:
+        budget = request.constraints.invocation_budget
+        budget_parts: list[str] = []
+        if budget.timeout_seconds is not None:
+            budget_parts.append(f"timeout={budget.timeout_seconds}s")
+        if budget.output_limit_kb is not None:
+            budget_parts.append(f"output={budget.output_limit_kb}KB")
+        if budget.max_invocations is not None:
+            budget_parts.append(f"max_invocations={budget.max_invocations}")
+        if budget_parts:
+            lines.append(f"Constraints: [cyan]{escape(', '.join(budget_parts))}[/cyan]")
+    panel_text = "\n".join(item for item in lines if item is not None)
+    console.print(Panel.fit(panel_text, title="Approval Required"))
     return typer.confirm("Approve this action?", default=False)
 
 
@@ -267,18 +433,20 @@ def _build_orchestrator(
     shell_output_callback: Any | None = None,
 ) -> RequestOrchestrator:
     effective_approval_mode = approval_mode or settings.approval.mode
+    tool_service = _build_tool_service(settings)
     return RequestOrchestrator(
         workspace_root=settings.workspace_root,
         approval_mode=effective_approval_mode,
         provider=build_provider_adapter(settings),
         shell_runtime=_build_shell_runtime(settings),
-        tool_service=_build_tool_service(settings),
+        tool_service=tool_service,
         approval_service=ApprovalService(
             mode=effective_approval_mode,
             prompt_callback=_prompt_for_approval,
         ),
         history_store=_build_history_store(settings),
         shell_output_callback=shell_output_callback,
+        capability_registry=_build_capability_registry(settings, tool_service=tool_service),
     )
 
 
@@ -288,80 +456,14 @@ def _chat_history_path(settings: AppSettings) -> Path:
     return history_path
 
 
-def _chat_transcript_path(settings: AppSettings) -> Path:
-    transcript_path = settings.app.state_dir / _REPL_TRANSCRIPT_FILENAME
-    transcript_path.parent.mkdir(parents=True, exist_ok=True)
-    return transcript_path
-
-
-def _trim_chat_transcript(transcript: list[ProviderMessage]) -> list[ProviderMessage]:
-    return list(transcript[-_REPL_MAX_TRANSCRIPT_MESSAGES:])
-
-
-def _load_chat_transcript(settings: AppSettings) -> list[ProviderMessage]:
-    transcript_path = _chat_transcript_path(settings)
-    if not transcript_path.exists():
-        return []
-    try:
-        payload = json.loads(transcript_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "chat_transcript_load_failed path=%s error=%s",
-            transcript_path,
-            exc,
-        )
-        return []
-    if not isinstance(payload, list):
-        logger.warning("chat_transcript_load_failed path=%s error=invalid-payload", transcript_path)
-        return []
-    try:
-        transcript = [ProviderMessage.model_validate(item) for item in payload]
-    except ValidationError as exc:
-        logger.warning(
-            "chat_transcript_load_failed path=%s error=%s",
-            transcript_path,
-            exc,
-        )
-        return []
-    return _trim_chat_transcript(transcript)
-
-
-def _persist_chat_transcript(settings: AppSettings, transcript: list[ProviderMessage]) -> None:
-    transcript_path = _chat_transcript_path(settings)
-    trimmed_transcript = _trim_chat_transcript(transcript)
-    try:
-        transcript_path.write_text(
-            json.dumps(
-                [message.model_dump(mode="json") for message in trimmed_transcript],
-                ensure_ascii=True,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        logger.warning(
-            "chat_transcript_persist_failed path=%s error=%s",
-            transcript_path,
-            exc,
-        )
-
-
-def _append_transcript_messages(
+def _settings_for_interactive_session(
     settings: AppSettings,
     state: InteractiveChatState,
-    *,
-    user_message: str,
-    assistant_message: str,
-) -> None:
-    state.transcript.extend(
-        [
-            ProviderMessage(role=ProviderMessageRole.USER, content=user_message),
-            ProviderMessage(role=ProviderMessageRole.ASSISTANT, content=assistant_message),
-        ]
-    )
-    state.transcript = _trim_chat_transcript(state.transcript)
-    _persist_chat_transcript(settings, state.transcript)
+) -> AppSettings:
+    runtime_settings = settings.model_copy(deep=True)
+    runtime_settings.provider.name = state.provider_name
+    runtime_settings.provider.model = state.model
+    return runtime_settings
 
 
 def _preview_transcript_text(value: str) -> str:
@@ -388,9 +490,13 @@ def _build_chat_prompt_session(settings: AppSettings) -> Any:
 
     bindings = KeyBindings()
 
-    @bindings.add("escape", "enter")
-    def _submit_multiline_input(event: Any) -> None:
+    @bindings.add("enter")
+    def _submit_input(event: Any) -> None:
         event.current_buffer.validate_and_handle()
+
+    @bindings.add("escape", "enter")
+    def _insert_multiline_newline(event: Any) -> None:
+        event.current_buffer.insert_text("\n")
 
     return PromptSession(
         history=FileHistory(str(_chat_history_path(settings))),
@@ -429,9 +535,10 @@ def _format_repl_cwd(workspace_root: Path, cwd: Path) -> str:
 
 def _chat_prompt(state: InteractiveChatState, *, settings: AppSettings, plan_only: bool) -> str:
     mode_suffix = " plan-only" if plan_only else ""
+    session_id = state.session_id[:8]
     return (
-        f"foundation[{_format_repl_cwd(settings.workspace_root, state.current_cwd)} "
-        f"{state.approval_mode.value}{mode_suffix}]> "
+        f"foundation[{session_id} {_format_repl_cwd(settings.workspace_root, state.current_cwd)} "
+        f"{state.approval_mode.value} {state.model}{mode_suffix}]> "
     )
 
 
@@ -439,15 +546,27 @@ def _render_interactive_chat_help() -> None:
     help_text = (
         "Natural-language request: send it directly\n"
         f"Direct shell command: prefix with `{_REPL_SHELL_PREFIX}`\n"
-        "Insert newline: press Enter\n"
-        "Submit multiline input: press Esc then Enter\n"
+        "Submit input: press Enter\n"
+        "Insert newline: press Esc then Enter\n"
         "/help: show this help\n"
         "/history [limit]: list recent persisted sessions\n"
+        "/sessions [limit]: list persistent chat sessions\n"
+        "/resume [session-id|latest]: switch to another persistent session\n"
+        "/plan: inspect the last structured plan\n"
+        "/actions: inspect the last action results\n"
+        "/summary: inspect the last orchestration summary\n"
+        "/memory: show loaded memory layers\n"
+        "/memory show [global|project|session|summary|turns]: inspect one memory source\n"
+        "/memory append [global|project] <text>: append to a memory file\n"
+        "/memory set [global|project] <text>: replace a memory file\n"
+        "/compact: compact older turns into the session summary now\n"
+        "/model [name]: show or change the session model\n"
+        "/tools: show current local tool availability\n"
         "/config [locations]: inspect effective config or paths\n"
         "/cwd [path]: show or update the interactive working directory\n"
         "/approval [auto|manual|prompt]: inspect or change session approval mode\n"
         "/clear: clear the terminal and redraw the session header\n"
-        "/reset: reset session-local cwd, approval mode, and transcript state\n"
+        "/reset: reset session-local cwd, approval mode, model, and transcript state\n"
         "/exit or /quit: leave interactive chat"
     )
     console.print(
@@ -458,25 +577,130 @@ def _render_interactive_chat_help() -> None:
     )
 
 
+def _memory_source_label(source: MemorySource) -> str:
+    labels = {
+        MemorySource.GLOBAL: "Global user memory",
+        MemorySource.PROJECT: "Project memory",
+        MemorySource.SESSION_SUMMARY: "Session summary",
+        MemorySource.RECENT_TURNS: "Recent turns",
+    }
+    return labels[source]
+
+
+def _loaded_memory_labels(envelope: MemoryEnvelope) -> list[str]:
+    return [
+        layer.label
+        for layer in envelope.layers
+        if layer.content.strip() or (layer.path is not None and layer.exists)
+    ]
+
+
 def _render_interactive_chat_welcome(
     settings: AppSettings,
     state: InteractiveChatState,
     *,
     plan_only: bool,
+    render_mode: RenderMode,
+    memory_envelope: MemoryEnvelope,
 ) -> None:
     plan_only_text = "enabled" if plan_only else "disabled"
+    loaded_memories = ", ".join(_loaded_memory_labels(memory_envelope)) or "none"
     console.print(
         Panel.fit(
+            f"Session: [cyan]{escape(state.session_id)}[/cyan]\n"
             f"Workspace root: [cyan]{escape(str(settings.workspace_root))}[/cyan]\n"
             f"Request cwd: [cyan]{escape(str(state.current_cwd))}[/cyan]\n"
             f"Approval mode: [cyan]{state.approval_mode.value}[/cyan]\n"
+            f"Provider: [cyan]{escape(state.provider_name)}[/cyan]\n"
+            f"Model: [cyan]{escape(state.model)}[/cyan]\n"
+            f"Render mode: [cyan]{render_mode.value}[/cyan]\n"
             f"Plan-only default: [cyan]{plan_only_text}[/cyan]\n"
+            f"Loaded memory: [cyan]{escape(loaded_memories)}[/cyan]\n"
             f"Prompt history: [cyan]{escape(str(_chat_history_path(settings)))}[/cyan]\n\n"
             "Enter a request to use the planner, prefix with `!` for a direct shell command, "
-            "or use `/help` for session commands.",
+            "or use `/plan`, `/actions`, `/summary`, or `/help` for session commands.",
             title="Interactive Chat",
         )
     )
+    if state.recovered_from_interruption:
+        interrupted_turn = state.interrupted_turn or "unknown input"
+        console.print(
+            Text(
+                (
+                    "Recovered the last clean checkpoint after an interrupted turn: "
+                    f"{interrupted_turn}"
+                ),
+                style="yellow",
+            )
+        )
+
+
+def _render_memory_envelope(envelope: MemoryEnvelope) -> None:
+    table = Table(title="Session Memory")
+    table.add_column("Source", style="cyan")
+    table.add_column("Location")
+    table.add_column("Loaded", justify="center")
+    for layer in envelope.layers:
+        table.add_row(
+            layer.label,
+            layer.path or "-",
+            "yes" if layer.content.strip() else "no",
+        )
+    console.print(table)
+
+
+def _render_memory_layer(layer: MemoryLayer) -> None:
+    title = layer.label if layer.path is None else f"{layer.label}: {layer.path}"
+    content = layer.content or "[empty]"
+    console.print(Panel.fit(content, title=title))
+
+
+def _memory_layer_for_source(envelope: MemoryEnvelope, source: MemorySource) -> MemoryLayer:
+    for layer in envelope.layers:
+        if layer.source is source:
+            return layer
+    raise ValueError(f"Memory source {source.value!r} is not available.")
+
+
+def _render_brain_sessions(sessions: list[SessionSnapshot]) -> None:
+    if not sessions:
+        console.print("No persistent chat sessions recorded yet.")
+        return
+    table = Table(title="Chat Sessions")
+    table.add_column("Session", style="cyan")
+    table.add_column("Updated")
+    table.add_column("Turns", justify="right")
+    table.add_column("Cwd")
+    table.add_column("Model")
+    table.add_column("State")
+    for session in sessions:
+        state = "interrupted" if session.recovered_from_interruption else "ready"
+        table.add_row(
+            session.session_id,
+            session.updated_at,
+            str(session.turn_count),
+            session.current_cwd,
+            session.model,
+            state,
+        )
+    console.print(table)
+
+
+def _parse_memory_source(argument: str) -> MemorySource:
+    normalized = argument.strip().lower()
+    aliases = {
+        "global": MemorySource.GLOBAL,
+        "project": MemorySource.PROJECT,
+        "session": MemorySource.SESSION_SUMMARY,
+        "summary": MemorySource.SESSION_SUMMARY,
+        "turns": MemorySource.RECENT_TURNS,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        choices = ", ".join(sorted(aliases))
+        raise ValueError(f"Expected one of: {choices}.") from exc
+
 
 
 def _record_repl_shell_session(
@@ -540,6 +764,7 @@ def _execute_repl_shell_command(
     raw_command: str,
     settings: AppSettings,
     state: InteractiveChatState,
+    session_manager: SessionManager,
     history_store: HistoryStore,
     shell_runtime: ShellRuntime,
     policy_engine: GuardrailPolicyEngine,
@@ -567,11 +792,12 @@ def _execute_repl_shell_command(
                 lines.append(f"stderr:\n{stderr_preview}")
         elif error:
             lines.append(f"Error: {error}")
-        _append_transcript_messages(
-            settings,
-            state,
+        session_manager.record_turn(
+            state.session,
+            turn_kind="shell",
             user_message=f"{_REPL_SHELL_PREFIX}{raw_command}",
             assistant_message="\n".join(lines),
+            metadata={"execution_status": execution_status},
         )
 
     try:
@@ -582,6 +808,12 @@ def _execute_repl_shell_command(
     if not argv:
         console.print(Text("No shell command was supplied after '!'.", style="dim"))
         return
+
+    session_manager.mark_turn_started(
+        state.session,
+        user_message=f"{_REPL_SHELL_PREFIX}{raw_command}",
+        turn_kind="shell",
+    )
 
     request_cwd = state.current_cwd
     request = ShellCommandRequest(
@@ -602,7 +834,20 @@ def _execute_repl_shell_command(
             mode=ShellActionMode.STREAM,
         ),
     )
-    decision = policy_engine.decide(action, request_cwd=request_cwd)
+    evaluation = policy_engine.evaluate(
+        action,
+        request_cwd=request_cwd,
+        approval_mode=state.approval_mode,
+    )
+    decision = (
+        policy_engine.to_policy_decision(evaluation)
+        if evaluation is not None
+        else PolicyDecision(
+            action_id=action.id,
+            decision=PolicyDecisionType.ALLOW,
+            reason="Explanation-only actions do not execute anything.",
+        )
+    )
     session_id = history_store.start_session(
         kind=SessionKind.RUN,
         workspace_root=settings.workspace_root,
@@ -610,6 +855,8 @@ def _execute_repl_shell_command(
         approval_mode=state.approval_mode.value,
         command_preview=shlex.join(request.argv),
     )
+    if evaluation is not None:
+        history_store.record_policy_evaluation(session_id, record=evaluation)
 
     if decision.decision is PolicyDecisionType.BLOCK:
         console.print(f"[bold red]Execution blocked:[/bold red] {decision.reason}")
@@ -632,12 +879,15 @@ def _execute_repl_shell_command(
         return
 
     if decision.decision is PolicyDecisionType.REQUIRE_APPROVAL:
+        if evaluation is None:
+            console.print("[bold red]Execution blocked:[/bold red] Missing policy evaluation.")
+            return
         approval_request, approval_resolution = ApprovalService(
             mode=state.approval_mode,
             prompt_callback=_prompt_for_approval,
         ).resolve(
             action,
-            decision,
+            evaluation,
             request_cwd=request_cwd,
         )
         history_store.record_approval(
@@ -685,8 +935,27 @@ def _execute_repl_shell_command(
             )
             return
 
+    if evaluation is not None:
+        policy_engine.register_invocation(evaluation)
+
+    effective_request = request
+    if evaluation is not None:
+        budget = (
+            evaluation.verdict.constraints or evaluation.policy_input.constraints
+        ).invocation_budget
+        if budget is not None:
+            timeout_seconds = request.timeout_seconds
+            if budget.timeout_seconds is not None and timeout_seconds is not None:
+                timeout_seconds = min(timeout_seconds, budget.timeout_seconds)
+            effective_request = request.model_copy(
+                update={
+                    "timeout_seconds": timeout_seconds,
+                    "capture_limit_kb": budget.output_limit_kb,
+                }
+            )
+
     try:
-        result = shell_runtime.execute(request, on_event=_emit_output_event)
+        result = shell_runtime.execute(effective_request, on_event=_emit_output_event)
     except ValueError as exc:
         console.print(f"[bold red]Execution error:[/bold red] {exc}")
         _record_repl_shell_session(
@@ -832,17 +1101,18 @@ def _build_transcript_assistant_message(result: OrchestrationResult) -> str:
 
 
 def _append_chat_transcript_turn(
-    settings: AppSettings,
+    session_manager: SessionManager,
     state: InteractiveChatState,
     *,
     user_message: str,
     result: OrchestrationResult,
 ) -> None:
-    _append_transcript_messages(
-        settings,
-        state,
+    session_manager.record_turn(
+        state.session,
+        turn_kind="chat",
         user_message=user_message,
         assistant_message=_build_transcript_assistant_message(result),
+        metadata={"history_session_id": result.session_id or ""},
     )
 
 
@@ -851,6 +1121,8 @@ def _run_interactive_chat(
     *,
     initial_cwd: Path,
     plan_only: bool,
+    render_mode: RenderMode,
+    resume_target: ResumeTarget,
 ) -> None:
     try:
         prompt_session = _build_chat_prompt_session(settings)
@@ -858,17 +1130,32 @@ def _run_interactive_chat(
         console.print(f"[bold red]Interactive chat error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    state = InteractiveChatState(
-        initial_cwd=initial_cwd,
-        current_cwd=initial_cwd,
-        approval_mode=settings.approval.mode,
-        transcript=_load_chat_transcript(settings),
-    )
+    session_manager = _build_session_manager(settings)
+    try:
+        session = session_manager.resolve_session(
+            resume_target,
+            initial_cwd=initial_cwd,
+            approval_mode=settings.approval.mode.value,
+            model=settings.provider.model,
+        )
+    except ValueError as exc:
+        console.print(f"[bold red]Interactive chat error:[/bold red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    state = InteractiveChatState(session=session)
     history_store = _build_history_store(settings)
     shell_runtime = _build_shell_runtime(settings)
-    policy_engine = GuardrailPolicyEngine(workspace_root=settings.workspace_root)
-
-    _render_interactive_chat_welcome(settings, state, plan_only=plan_only)
+    policy_engine = GuardrailPolicyEngine(
+        workspace_root=settings.workspace_root,
+        capability_registry=_build_capability_registry(settings),
+    )
+    _render_interactive_chat_welcome(
+        settings,
+        state,
+        plan_only=plan_only,
+        render_mode=render_mode,
+        memory_envelope=session_manager.build_memory_envelope(state.session),
+    )
 
     while True:
         try:
@@ -907,6 +1194,119 @@ def _run_interactive_chat(
                 continue
             _render_history_list(history_store.list_sessions(limit=limit))
             continue
+        if command == "/sessions":
+            try:
+                limit = _REPL_DEFAULT_HISTORY_LIMIT if not argument else int(argument)
+            except ValueError:
+                console.print("[bold red]Session error:[/bold red] Expected an integer limit.")
+                continue
+            if limit <= 0:
+                console.print("[bold red]Session error:[/bold red] Limit must be positive.")
+                continue
+            _render_brain_sessions(session_manager.list_sessions(limit=limit))
+            continue
+        if command == "/resume":
+            target = (
+                ResumeTarget.latest()
+                if not argument or argument == "latest"
+                else ResumeTarget.explicit(argument)
+            )
+            try:
+                state.session = session_manager.resolve_session(
+                    target,
+                    initial_cwd=initial_cwd,
+                    approval_mode=settings.approval.mode.value,
+                    model=settings.provider.model,
+                )
+            except ValueError as exc:
+                console.print(f"[bold red]Resume error:[/bold red] {exc}")
+                continue
+            state.last_result = None
+            _render_interactive_chat_welcome(
+                settings,
+                state,
+                plan_only=plan_only,
+                render_mode=render_mode,
+                memory_envelope=session_manager.build_memory_envelope(state.session),
+            )
+            continue
+        if command in {
+            InteractiveDetailCommand.PLAN.value,
+            InteractiveDetailCommand.ACTIONS.value,
+            InteractiveDetailCommand.SUMMARY.value,
+        }:
+            if state.last_result is None:
+                console.print(
+                    Text(
+                        "No assistant turn has completed in this session yet.",
+                        style="dim",
+                    )
+                )
+                continue
+            _render_interactive_detail(state.last_result, InteractiveDetailCommand(command))
+            continue
+        if command == "/memory":
+            if not argument:
+                _render_memory_envelope(session_manager.build_memory_envelope(state.session))
+                continue
+            subcommand, _, remainder = argument.partition(" ")
+            subcommand = subcommand.strip().lower()
+            remainder = remainder.strip()
+            if subcommand == "show":
+                if not remainder:
+                    console.print(
+                        "[bold red]Memory error:[/bold red] Expected a memory source to show."
+                    )
+                    continue
+                try:
+                    source = _parse_memory_source(remainder)
+                    envelope = session_manager.build_memory_envelope(state.session)
+                    _render_memory_layer(_memory_layer_for_source(envelope, source))
+                except ValueError as exc:
+                    console.print(f"[bold red]Memory error:[/bold red] {exc}")
+                continue
+            if subcommand in {"append", "set"}:
+                source_text, _, content = remainder.partition(" ")
+                if not source_text or not content.strip():
+                    console.print(
+                        "[bold red]Memory error:[/bold red] Expected "
+                        "`/memory append|set [global|project] <text>`."
+                    )
+                    continue
+                try:
+                    layer = session_manager.write_memory(
+                        _parse_memory_source(source_text),
+                        content=content,
+                        append=subcommand == "append",
+                    )
+                except ValueError as exc:
+                    console.print(f"[bold red]Memory error:[/bold red] {exc}")
+                    continue
+                console.print(Text(f"{layer.label} updated.", style="dim"))
+                continue
+            console.print(
+                "[bold red]Memory error:[/bold red] Use `/memory`, "
+                "`/memory show ...`, `/memory append ...`, or `/memory set ...`."
+            )
+            continue
+        if command == "/compact":
+            changed = session_manager.compact_session(state.session, force=True)
+            if changed:
+                console.print(Text("Session memory compacted.", style="dim"))
+            else:
+                console.print(Text("No compaction was needed.", style="dim"))
+            continue
+        if command == "/model":
+            if not argument:
+                console.print(Text(f"Current model: {state.model}", style="dim"))
+                continue
+            state.model = argument
+            session_manager.checkpoint(state.session)
+            console.print(Text(f"Interactive model set to {state.model}.", style="dim"))
+            continue
+        if command == "/tools":
+            _render_availability(_build_tool_service(settings).availability_report())
+            continue
         if command == "/config":
             if argument and argument != "locations":
                 console.print(
@@ -932,6 +1332,7 @@ def _run_interactive_chat(
             except ValueError as exc:
                 console.print(f"[bold red]Cwd error:[/bold red] {exc}")
                 continue
+            session_manager.checkpoint(state.session)
             console.print(Text(f"Interactive cwd set to {state.current_cwd}.", style="dim"))
             continue
         if command == "/approval":
@@ -947,6 +1348,7 @@ def _run_interactive_chat(
                 choices = ", ".join(mode.value for mode in ApprovalMode)
                 console.print(f"[bold red]Approval error:[/bold red] Expected one of: {choices}.")
                 continue
+            session_manager.checkpoint(state.session)
             console.print(
                 Text(
                     f"Interactive approval mode set to {state.approval_mode.value}.",
@@ -956,13 +1358,22 @@ def _run_interactive_chat(
             continue
         if command == "/clear":
             console.clear()
-            _render_interactive_chat_welcome(settings, state, plan_only=plan_only)
+            _render_interactive_chat_welcome(
+                settings,
+                state,
+                plan_only=plan_only,
+                render_mode=render_mode,
+                memory_envelope=session_manager.build_memory_envelope(state.session),
+            )
             continue
         if command == "/reset":
-            state.current_cwd = state.initial_cwd
-            state.approval_mode = settings.approval.mode
-            state.transcript.clear()
-            _persist_chat_transcript(settings, state.transcript)
+            session_manager.reset_session(
+                state.session,
+                current_cwd=state.initial_cwd,
+                approval_mode=settings.approval.mode.value,
+                model=settings.provider.model,
+            )
+            state.last_result = None
             console.print(Text("Session-local state reset.", style="dim"))
             continue
         if command.startswith("/"):
@@ -973,17 +1384,24 @@ def _run_interactive_chat(
                 raw_command=text.removeprefix(_REPL_SHELL_PREFIX).strip(),
                 settings=settings,
                 state=state,
+                session_manager=session_manager,
                 history_store=history_store,
                 shell_runtime=shell_runtime,
                 policy_engine=policy_engine,
             )
             continue
 
+        session_manager.mark_turn_started(
+            state.session,
+            user_message=text,
+            turn_kind="chat",
+        )
+        memory_envelope = session_manager.build_memory_envelope(state.session)
         try:
             result = _execute_chat_request(
-                settings,
+                _settings_for_interactive_session(settings, state),
                 message=text,
-                conversation_history=state.transcript,
+                conversation_history=memory_envelope.prompt_messages,
                 cwd=state.current_cwd,
                 plan_only=plan_only,
                 approval_mode=state.approval_mode,
@@ -991,20 +1409,48 @@ def _run_interactive_chat(
             )
         except ProviderError as exc:
             console.print(f"[bold red]Provider error:[/bold red] {exc}")
+            session_manager.record_turn(
+                state.session,
+                turn_kind="chat",
+                user_message=text,
+                assistant_message=f"Provider error: {exc}",
+                metadata={"error_type": exc.__class__.__name__, "status": "failed"},
+            )
             continue
         except OrchestrationPlanError as exc:
             console.print(f"[bold red]Planning error:[/bold red] {exc}")
+            session_manager.record_turn(
+                state.session,
+                turn_kind="chat",
+                user_message=text,
+                assistant_message=f"Planning error: {exc}",
+                metadata={"error_type": exc.__class__.__name__, "status": "failed"},
+            )
             continue
         except OrchestrationError as exc:
             console.print(f"[bold red]Orchestration error:[/bold red] {exc}")
+            session_manager.record_turn(
+                state.session,
+                turn_kind="chat",
+                user_message=text,
+                assistant_message=f"Orchestration error: {exc}",
+                metadata={"error_type": exc.__class__.__name__, "status": "failed"},
+            )
             continue
 
-        _render_assistant_message(result)
-        _render_action_plan(result)
-        for execution_result in result.execution_results:
-            _render_chat_execution_result(execution_result, streamed_shell_output=True)
-        _render_orchestration_summary(result)
-        _append_chat_transcript_turn(settings, state, user_message=text, result=result)
+        state.last_result = result
+        _render_chat_turn(
+            result,
+            render_mode=render_mode,
+            interactive=True,
+            streamed_shell_output=True,
+        )
+        _append_chat_transcript_turn(
+            session_manager,
+            state,
+            user_message=text,
+            result=result,
+        )
 
 
 def _parse_env_overlays(values: list[str]) -> dict[str, str]:
@@ -1211,12 +1657,187 @@ def _render_assistant_message(result: OrchestrationResult) -> None:
     console.print(Panel.fit(result.assistant_message.content, title="Assistant"))
 
 
+def _chat_surface_policy(render_mode: RenderMode) -> ChatSurfacePolicy:
+    return ChatSurfacePolicy(render_mode=render_mode)
+
+
+def _has_hidden_chat_detail(result: OrchestrationResult) -> bool:
+    return bool(result.plan.actions or result.execution_results or result.policy_decisions)
+
+
+def _detail_ref_for_result(result: OrchestrationResult) -> AuditDetailRef | None:
+    if result.session_id is None:
+        return None
+    return AuditDetailRef(
+        session_id=result.session_id,
+        history_hint=f"foundation history --session {result.session_id}",
+        trace_hint=f"foundation trace --session {result.session_id}",
+    )
+
+
+def _notice_level_for_result(result: OrchestrationResult) -> PresentationNoticeLevel:
+    if result.summary.failed_actions or result.summary.blocked_actions:
+        return PresentationNoticeLevel.ERROR
+    if result.summary.pending_approval_actions or result.request.plan_only:
+        return PresentationNoticeLevel.WARNING
+    if result.summary.executed_actions or result.summary.skipped_actions:
+        return PresentationNoticeLevel.DIM
+    return PresentationNoticeLevel.INFO
+
+
+def _artifact_preview_notice(result: ExecutionResult) -> ChatNotice | None:
+    if result.artifact_type is None or result.artifact is None:
+        return None
+    if result.artifact_type is ExecutionArtifactType.EXPLANATION:
+        return None
+    if result.artifact_type is ExecutionArtifactType.SHELL:
+        shell_result = ShellCommandResult.model_validate(result.artifact)
+        preview_lines: list[str] = []
+        stdout_preview = _preview_transcript_text(shell_result.stdout)
+        stderr_preview = _preview_transcript_text(shell_result.stderr)
+        if stdout_preview:
+            preview_lines.append(f"stdout:\n{stdout_preview}")
+        if stderr_preview and not shell_result.ok:
+            preview_lines.append(f"stderr:\n{stderr_preview}")
+        if not preview_lines:
+            return None
+        return ChatNotice(
+            level=PresentationNoticeLevel.DIM,
+            text="\n".join(preview_lines),
+        )
+    if result.artifact_type is ExecutionArtifactType.SEARCH:
+        search_result = SearchResult.model_validate(result.artifact)
+        if not search_result.matches:
+            return None
+        preview_lines = [
+            f"{match.path}:{match.line_number} {match.line_text}"
+            for match in search_result.matches[:3]
+        ]
+        if len(search_result.matches) > 3 or search_result.truncated:
+            preview_lines.append("...")
+        return ChatNotice(
+            level=PresentationNoticeLevel.DIM,
+            text="Search preview:\n" + "\n".join(preview_lines),
+        )
+    if result.artifact_type is ExecutionArtifactType.FILES:
+        file_result = FileDiscoveryResult.model_validate(result.artifact)
+        if not file_result.paths:
+            return None
+        preview_lines = list(file_result.paths[:5])
+        if len(file_result.paths) > 5 or file_result.truncated:
+            preview_lines.append("...")
+        return ChatNotice(
+            level=PresentationNoticeLevel.DIM,
+            text="Path preview:\n" + "\n".join(preview_lines),
+        )
+    if result.artifact_type is ExecutionArtifactType.GIT:
+        git_result = GitContextResult.model_validate(result.artifact)
+        preview_lines = [f"Branch: {git_result.branch}"]
+        if git_result.status:
+            changed_paths = [entry.path for entry in git_result.status[:5]]
+            changed_text = ", ".join(changed_paths)
+            if len(git_result.status) > 5 or git_result.truncated_status:
+                changed_text += ", ..."
+            preview_lines.append(f"Changed: {changed_text}")
+        if git_result.recent_commits:
+            preview_lines.append(
+                "Recent: "
+                + "; ".join(
+                    f"{commit.short_sha} {commit.summary}"
+                    for commit in git_result.recent_commits[:3]
+                )
+            )
+        return ChatNotice(
+            level=PresentationNoticeLevel.DIM,
+            text="\n".join(preview_lines),
+        )
+    help_result = HelpLookupResult.model_validate(result.artifact)
+    content_preview = _preview_transcript_text(help_result.content)
+    if not content_preview:
+        return None
+    return ChatNotice(
+        level=PresentationNoticeLevel.DIM,
+        text=f"{help_result.source.value}: {help_result.topic}\n{content_preview}",
+    )
+
+
+def _build_chat_turn_presentation(
+    result: OrchestrationResult,
+    *,
+    policy: ChatSurfacePolicy,
+    interactive: bool,
+) -> ChatTurnPresentation:
+    primary_text = result.assistant_message.content.strip()
+    notices: list[ChatNotice] = []
+    explanation_messages = [
+        str(item.artifact.get("message", "")).strip()
+        for item in result.execution_results
+        if item.artifact_type is ExecutionArtifactType.EXPLANATION and item.artifact is not None
+    ]
+    seen_messages = {primary_text}
+    for message in explanation_messages:
+        if message and message not in seen_messages:
+            notices.append(
+                ChatNotice(
+                    level=PresentationNoticeLevel.DIM,
+                    text=message,
+                )
+            )
+            seen_messages.add(message)
+
+    summary_text = result.summary.text.strip()
+    if (result.plan.actions or result.execution_results) and summary_text not in seen_messages:
+        notices.insert(
+            0,
+            ChatNotice(
+                level=_notice_level_for_result(result),
+                text=summary_text,
+            ),
+        )
+        seen_messages.add(summary_text)
+
+    for execution_result in result.execution_results:
+        artifact_notice = _artifact_preview_notice(execution_result)
+        if artifact_notice is not None and artifact_notice.text not in seen_messages:
+            notices.append(artifact_notice)
+            seen_messages.add(artifact_notice.text)
+
+    audit_ref = None
+    if policy.show_audit_refs and _has_hidden_chat_detail(result):
+        audit_ref = _detail_ref_for_result(result)
+        if audit_ref is not None:
+            hint = (
+                f"Session {audit_ref.session_id[:8]} saved. Use "
+                f"{InteractiveDetailCommand.PLAN.value}, "
+                f"{InteractiveDetailCommand.ACTIONS.value}, or "
+                f"{InteractiveDetailCommand.SUMMARY.value} for detail."
+                if interactive
+                else (
+                    f"Session {audit_ref.session_id[:8]} saved. Re-run with `--render verbose` "
+                    f"or inspect with `{audit_ref.trace_hint}`."
+                )
+            )
+            notices.append(
+                ChatNotice(
+                    level=PresentationNoticeLevel.DIM,
+                    text=hint,
+                )
+            )
+
+    return ChatTurnPresentation(
+        primary_text=primary_text,
+        notices=notices,
+        audit_ref=audit_ref,
+    )
+
+
 def _render_action_plan(result: OrchestrationResult) -> None:
     if not result.plan.actions:
         console.print(Text("No actions planned.", style="dim"))
         return
 
     decisions = {decision.action_id: decision for decision in result.policy_decisions}
+    evaluations = {record.action_id: record for record in result.policy_evaluations}
     table = Table(title="Planned Actions")
     table.add_column("Id", style="cyan")
     table.add_column("Kind")
@@ -1224,7 +1845,12 @@ def _render_action_plan(result: OrchestrationResult) -> None:
     table.add_column("Policy")
     for action in result.plan.actions:
         decision = decisions.get(action.id)
-        policy_text = "-" if decision is None else decision.decision.value
+        evaluation = evaluations.get(action.id)
+        policy_text = "-"
+        if evaluation is not None:
+            policy_text = evaluation.verdict.outcome.value
+        elif decision is not None:
+            policy_text = decision.decision.value
         table.add_row(action.id, action.kind.value, action.summary, policy_text)
     console.print(table)
 
@@ -1276,6 +1902,18 @@ def _render_chat_execution_result(
         console.print(Text(str(message), style="dim"))
 
 
+def _render_chat_execution_details(
+    result: OrchestrationResult,
+    *,
+    streamed_shell_output: bool,
+) -> None:
+    for execution_result in result.execution_results:
+        _render_chat_execution_result(
+            execution_result,
+            streamed_shell_output=streamed_shell_output,
+        )
+
+
 def _render_orchestration_summary(result: OrchestrationResult) -> None:
     usage = result.planning_metadata.usage
     usage_text = "unknown"
@@ -1294,6 +1932,83 @@ def _render_orchestration_summary(result: OrchestrationResult) -> None:
             title="Orchestration Summary",
         )
     )
+
+
+def _render_concise_chat_turn(
+    result: OrchestrationResult,
+    *,
+    policy: ChatSurfacePolicy,
+    interactive: bool,
+) -> None:
+    presentation = _build_chat_turn_presentation(
+        result,
+        policy=policy,
+        interactive=interactive,
+    )
+    console.print(presentation.primary_text)
+    style_map = {
+        PresentationNoticeLevel.INFO: "cyan",
+        PresentationNoticeLevel.WARNING: "yellow",
+        PresentationNoticeLevel.ERROR: "bold red",
+        PresentationNoticeLevel.DIM: "dim",
+    }
+    for notice in presentation.notices:
+        console.print(Text(notice.text, style=style_map[notice.level]))
+
+
+def _render_verbose_chat_turn(
+    result: OrchestrationResult,
+    *,
+    streamed_shell_output: bool,
+) -> None:
+    _render_assistant_message(result)
+    _render_action_plan(result)
+    _render_chat_execution_details(
+        result,
+        streamed_shell_output=streamed_shell_output,
+    )
+    _render_orchestration_summary(result)
+
+
+def _render_chat_turn(
+    result: OrchestrationResult,
+    *,
+    render_mode: RenderMode,
+    interactive: bool = False,
+    streamed_shell_output: bool = False,
+) -> None:
+    if render_mode is RenderMode.VERBOSE:
+        _render_verbose_chat_turn(
+            result,
+            streamed_shell_output=streamed_shell_output,
+        )
+        return
+    _render_concise_chat_turn(
+        result,
+        policy=_chat_surface_policy(render_mode),
+        interactive=interactive,
+    )
+
+
+def _render_interactive_detail(
+    result: OrchestrationResult,
+    command: InteractiveDetailCommand,
+) -> None:
+    if command is InteractiveDetailCommand.PLAN:
+        _render_action_plan(result)
+        return
+    if command is InteractiveDetailCommand.ACTIONS:
+        if not result.execution_results:
+            console.print(
+                Text(
+                    "No execution details were recorded for the last request.",
+                    style="dim",
+                )
+            )
+            return
+        _render_chat_execution_details(result, streamed_shell_output=False)
+        return
+    _render_orchestration_summary(result)
 
 
 def _render_history_list(sessions: list[HistorySessionSummary]) -> None:
@@ -1355,15 +2070,33 @@ def _render_history_detail(session: HistorySessionDetail) -> None:
     if session.approvals:
         table = Table(title="Approvals")
         table.add_column("Action", style="cyan")
+        table.add_column("Capability")
         table.add_column("Status")
         table.add_column("Mode")
         table.add_column("Reason")
         for approval in session.approvals:
             table.add_row(
                 approval.action_id or "-",
+                approval.capability_id or "-",
                 approval.status.value,
                 approval.mode,
                 approval.reason,
+            )
+        console.print(table)
+
+    if session.policy_evaluations:
+        table = Table(title="Policy Evaluations")
+        table.add_column("Action", style="cyan")
+        table.add_column("Capability")
+        table.add_column("Outcome")
+        table.add_column("Reasons")
+        for record in session.policy_evaluations:
+            reasons = ", ".join(code.value for code in record.verdict.reason_codes) or "-"
+            table.add_row(
+                record.action_id,
+                record.capability_id,
+                record.verdict.outcome.value,
+                reasons,
             )
         console.print(table)
 
@@ -1396,6 +2129,126 @@ def _render_history_detail(session: HistorySessionDetail) -> None:
                 "-" if command.exit_code is None else str(command.exit_code),
             )
         console.print(table)
+
+
+def _render_trace_list(traces: list[TraceSummary]) -> None:
+    if not traces:
+        console.print("No traces recorded yet.")
+        return
+
+    table = Table(title="Trace History")
+    table.add_column("Trace", style="cyan")
+    table.add_column("Status")
+    table.add_column("Started")
+    table.add_column("Steps", justify="right")
+    table.add_column("Capabilities")
+    table.add_column("Request")
+    for trace in traces:
+        capabilities = ", ".join(trace.selected_capability_ids) or "-"
+        table.add_row(
+            trace.trace_id,
+            trace.status.value,
+            trace.started_at,
+            str(trace.step_count),
+            capabilities,
+            trace.request_text or "-",
+        )
+    console.print(table)
+
+
+def _render_trace_detail(trace: TraceRecord) -> None:
+    console.print(
+        Panel.fit(
+            f"Trace: [cyan]{trace.trace_id}[/cyan]\n"
+            f"Status: [cyan]{trace.status.value}[/cyan]\n"
+            f"Started: [cyan]{trace.started_at}[/cyan]\n"
+            f"Completed: [cyan]{trace.completed_at or '-'}[/cyan]\n"
+            f"Steps: [cyan]{trace.summary.step_count}[/cyan]",
+            title="Trace Detail",
+        )
+    )
+    if trace.request_text:
+        console.print(Panel.fit(trace.request_text, title="Request"))
+
+    summary = trace.summary
+    console.print(
+        Panel.fit(
+            f"Executed: [cyan]{summary.executed_steps}[/cyan]\n"
+            f"Pending approval: [cyan]{summary.pending_approval_steps}[/cyan]\n"
+            f"Blocked: [cyan]{summary.blocked_steps}[/cyan]\n"
+            f"Failed: [cyan]{summary.failed_steps}[/cyan]\n"
+            f"Skipped: [cyan]{summary.skipped_steps}[/cyan]",
+            title="Trace Summary",
+        )
+    )
+
+    if trace.edges:
+        edge_table = Table(title="Trace Edges")
+        edge_table.add_column("Source", style="cyan")
+        edge_table.add_column("Target")
+        edge_table.add_column("Kind")
+        for edge in trace.edges:
+            edge_table.add_row(edge.source_step_id, edge.target_step_id, edge.edge_kind.value)
+        console.print(edge_table)
+
+    if trace.steps:
+        step_table = Table(title="Trace Steps")
+        step_table.add_column("Step", style="cyan")
+        step_table.add_column("Type")
+        step_table.add_column("Status")
+        step_table.add_column("Capability")
+        step_table.add_column("Why")
+        for step in trace.steps:
+            if step.step_type.value == "planning":
+                status = "planned"
+                capability = "-"
+                why = ", ".join(reason.summary for reason in step.selection_reasons) or "-"
+            else:
+                status = step.status.value
+                capability = step.capability_id or "-"
+                why = step.selection_reason.detail or step.selection_reason.summary
+            step_table.add_row(
+                step.step_id,
+                step.step_type.value,
+                status,
+                capability,
+                why,
+            )
+        console.print(step_table)
+
+
+def _render_audit_report(report: AuditReport) -> None:
+    status_text = "pass" if report.completeness_passed else "fail"
+    console.print(
+        Panel.fit(
+            f"Trace: [cyan]{report.trace_summary.trace_id}[/cyan]\n"
+            f"Completeness: [cyan]{status_text}[/cyan]\n"
+            f"Inspected step: [cyan]{report.inspected_step_id or 'all'}[/cyan]",
+            title="Audit Report",
+        )
+    )
+    if report.notes:
+        console.print(Panel.fit("\n".join(report.notes), title="Notes"))
+    if report.missing_fields_by_step:
+        table = Table(title="Missing Fields")
+        table.add_column("Step", style="cyan")
+        table.add_column("Fields")
+        for step_id, fields in report.missing_fields_by_step.items():
+            table.add_row(step_id, ", ".join(fields))
+        console.print(table)
+    _render_trace_detail(
+        TraceRecord(
+            trace_id=report.trace_summary.trace_id,
+            session_id=report.trace_summary.session_id,
+            request_text=report.trace_summary.request_text,
+            status=report.trace_summary.status,
+            started_at=report.trace_summary.started_at,
+            completed_at=report.trace_summary.completed_at,
+            steps=report.steps,
+            edges=report.edges,
+            summary=report.trace_summary,
+        )
+    )
 
 
 def _resolve_cli_request_cwd(workspace_root: Path, cwd: Path | None) -> Path:
@@ -1729,6 +2582,14 @@ def chat(
             help="Generate and validate a structured plan without executing allowed actions.",
         ),
     ] = False,
+    render_mode: Annotated[
+        RenderMode,
+        typer.Option(
+            "--render",
+            case_sensitive=False,
+            help="Choose concise or verbose chat presentation.",
+        ),
+    ] = RenderMode.CONCISE,
     as_json: Annotated[
         bool,
         typer.Option(
@@ -1736,6 +2597,20 @@ def chat(
             help="Emit the orchestration result as JSON.",
         ),
     ] = False,
+    new_session: Annotated[
+        bool,
+        typer.Option(
+            "--new",
+            help="Start a fresh persistent interactive session.",
+        ),
+    ] = False,
+    resume_session: Annotated[
+        str | None,
+        typer.Option(
+            "--resume",
+            help="Resume one persistent interactive session by id.",
+        ),
+    ] = None,
 ) -> None:
     """Run the Stage 7 interactive chat loop or the one-shot planning flow."""
     settings = _load_runtime_settings(ctx)
@@ -1744,7 +2619,21 @@ def chat(
         request_parts = request_parts[1:]
     request_text = " ".join(request_parts).strip()
 
-    logger.info("command_invoked name=chat plan_only=%s cwd=%s", plan_only, cwd)
+    logger.info(
+        "command_invoked name=chat plan_only=%s render_mode=%s cwd=%s new_session=%s "
+        "resume_session=%s",
+        plan_only,
+        render_mode.value,
+        cwd,
+        new_session,
+        resume_session,
+    )
+
+    if new_session and resume_session is not None:
+        console.print(
+            "[bold red]Chat error:[/bold red] Use either `--new` or `--resume`, not both."
+        )
+        raise typer.Exit(code=2)
 
     if not request_text:
         if as_json:
@@ -1757,8 +2646,38 @@ def chat(
         except ValueError as exc:
             console.print(f"[bold red]Chat error:[/bold red] {exc}")
             raise typer.Exit(code=2) from exc
-        _run_interactive_chat(settings, initial_cwd=initial_cwd, plan_only=plan_only)
+        resume_target = (
+            ResumeTarget.explicit(resume_session)
+            if resume_session is not None
+            else ResumeTarget.latest()
+        )
+        if new_session:
+            session_manager = _build_session_manager(settings)
+            try:
+                new_state = session_manager.create_session(
+                    initial_cwd=initial_cwd,
+                    approval_mode=settings.approval.mode.value,
+                    model=settings.provider.model,
+                )
+            except ValueError as exc:
+                console.print(f"[bold red]Chat error:[/bold red] {exc}")
+                raise typer.Exit(code=2) from exc
+            resume_target = ResumeTarget.explicit(new_state.session_id)
+        _run_interactive_chat(
+            settings,
+            initial_cwd=initial_cwd,
+            plan_only=plan_only,
+            render_mode=render_mode,
+            resume_target=resume_target,
+        )
         return
+
+    if new_session or resume_session is not None:
+        console.print(
+            "[bold red]Chat error:[/bold red] `--new` and `--resume` are only "
+            "supported for interactive `foundation chat` sessions."
+        )
+        raise typer.Exit(code=2)
 
     try:
         result = _execute_chat_request(
@@ -1781,11 +2700,7 @@ def chat(
         console.print_json(data=result.model_dump(mode="json"))
         return
 
-    _render_assistant_message(result)
-    _render_action_plan(result)
-    for execution_result in result.execution_results:
-        _render_chat_execution_result(execution_result)
-    _render_orchestration_summary(result)
+    _render_chat_turn(result, render_mode=render_mode)
 
 
 @config_app.callback()
@@ -2159,6 +3074,102 @@ def history(
         console.print_json(data=[record.model_dump(mode="json") for record in records])
         return
     _render_history_list(records)
+
+
+@app.command()
+def trace(
+    ctx: typer.Context,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            min=1,
+            help="Maximum number of traces to list.",
+        ),
+    ] = 20,
+    session: Annotated[
+        str | None,
+        typer.Option(
+            "--session",
+            help="Show the trace for one session id.",
+        ),
+    ] = None,
+    step: Annotated[
+        str | None,
+        typer.Option(
+            "--step",
+            help="Show one trace step. Requires --session.",
+        ),
+    ] = None,
+    predecessors: Annotated[
+        bool,
+        typer.Option(
+            "--predecessors",
+            help="Include causal predecessors when --step is set.",
+        ),
+    ] = False,
+    audit: Annotated[
+        bool,
+        typer.Option(
+            "--audit",
+            help="Render the audit report instead of the raw trace.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit JSON instead of Rich-rendered output.",
+        ),
+    ] = False,
+) -> None:
+    """Inspect Stage 3 traces and audit reports."""
+    settings = _load_runtime_settings(ctx)
+    logger.info(
+        "command_invoked name=trace session=%s step=%s limit=%s",
+        session,
+        step,
+        limit,
+    )
+    trace_store = _build_history_store(settings)
+
+    if step is not None and session is None:
+        console.print("[bold red]Trace error:[/bold red] `--step` requires `--session`.")
+        raise typer.Exit(code=2)
+
+    if session is None:
+        records = trace_store.list_traces(limit=limit)
+        if as_json:
+            console.print_json(data=[record.model_dump(mode="json") for record in records])
+            return
+        _render_trace_list(records)
+        return
+
+    query = TraceQuery(
+        session_id=session,
+        step_id=step,
+        include_predecessors=predecessors,
+        limit=limit,
+    )
+    if audit:
+        report = trace_store.get_audit_report(query)
+        if report is None:
+            console.print(f"[bold red]Trace error:[/bold red] Unknown session id {session}.")
+            raise typer.Exit(code=1)
+        if as_json:
+            console.print_json(data=report.model_dump(mode="json"))
+            return
+        _render_audit_report(report)
+        return
+
+    record = trace_store.get_trace(query)
+    if record is None:
+        console.print(f"[bold red]Trace error:[/bold red] Unknown trace or step for {session}.")
+        raise typer.Exit(code=1)
+    if as_json:
+        console.print_json(data=record.model_dump(mode="json"))
+        return
+    _render_trace_detail(record)
 
 
 @app.command()

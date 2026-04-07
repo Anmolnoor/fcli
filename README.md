@@ -1,6 +1,6 @@
 # Foundation CLI
 
-Foundation CLI is a local-first, shell-native assistant that follows an explicit `plan -> approve -> execute -> observe` loop. This repository now includes the Stage 6 foundation plus the first Stage 7 interactive chat slice: typed configuration, config inspection and validation commands, environment readiness checks, a real shell runtime with buffered, streaming, and PTY-backed execution, typed local-context tooling, model adapters for OpenAI and Ollama, a one-shot orchestrator, SQLite-backed history, approval flows, workspace guardrails, and an interactive `foundation chat` session loop.
+Foundation CLI is a local-first, shell-native assistant that follows an explicit `plan -> approve -> execute -> observe` loop. This repository now includes the Stage 6 foundation, the Stage 00 bridge for persistent conversational sessions, the v2 Stage 1 capability registry, the v2 Stage 2 capability policy engine, the v2 Stage 3 trace and audit foundation, and the v2 Stage 4 quiet chat surface: typed configuration, config inspection and validation commands, environment readiness checks, a real shell runtime with buffered, streaming, and PTY-backed execution, typed local-context tooling, model adapters for OpenAI and Ollama, a one-shot orchestrator split across planner, executor, and observer responsibilities, a local capability store with built-in manifest seeding and health checks, capability-aware approval flows, executor-side policy constraints, SQLite-backed history plus step-level trace persistence, trace and audit inspection commands, and an interactive `foundation chat` session shell with layered memory, resume support, and concise-by-default chat rendering.
 
 ## Requirements
 - Python 3.12
@@ -78,14 +78,17 @@ plans/                  Stage-by-stage implementation plans
 ```
 
 ## Current CLI Surface
-`foundation chat` now supports both an interactive Stage 7 session loop and the Stage 6 one-shot orchestration flow when a request is passed explicitly.
+`foundation chat` now supports both a persistent interactive session shell and the Stage 6 one-shot orchestration flow when a request is passed explicitly.
 
 ```bash
 foundation run -- pwd
 foundation run --mode buffered -- python -c "print('hello')"
 foundation run --mode pty -- python -c "import sys; print(sys.stdout.isatty())"
 foundation chat
+foundation chat --new
+foundation chat --resume <session-id>
 foundation chat summarize the current git status
+foundation chat --render verbose summarize the current git status
 foundation chat --plan-only find TODO comments under src
 foundation chat --json inspect the workspace root
 foundation config
@@ -101,10 +104,13 @@ foundation tools tldr git
 foundation history
 foundation history --json
 foundation history --session <session-id>
+foundation trace
+foundation trace --session <session-id>
+foundation trace --session <session-id> --step <step-id> --predecessors --audit
 foundation doctor
 ```
 
-`foundation chat` now opens an interactive session when no request is supplied. Inside the session, natural-language requests still use the structured planner, `!` runs a direct shell command through the same guardrail and approval flow, prompt history persists to disk, and slash commands such as `/help`, `/history`, `/config`, `/cwd`, `/approval`, `/clear`, and `/reset` provide session-local controls. When a request is supplied explicitly, `foundation chat` still gathers local context, asks the configured provider for a structured plan, validates it through Pydantic contracts, auto-executes allowed actions, prompts or defers when approval is required, and persists the request, plan, approvals, and outcomes into the history database. `foundation run` is also audited into history, and `foundation history` can list recent sessions or render one session in detail. `foundation tools availability` still shows which local binaries are present, and `search`, `files`, and `git` remain available as direct subcommands.
+`foundation chat` now resumes the latest compatible interactive session by default when no request is supplied. Use `--new` to start fresh or `--resume <session-id>` to reopen one explicit session. Chat rendering is concise by default in both one-shot and interactive mode; pass `--render verbose` when you want the full assistant panel, plan table, execution panels, and orchestration summary inline. Inside the session, natural-language requests still use the structured planner, `!` runs a direct shell command through the same capability policy and approval flow, session state is checkpointed into SQLite, and slash commands such as `/plan`, `/actions`, `/summary`, `/memory`, `/sessions`, `/resume`, `/compact`, `/model`, `/tools`, `/history`, `/config`, `/cwd`, `/approval`, `/clear`, and `/reset` provide session-local controls. Global memory lives in `~/.config/foundation/FOUNDATION.md`, project memory lives in `<workspace-root>/FOUNDATION.md`, and older turns are compacted into a persisted session summary while recent turns stay in the active prompt window. When a request is supplied explicitly, `foundation chat` gathers local context, asks the configured provider for a structured plan, validates it through Pydantic contracts, evaluates every runnable capability through the Stage 2 policy engine, auto-executes allowed actions, prompts or defers when approval is required, and persists the request, plan, policy evaluations, approvals, outcomes, step-level traces, and causal edges into the history database. The runtime now records a planning step plus per-action execution steps with stable artifact references, manifest fingerprints, policy snapshots, and audit-oriented event records. The planner consumes a local capability snapshot sourced from `<data_dir>/capabilities`, with built-in manifests seeded for search, files, git, local help, and shell-backed execution. Runtime logs route to the configured log file instead of interleaving with the normal chat transcript unless debug logging is enabled. `foundation run` is also audited into history, `foundation history` can list recent sessions or render one session in detail, and `foundation trace` can inspect full traces, one step plus its predecessors, or an audit report. `foundation tools availability` still shows which local binaries are present, and `search`, `files`, and `git` remain available as direct subcommands.
 
 ## Configuration
 Foundation reads settings in this order:
@@ -185,10 +191,10 @@ foundation --provider ollama --model gpt-oss:20b chat inspect the workspace root
 foundation --provider ollama --model gpt-oss:120b-cloud --base-url https://ollama.com/api doctor
 ```
 
-`foundation config show` prints the effective configuration without exposing secret values, including the resolved provider base URL. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, and Stage 4 tool binary availability.
+`foundation config show` prints the effective configuration without exposing secret values, including the resolved provider base URL. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, history and log readiness, and capability registry health for the seeded built-ins.
 
 ## Known Limitations
-- The Stage 7 interactive chat loop is an MVP slice. Per-turn planner requests and direct `!` shell commands are persisted, but the full long-lived conversational memory model is not implemented yet.
+- The persistent chat shell is still a bridge stage on top of the v1 runtime. Built-in tools now flow through the Stage 3 trace-aware runtime, but external-service and user-authored capabilities are still modeled locally before later stages make them executable.
 - Approval decisions are per-action and per-invocation. Persistent allowlists or reusable approval rules are not implemented yet.
 - Secret lookup is read-only in Stage 2. The CLI can validate and consume keychain or environment credentials, but it does not write credentials yet.
 - `foundation doctor` reports missing-but-creatable directories as warnings rather than mutating the filesystem.
@@ -200,8 +206,9 @@ foundation --provider ollama --model gpt-oss:120b-cloud --base-url https://ollam
 - `src/foundation/logging.py` provides a small stdlib logging baseline that later stages can replace or expand.
 - `src/foundation/services/tools.py` owns the typed Stage 4 local-context wrappers and shared ignore-rule filtering.
 - `src/foundation/services/provider.py` owns the Stage 5 provider adapter contract plus the OpenAI and Ollama implementations.
-- `src/foundation/services/orchestrator.py` owns the structured planning, approval, execution, and audit loop.
-- `src/foundation/services/history.py` owns the Stage 6 SQLite persistence and history queries.
-- `src/foundation/services/guardrails.py` owns Stage 6 shell-action classification and workspace guardrails.
-- `src/foundation/services/approval.py` owns Stage 6 prompt/manual/auto approval resolution.
+- `src/foundation/services/planner.py`, `src/foundation/services/executor.py`, and `src/foundation/services/observer.py` split the Stage 3 runtime into planning, execution, and audit responsibilities.
+- `src/foundation/services/orchestrator.py` coordinates the structured planning, approval, execution, and audit loop across those services.
+- `src/foundation/services/history.py` owns the Stage 6 SQLite persistence, trace storage, audit queries, and history views.
+- `src/foundation/services/guardrails.py` owns the Stage 2 capability policy engine and shell-backed capability classification.
+- `src/foundation/services/approval.py` owns Stage 2 capability-aware prompt/manual/auto approval resolution.
 - `./scripts/uv` wraps the project-local `uv` binary, pins `UV_CACHE_DIR` to `.uv-cache/`, and defaults `uv run` to `UV_NO_SYNC=1` so verification stays reliable in restricted environments.

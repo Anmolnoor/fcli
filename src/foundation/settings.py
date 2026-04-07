@@ -435,6 +435,7 @@ class AppSettings(BaseSettings):
             "env_file_path": str(self.env_file_path),
             "workspace_root": str(self.app.workspace_root),
             "data_dir": str(self.app.data_dir),
+            "capability_store": str(self.app.data_dir / "capabilities"),
             "state_dir": str(self.app.state_dir),
             "log_dir": str(self.app.log_dir),
             "history_database": str(self.history.database_path),
@@ -466,12 +467,11 @@ class AppSettings(BaseSettings):
     def safe_dump(self) -> dict[str, Any]:
         """Return a safe rendering of the effective config without secret values."""
         payload = self.model_dump(mode="json")
+        keychain_ref = self.provider.effective_api_key_keychain()
         payload["provider"]["api_key"] = "[redacted]"
         payload["provider"]["api_key_env_var"] = self.provider.effective_api_key_env_var()
         payload["provider"]["api_key_keychain"] = (
-            self.provider.effective_api_key_keychain().model_dump(mode="json")
-            if self.provider.effective_api_key_keychain() is not None
-            else None
+            None if keychain_ref is None else keychain_ref.model_dump(mode="json")
         )
         payload["provider"]["resolved_base_url"] = self.provider.effective_base_url()
         payload["provider"]["credential_source_order"] = self.provider.credential_source_order()

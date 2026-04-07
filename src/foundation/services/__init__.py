@@ -1,13 +1,26 @@
 """Service-layer package for Foundation CLI."""
 
 from foundation.services.approval import ApprovalPrompt, ApprovalService
-from foundation.services.guardrails import GuardrailPolicyEngine, SimplePolicyEngine
-from foundation.services.history import HistoryStore
+from foundation.services.capabilities import (
+    CapabilityDocument,
+    CapabilityRegistry,
+    CapabilityResolver,
+    CapabilityStore,
+)
+from foundation.services.executor import ActionExecutionEnvelope, ActionExecutor
+from foundation.services.guardrails import (
+    CapabilityPolicyEngine,
+    GuardrailPolicyEngine,
+    SimplePolicyEngine,
+)
+from foundation.services.history import HistoryStore, TraceStore
+from foundation.services.observer import ObserverService
 from foundation.services.orchestrator import (
     OrchestrationError,
     OrchestrationPlanError,
     RequestOrchestrator,
 )
+from foundation.services.planner import PlannerService, PlanningError
 from foundation.services.provider import (
     OllamaChatAdapter,
     OpenAIResponsesAdapter,
@@ -16,6 +29,7 @@ from foundation.services.provider import (
     ProviderErrorCode,
     build_provider_adapter,
 )
+from foundation.services.session import ConversationCompactor, SessionManager
 from foundation.services.shell import (
     ExecutionMode,
     OutputStream,
@@ -56,6 +70,14 @@ from foundation.services.tools import (
 __all__ = [
     "ApprovalPrompt",
     "ApprovalService",
+    "ActionExecutionEnvelope",
+    "ActionExecutor",
+    "CapabilityDocument",
+    "CapabilityRegistry",
+    "CapabilityResolver",
+    "CapabilityStore",
+    "CapabilityPolicyEngine",
+    "ConversationCompactor",
     "ExecutionMode",
     "FileDiscoveryRequest",
     "FileDiscoveryResult",
@@ -71,11 +93,14 @@ __all__ = [
     "HelpLookupSource",
     "HistoryStore",
     "LocalToolService",
+    "ObserverService",
     "OpenAIResponsesAdapter",
     "OllamaChatAdapter",
     "OrchestrationError",
     "OrchestrationPlanError",
     "OutputStream",
+    "PlannerService",
+    "PlanningError",
     "ProviderAdapter",
     "ProviderError",
     "ProviderErrorCode",
@@ -83,6 +108,7 @@ __all__ = [
     "SearchMatch",
     "SearchRequest",
     "SearchResult",
+    "SessionManager",
     "ShellCommandRequest",
     "ShellCommandResult",
     "ShellExecutionCancelled",
@@ -97,6 +123,7 @@ __all__ = [
     "ToolError",
     "ToolErrorCode",
     "ToolExecutionError",
+    "TraceStore",
     "WorkspaceRewriteStager",
     "WorkspacePathFilter",
     "build_provider_adapter",

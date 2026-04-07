@@ -65,6 +65,7 @@ class ShellCommandRequest(BaseModel):
     cwd: Path | None = None
     env_overlay: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: PositiveInt | None = None
+    capture_limit_kb: PositiveInt | None = None
     mode: ExecutionMode = ExecutionMode.BUFFERED
     approval_context: dict[str, Any] = Field(default_factory=dict)
 
@@ -415,13 +416,16 @@ class ShellRuntime:
 
         env = os.environ.copy()
         env.update(request.env_overlay)
+        capture_limit_bytes = self._capture_limit_bytes
+        if request.capture_limit_kb is not None:
+            capture_limit_bytes = min(capture_limit_bytes, request.capture_limit_kb * 1024)
 
         return _PreparedCommand(
             request=request,
             cwd=cwd,
             env=env,
             timeout_seconds=timeout_seconds,
-            capture_limit_bytes=self._capture_limit_bytes,
+            capture_limit_bytes=capture_limit_bytes,
         )
 
     def _resolve_cwd(self, value: Path | None) -> Path:

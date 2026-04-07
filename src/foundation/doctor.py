@@ -11,8 +11,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from foundation.models import CapabilityHealth, CapabilityState
 from foundation.observability import emit_event
-from foundation.services import LocalToolService, ToolAvailabilityStatus
+from foundation.services import CapabilityRegistry, CapabilityStore, LocalToolService
 from foundation.services.history import HistoryStore
 from foundation.settings import (
     AppSettings,
@@ -301,59 +302,116 @@ def _secret_lookup_check(
     )
 
 
-def _external_tools_check(
+def _capability_registry_check(
     settings: AppSettings,
     *,
     environment: Mapping[str, str] | None = None,
 ) -> DoctorCheck:
+    store_root = settings.app.data_dir / "capabilities"
+    detail_lines: list[str] = []
+    store_missing_but_creatable = False
+
+    if store_root.exists():
+        if not store_root.is_dir():
+            return DoctorCheck(
+                name="Capability registry",
+                status=DoctorStatus.FAIL,
+                summary="Capability store root is not a directory.",
+                detail=f"{store_root} exists but is not a directory.",
+            )
+    else:
+        parent = _nearest_existing_parent(store_root)
+        if not os.access(parent, os.W_OK):
+            return DoctorCheck(
+                name="Capability registry",
+                status=DoctorStatus.FAIL,
+                summary="Capability store is blocked by filesystem permissions.",
+                detail=f"Cannot create capability store under {parent}.",
+            )
+        store_missing_but_creatable = True
+        detail_lines.append(
+            f"Capability store root: {store_root} is missing but creatable from {parent}."
+        )
+
     service = LocalToolService(
         workspace_root=settings.workspace_root,
         default_timeout_seconds=min(settings.shell.default_timeout_seconds, 30),
         capture_limit_kb=settings.shell.capture_limit_kb,
         environment=environment,
     )
-    availability = service.availability_report()
-
-    missing_required = [
-        item
-        for item in availability
-        if item.required and item.status is not ToolAvailabilityStatus.AVAILABLE
-    ]
-    missing_optional = [
-        item
-        for item in availability
-        if not item.required and item.status is not ToolAvailabilityStatus.AVAILABLE
-    ]
-
-    detail_lines = []
-    for item in availability:
-        state = "available" if item.status is ToolAvailabilityStatus.AVAILABLE else "missing"
-        resolved = f" ({item.resolved_command}: {item.path})" if item.path is not None else ""
-        line = f"{item.name}: {state}{resolved}"
-        if item.status is not ToolAvailabilityStatus.AVAILABLE and item.install_hint:
-            line = f"{line} | {item.install_hint}"
-        detail_lines.append(line)
-
-    if missing_required:
+    try:
+        registry = CapabilityRegistry(
+            store=CapabilityStore(store_root, create_root=False),
+            tool_service=service,
+            read_only=True,
+        )
+        capabilities = registry.list_capabilities()
+        invalid_documents = registry.invalid_manifests()
+    except Exception as exc:
         return DoctorCheck(
-            name="External tools",
+            name="Capability registry",
             status=DoctorStatus.FAIL,
-            summary="Required Stage 4 tool binaries are missing.",
+            summary="Capability registry could not be inspected.",
+            detail=str(exc),
+        )
+
+    failed_required: list[str] = []
+    warned_optional: list[str] = []
+
+    for document in invalid_documents:
+        failed_required.append(f"Invalid manifest: {document.path}")
+        detail_lines.append(f"{document.path}: invalid manifest | {document.error}")
+
+    for capability in capabilities:
+        required = bool(capability.transport_config.get("required", False))
+        status = capability.health.value
+        line = (
+            f"{capability.id}@{capability.version}: {capability.state.value}, {status}"
+        )
+        if capability.health_detail:
+            line = f"{line} | {capability.health_detail}"
+        detail_lines.append(line)
+        if capability.state is CapabilityState.DISABLED and required:
+            failed_required.append(f"{capability.id} is disabled.")
+            continue
+        if capability.health is CapabilityHealth.HEALTHY:
+            continue
+        if required:
+            failed_required.append(f"{capability.id} is unhealthy.")
+        else:
+            warned_optional.append(f"{capability.id} is unhealthy.")
+
+    if failed_required:
+        return DoctorCheck(
+            name="Capability registry",
+            status=DoctorStatus.FAIL,
+            summary="Required capabilities are invalid, disabled, or unhealthy.",
             detail="\n".join(detail_lines),
         )
 
-    if missing_optional:
+    if warned_optional:
+        summary = "Some optional capabilities are unavailable."
+        if store_missing_but_creatable:
+            summary = "Capability store is missing but creatable."
         return DoctorCheck(
-            name="External tools",
+            name="Capability registry",
             status=DoctorStatus.WARN,
-            summary="Some optional Stage 4 tool binaries are missing.",
+            summary=summary,
+            detail="\n".join(detail_lines),
+        )
+
+    if store_missing_but_creatable:
+        return DoctorCheck(
+            name="Capability registry",
+            status=DoctorStatus.WARN,
+            summary="Capability store is missing but creatable.",
             detail="\n".join(detail_lines),
         )
 
     return DoctorCheck(
-        name="External tools",
+        name="Capability registry",
         status=DoctorStatus.PASS,
-        summary="All configured Stage 4 tool binaries are available.",
+        summary="Enabled capabilities are healthy and queryable.",
         detail="\n".join(detail_lines),
     )
 
@@ -395,5 +453,5 @@ def run_doctor(
     checks.append(_secret_lookup_check(settings, environment=environment))
     checks.append(_database_health_check(settings))
     checks.append(_log_path_check(settings))
-    checks.append(_external_tools_check(settings, environment=environment))
+    checks.append(_capability_registry_check(settings, environment=environment))
     return DoctorReport(checks=checks)

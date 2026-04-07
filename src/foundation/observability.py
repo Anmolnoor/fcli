@@ -120,6 +120,15 @@ def _redact_payload(
     return redacted
 
 
+def redact_payload(
+    payload: Mapping[str, Any] | None,
+    *,
+    allow_text_values: set[str] | None = None,
+) -> dict[str, Any]:
+    """Return a redacted copy of one event payload."""
+    return _redact_payload(payload, allow_text_values=allow_text_values)
+
+
 def _event_payload(
     *,
     event_name: str,

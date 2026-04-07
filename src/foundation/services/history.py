@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from foundation.models import PolicyEvaluationRecord
 from foundation.models.history import (
     ApprovalRequest,
     ApprovalResolution,
@@ -21,10 +22,21 @@ from foundation.models.history import (
     SessionKind,
     SessionStatus,
 )
+from foundation.models.orchestration import ExecutionStatus
+from foundation.models.trace import (
+    AuditReport,
+    ExecutionStep,
+    PlanningStep,
+    TraceEdge,
+    TraceQuery,
+    TraceRecord,
+    TraceSummary,
+)
+from foundation.observability import redact_payload
 
 logger = logging.getLogger("foundation.services.history")
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 3
 _DEFAULT_MAX_BLOB_BYTES = 64 * 1024
 
 _SCHEMA_SQL = """
@@ -111,6 +123,26 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
     resolved_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS capability_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    action_id TEXT,
+    capability_id TEXT,
+    request_json TEXT NOT NULL,
+    resolution_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS policy_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    action_id TEXT NOT NULL,
+    capability_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS summarized_outcomes (
     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
     assistant_message TEXT,
@@ -131,11 +163,43 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trace_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    trace_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    step_type TEXT NOT NULL,
+    action_id TEXT,
+    capability_id TEXT,
+    capability_version TEXT,
+    status TEXT,
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, step_id)
+);
+
+CREATE TABLE IF NOT EXISTS trace_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    trace_id TEXT NOT NULL,
+    source_step_id TEXT NOT NULL,
+    target_step_id TEXT NOT NULL,
+    edge_kind TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session_id ON tool_calls(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_commands_session_id ON executed_commands(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_approvals_session_id ON approval_decisions(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_capability_approvals_session_id
+    ON capability_approvals(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_policy_evaluations_session_id
+    ON policy_evaluations(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_trace_steps_session_id ON trace_steps(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_trace_steps_lookup ON trace_steps(session_id, step_id);
+CREATE INDEX IF NOT EXISTS idx_trace_edges_session_id ON trace_edges(session_id, id);
 """
 
 
@@ -414,6 +478,7 @@ class HistoryStore:
         request: ApprovalRequest,
         resolution: ApprovalResolution,
     ) -> None:
+        created_at = _utcnow()
         with self._connect() as connection:
             connection.execute(
                 """
@@ -442,6 +507,27 @@ class HistoryStore:
                     resolution.resolved_at,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO capability_approvals (
+                    session_id,
+                    action_id,
+                    capability_id,
+                    request_json,
+                    resolution_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    request.action_id,
+                    request.capability_id,
+                    self._encode_json_blob(request.model_dump(mode="json")),
+                    self._encode_json_blob(resolution.model_dump(mode="json")),
+                    created_at,
+                ),
+            )
         self.record_event(
             session_id,
             "approval_recorded",
@@ -449,6 +535,45 @@ class HistoryStore:
                 "action_id": request.action_id,
                 "status": resolution.status.value,
                 "mode": resolution.mode,
+            },
+        )
+
+    def record_policy_evaluation(
+        self,
+        session_id: str,
+        *,
+        record: PolicyEvaluationRecord,
+    ) -> None:
+        created_at = _utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO policy_evaluations (
+                    session_id,
+                    action_id,
+                    capability_id,
+                    outcome,
+                    record_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    record.action_id,
+                    record.capability_id,
+                    record.verdict.outcome.value,
+                    self._encode_json_blob(record.model_dump(mode="json")),
+                    created_at,
+                ),
+            )
+        self.record_event(
+            session_id,
+            "policy_evaluation_recorded",
+            {
+                "action_id": record.action_id,
+                "capability_id": record.capability_id,
+                "outcome": record.verdict.outcome.value,
             },
         )
 
@@ -503,8 +628,180 @@ class HistoryStore:
                 INSERT INTO events (session_id, event_type, payload_json, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
-                (session_id, event_type, self._encode_json_blob(payload), created_at),
+                (
+                    session_id,
+                    event_type,
+                    self._encode_json_blob(redact_payload(payload)),
+                    created_at,
+                ),
             )
+
+    def record_trace_step(
+        self,
+        session_id: str,
+        *,
+        step: PlanningStep | ExecutionStep,
+    ) -> None:
+        created_at = step.completed_at
+        action_id = step.action_id if isinstance(step, ExecutionStep) else None
+        capability_id = step.capability_id if isinstance(step, ExecutionStep) else None
+        capability_version = step.capability_version if isinstance(step, ExecutionStep) else None
+        status = step.status.value if isinstance(step, ExecutionStep) else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO trace_steps (
+                    session_id,
+                    trace_id,
+                    step_id,
+                    step_type,
+                    action_id,
+                    capability_id,
+                    capability_version,
+                    status,
+                    record_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    step.trace_id,
+                    step.step_id,
+                    step.step_type.value,
+                    action_id,
+                    capability_id,
+                    capability_version,
+                    status,
+                    self._encode_json_blob(step.model_dump(mode="json")),
+                    created_at,
+                ),
+            )
+
+    def record_trace_edge(self, session_id: str, *, edge: TraceEdge) -> None:
+        created_at = _utcnow()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO trace_edges (
+                    session_id,
+                    trace_id,
+                    source_step_id,
+                    target_step_id,
+                    edge_kind,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    edge.trace_id,
+                    edge.source_step_id,
+                    edge.target_step_id,
+                    edge.edge_kind.value,
+                    created_at,
+                ),
+            )
+
+    def record_trace_edges(self, session_id: str, *, edges: list[TraceEdge]) -> None:
+        for edge in edges:
+            self.record_trace_edge(session_id, edge=edge)
+
+    def list_traces(self, *, limit: int = 20) -> list[TraceSummary]:
+        sessions = self.list_sessions(limit=limit)
+        with self._connect() as connection:
+            traces = [
+                self._trace_summary_for_session(
+                    connection,
+                    session_id=session.session_id,
+                    session_row=None,
+                )
+                for session in sessions
+            ]
+        return [trace for trace in traces if trace.step_count > 0]
+
+    def get_trace(self, query: TraceQuery) -> TraceRecord | None:
+        with self._connect() as connection:
+            session_row = self._session_row(connection, query.session_id)
+            if session_row is None:
+                return None
+            all_steps = self._load_trace_steps(connection, session_id=query.session_id)
+            all_edges = self._load_trace_edges(connection, session_id=query.session_id)
+
+        trace_summary = self._trace_summary_for_session(
+            None,
+            session_id=query.session_id,
+            session_row=session_row,
+            trace_steps=all_steps,
+        )
+        request_id = next((step.request_id for step in all_steps), None)
+
+        selected_step_ids: set[str] | None = None
+        if query.step_id is not None:
+            selected_step_ids = self._step_subset(
+                query.step_id,
+                steps=all_steps,
+                edges=all_edges,
+                include_predecessors=query.include_predecessors,
+            )
+            if not selected_step_ids:
+                return None
+
+        steps = (
+            all_steps
+            if selected_step_ids is None
+            else [step for step in all_steps if step.step_id in selected_step_ids]
+        )
+        edges = (
+            all_edges
+            if selected_step_ids is None
+            else [
+                edge
+                for edge in all_edges
+                if edge.source_step_id in selected_step_ids
+                and edge.target_step_id in selected_step_ids
+            ]
+        )
+
+        return TraceRecord(
+            trace_id=query.session_id,
+            session_id=query.session_id,
+            request_id=request_id,
+            request_text=session_row["request_text"],
+            status=session_row["status"],
+            started_at=session_row["started_at"],
+            completed_at=session_row["completed_at"],
+            steps=steps,
+            edges=edges,
+            summary=trace_summary,
+        )
+
+    def get_audit_report(self, query: TraceQuery) -> AuditReport | None:
+        trace = self.get_trace(query)
+        if trace is None:
+            return None
+        missing_fields_by_step = {
+            step.step_id: missing
+            for step in trace.steps
+            if (missing := self._missing_trace_fields(step))
+        }
+        completeness_passed = not missing_fields_by_step
+        notes: list[str] = []
+        if query.step_id is not None and query.include_predecessors:
+            notes.append("Showing the requested step plus its causal predecessors.")
+        elif query.step_id is not None:
+            notes.append("Showing the requested step only.")
+        elif not trace.steps:
+            notes.append("No trace steps were recorded for this session.")
+        return AuditReport(
+            trace_summary=trace.summary,
+            inspected_step_id=query.step_id,
+            steps=trace.steps,
+            edges=trace.edges,
+            completeness_passed=completeness_passed,
+            missing_fields_by_step=missing_fields_by_step,
+            notes=notes,
+        )
 
     def finalize_session(self, session_id: str, *, status: SessionStatus) -> None:
         completed_at = _utcnow()
@@ -605,31 +902,81 @@ class HistoryStore:
             if session_row is None:
                 return None
 
-            approvals = [
-                HistoryApprovalRecord.model_validate(
-                    {
-                        "action_id": row["action_id"],
-                        "mode": row["mode"],
-                        "status": row["status"],
-                        "reason": row["reason"],
-                        "risk_categories": self._load_json_list(row["risk_categories_json"]),
-                        "command_preview": row["command_preview"],
-                        "requested_at": row["requested_at"],
-                        "resolved_at": row["resolved_at"],
-                    }
+            approval_rows = connection.execute(
+                """
+                SELECT request_json, resolution_json
+                FROM capability_approvals
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            if approval_rows:
+                approvals = []
+                for row in approval_rows:
+                    request_payload = self._load_json_dict(row["request_json"]) or {}
+                    resolution_payload = self._load_json_dict(row["resolution_json"]) or {}
+                    approvals.append(
+                        HistoryApprovalRecord.model_validate(
+                            {
+                                "action_id": request_payload.get("action_id"),
+                                "capability_id": request_payload.get("capability_id"),
+                                "mode": resolution_payload.get("mode"),
+                                "status": resolution_payload.get("status"),
+                                "reason": resolution_payload.get("reason"),
+                                "risk_categories": request_payload.get("risk_categories", []),
+                                "reason_codes": resolution_payload.get("reason_codes", []),
+                                "requested_side_effects": request_payload.get(
+                                    "requested_side_effects",
+                                    [],
+                                ),
+                                "command_preview": request_payload.get("command_preview"),
+                                "requested_at": resolution_payload.get("requested_at"),
+                                "resolved_at": resolution_payload.get("resolved_at"),
+                            }
+                        )
+                    )
+            else:
+                approvals = [
+                    HistoryApprovalRecord.model_validate(
+                        {
+                            "action_id": row["action_id"],
+                            "mode": row["mode"],
+                            "status": row["status"],
+                            "reason": row["reason"],
+                            "risk_categories": self._load_json_list(row["risk_categories_json"]),
+                            "command_preview": row["command_preview"],
+                            "requested_at": row["requested_at"],
+                            "resolved_at": row["resolved_at"],
+                        }
+                    )
+                    for row in connection.execute(
+                        """
+                        SELECT
+                            action_id,
+                            mode,
+                            status,
+                            reason,
+                            risk_categories_json,
+                            command_preview,
+                            requested_at,
+                            resolved_at
+                        FROM approval_decisions
+                        WHERE session_id = ?
+                        ORDER BY id ASC
+                        """,
+                        (session_id,),
+                    ).fetchall()
+                ]
+
+            policy_evaluations = [
+                PolicyEvaluationRecord.model_validate(
+                    self._load_json_dict(row["record_json"]) or {}
                 )
                 for row in connection.execute(
                     """
-                    SELECT
-                        action_id,
-                        mode,
-                        status,
-                        reason,
-                        risk_categories_json,
-                        command_preview,
-                        requested_at,
-                        resolved_at
-                    FROM approval_decisions
+                    SELECT record_json
+                    FROM policy_evaluations
                     WHERE session_id = ?
                     ORDER BY id ASC
                     """,
@@ -755,10 +1102,216 @@ class HistoryStore:
             plan=self._load_json_dict(session_row["plan_json"]),
             planning_metadata=self._load_json_dict(session_row["planning_metadata_json"]),
             approvals=approvals,
+            policy_evaluations=policy_evaluations,
             tool_calls=tool_calls,
             commands=commands,
             events=events,
         )
+
+    def _session_row(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT
+                sessions.id,
+                sessions.kind,
+                sessions.status,
+                sessions.workspace_root,
+                sessions.request_cwd,
+                sessions.approval_mode,
+                sessions.plan_only,
+                sessions.command_preview,
+                sessions.started_at,
+                sessions.completed_at,
+                (
+                    SELECT content
+                    FROM user_messages
+                    WHERE user_messages.session_id = sessions.id
+                    ORDER BY user_messages.id ASC
+                    LIMIT 1
+                ) AS request_text,
+                summarized_outcomes.summary_text,
+                COALESCE(summarized_outcomes.executed_actions, 0) AS executed_actions,
+                COALESCE(summarized_outcomes.pending_approval_actions, 0)
+                    AS pending_approval_actions,
+                COALESCE(summarized_outcomes.blocked_actions, 0) AS blocked_actions,
+                COALESCE(summarized_outcomes.failed_actions, 0) AS failed_actions,
+                COALESCE(summarized_outcomes.skipped_actions, 0) AS skipped_actions,
+                summarized_outcomes.assistant_message AS summary_assistant_message,
+                assistant_plans.assistant_message AS plan_assistant_message,
+                assistant_plans.context_json,
+                assistant_plans.plan_json,
+                assistant_plans.planning_metadata_json
+            FROM sessions
+            LEFT JOIN summarized_outcomes
+                ON summarized_outcomes.session_id = sessions.id
+            LEFT JOIN assistant_plans
+                ON assistant_plans.session_id = sessions.id
+            WHERE sessions.id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+
+    def _load_trace_steps(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+    ) -> list[PlanningStep | ExecutionStep]:
+        rows = connection.execute(
+            """
+            SELECT record_json
+            FROM trace_steps
+            WHERE session_id = ?
+            ORDER BY id ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        return [
+            self._trace_step_from_payload(self._load_json_dict(row["record_json"]) or {})
+            for row in rows
+        ]
+
+    def _load_trace_edges(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+    ) -> list[TraceEdge]:
+        rows = connection.execute(
+            """
+            SELECT trace_id, source_step_id, target_step_id, edge_kind
+            FROM trace_edges
+            WHERE session_id = ?
+            ORDER BY id ASC
+            """,
+            (session_id,),
+        ).fetchall()
+        return [
+            TraceEdge(
+                trace_id=row["trace_id"],
+                source_step_id=row["source_step_id"],
+                target_step_id=row["target_step_id"],
+                edge_kind=row["edge_kind"],
+            )
+            for row in rows
+        ]
+
+    def _trace_step_from_payload(
+        self,
+        payload: dict[str, object],
+    ) -> PlanningStep | ExecutionStep:
+        step_type = payload.get("step_type")
+        if step_type == "planning":
+            return PlanningStep.model_validate(payload)
+        return ExecutionStep.model_validate(payload)
+
+    def _trace_summary_for_session(
+        self,
+        connection: sqlite3.Connection | None,
+        *,
+        session_id: str,
+        session_row: sqlite3.Row | None = None,
+        trace_steps: list[PlanningStep | ExecutionStep] | None = None,
+    ) -> TraceSummary:
+        if connection is None:
+            with self._connect() as new_connection:
+                return self._trace_summary_for_session(
+                    new_connection,
+                    session_id=session_id,
+                    session_row=session_row,
+                    trace_steps=trace_steps,
+                )
+        row = session_row or self._session_row(connection, session_id)
+        if row is None:
+            raise KeyError(f"Unknown session id {session_id}.")
+        steps = trace_steps or self._load_trace_steps(connection, session_id=session_id)
+        execution_steps = [step for step in steps if isinstance(step, ExecutionStep)]
+        capability_ids = sorted(
+            {
+                step.capability_id
+                for step in execution_steps
+                if step.capability_id is not None
+            }
+        )
+        return TraceSummary(
+            trace_id=session_id,
+            session_id=session_id,
+            request_text=row["request_text"],
+            status=row["status"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            step_count=len(steps),
+            executed_steps=sum(step.status is ExecutionStatus.EXECUTED for step in execution_steps),
+            pending_approval_steps=sum(
+                step.status is ExecutionStatus.PENDING_APPROVAL for step in execution_steps
+            ),
+            blocked_steps=sum(step.status is ExecutionStatus.BLOCKED for step in execution_steps),
+            failed_steps=sum(step.status is ExecutionStatus.FAILED for step in execution_steps),
+            skipped_steps=sum(
+                step.status is ExecutionStatus.NOT_EXECUTED for step in execution_steps
+            ),
+            selected_capability_ids=capability_ids,
+        )
+
+    def _step_subset(
+        self,
+        step_id: str,
+        *,
+        steps: list[PlanningStep | ExecutionStep],
+        edges: list[TraceEdge],
+        include_predecessors: bool,
+    ) -> set[str]:
+        available_step_ids = {step.step_id for step in steps}
+        if step_id not in available_step_ids:
+            return set()
+        selected = {step_id}
+        if not include_predecessors:
+            return selected
+
+        predecessors_by_target: dict[str, set[str]] = {}
+        for edge in edges:
+            predecessors_by_target.setdefault(edge.target_step_id, set()).add(edge.source_step_id)
+
+        stack = [step_id]
+        while stack:
+            current = stack.pop()
+            for predecessor in predecessors_by_target.get(current, set()):
+                if predecessor not in selected:
+                    selected.add(predecessor)
+                    stack.append(predecessor)
+        return selected
+
+    def _missing_trace_fields(self, step: PlanningStep | ExecutionStep) -> list[str]:
+        missing: list[str] = []
+        if not step.request_id:
+            missing.append("request_id")
+        if not step.started_at:
+            missing.append("started_at")
+        if not step.completed_at:
+            missing.append("completed_at")
+
+        if isinstance(step, PlanningStep):
+            if not step.candidate_capability_ids:
+                missing.append("candidate_capability_ids")
+            if not step.artifacts:
+                missing.append("artifacts")
+            return missing
+
+        if not step.selection_reason.summary:
+            missing.append("selection_reason")
+        if step.capability_id is not None and step.capability_version is None:
+            missing.append("capability_version")
+        if step.capability_id is not None and step.manifest_fingerprint is None:
+            missing.append("manifest_fingerprint")
+        if step.capability_id is not None and step.policy_evaluation is None:
+            missing.append("policy_evaluation")
+        if not step.artifacts:
+            missing.append("artifacts")
+        return missing
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path)
@@ -852,3 +1405,7 @@ class HistoryStore:
                 connection.execute("DELETE FROM sessions WHERE id = ?", (row["id"],))
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("history_pruned database_path=%s", self._database_path)
+
+
+class TraceStore(HistoryStore):
+    """Stage 3 trace-aware store built on the history database."""

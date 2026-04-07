@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from foundation.models.presentation import TerminalLogRouting
 from foundation.observability import configure_structlog_if_available
 
 
@@ -91,6 +92,7 @@ def _install_handlers(
     level: int,
     log_path: Path | None,
     structured: bool,
+    routing: TerminalLogRouting,
 ) -> None:
     formatter: logging.Formatter
     if structured:
@@ -98,21 +100,32 @@ def _install_handlers(
     else:
         formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    handlers: list[logging.Handler] = []
+    if routing in {
+        TerminalLogRouting.FILE_AND_TERMINAL,
+        TerminalLogRouting.TERMINAL_ONLY,
+    }:
+        handlers.append(logging.StreamHandler())
     if log_path is not None:
         try:
             path = Path(log_path).expanduser().resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
-            handlers.append(
-                logging.FileHandler(
-                    path,
-                    mode="a",
-                    encoding="utf-8",
+            if routing in {
+                TerminalLogRouting.FILE_AND_TERMINAL,
+                TerminalLogRouting.FILE_ONLY,
+            }:
+                handlers.append(
+                    logging.FileHandler(
+                        path,
+                        mode="a",
+                        encoding="utf-8",
+                    )
                 )
-            )
         except OSError:
             # Keep logging alive even if the configured path is not writable.
             handlers = [logging.StreamHandler()]
+    if not handlers:
+        handlers = [logging.StreamHandler()]
 
     for handler in handlers:
         handler.setLevel(level)
@@ -131,6 +144,7 @@ def configure_logging(
     *,
     log_path: Path | None = None,
     structured: bool = False,
+    routing: TerminalLogRouting = TerminalLogRouting.FILE_AND_TERMINAL,
 ) -> logging.Logger:
     """Configure a process-wide structured/unstructured logging baseline."""
     normalized_level = _normalize_level(level)
@@ -139,6 +153,7 @@ def configure_logging(
         level=normalized_level,
         log_path=log_path,
         structured=structured,
+        routing=routing,
     )
     if structured:
         configure_structlog_if_available()

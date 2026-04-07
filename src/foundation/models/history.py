@@ -7,6 +7,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from foundation.models.capability import (
+    CapabilityConstraintSet,
+    PolicyEvaluationRecord,
+    PolicyReasonCode,
+    RiskClass,
+    TrustTier,
+)
+
 
 class StrictModel(BaseModel):
     """Base model that rejects undeclared fields."""
@@ -41,25 +49,45 @@ class ApprovalRequest(StrictModel):
     """One approval prompt assembled from policy output."""
 
     action_id: str = Field(min_length=1)
+    capability_id: str | None = None
+    capability_version: str | None = None
+    capability_name: str | None = None
     summary: str = Field(min_length=1)
     reason: str = Field(min_length=1)
     risk_categories: list[str] = Field(default_factory=list)
+    risk_class: RiskClass | None = None
+    trust_tier: TrustTier | None = None
+    reason_codes: list[PolicyReasonCode] = Field(default_factory=list)
     command_preview: str | None = None
     cwd: str | None = None
     paths: list[str] = Field(default_factory=list)
+    network_hosts: list[str] = Field(default_factory=list)
+    requested_side_effects: list[str] = Field(default_factory=list)
+    constraints: CapabilityConstraintSet | None = None
 
 
 class ApprovalResolution(StrictModel):
     """Normalized approval result used by orchestration and persistence."""
 
     action_id: str = Field(min_length=1)
+    capability_id: str | None = None
     mode: str = Field(min_length=1)
     status: ApprovalDecisionStatus
     reason: str = Field(min_length=1)
     requested_at: str = Field(min_length=1)
     resolved_at: str = Field(min_length=1)
     risk_categories: list[str] = Field(default_factory=list)
+    reason_codes: list[PolicyReasonCode] = Field(default_factory=list)
     command_preview: str | None = None
+    requested_side_effects: list[str] = Field(default_factory=list)
+
+
+class CapabilityApprovalRequest(ApprovalRequest):
+    """Capability-aware approval request for Stage 2 governance."""
+
+
+class CapabilityApprovalResolution(ApprovalResolution):
+    """Capability-aware approval result for Stage 2 governance."""
 
 
 class HistoryEventRecord(StrictModel):
@@ -74,10 +102,13 @@ class HistoryApprovalRecord(StrictModel):
     """A persisted approval request and outcome."""
 
     action_id: str | None = None
+    capability_id: str | None = None
     mode: str = Field(min_length=1)
     status: ApprovalDecisionStatus
     reason: str = Field(min_length=1)
     risk_categories: list[str] = Field(default_factory=list)
+    reason_codes: list[PolicyReasonCode] = Field(default_factory=list)
+    requested_side_effects: list[str] = Field(default_factory=list)
     command_preview: str | None = None
     requested_at: str = Field(min_length=1)
     resolved_at: str = Field(min_length=1)
@@ -151,6 +182,7 @@ class HistorySessionDetail(HistorySessionSummary):
     plan: dict[str, Any] | None = None
     planning_metadata: dict[str, Any] | None = None
     approvals: list[HistoryApprovalRecord] = Field(default_factory=list)
+    policy_evaluations: list[PolicyEvaluationRecord] = Field(default_factory=list)
     tool_calls: list[HistoryToolCallRecord] = Field(default_factory=list)
     commands: list[HistoryCommandRecord] = Field(default_factory=list)
     events: list[HistoryEventRecord] = Field(default_factory=list)

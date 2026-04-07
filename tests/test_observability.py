@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
+import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import pytest
 
 from foundation.doctor import DoctorCheck, DoctorStatus, run_doctor
 from foundation.logging import configure_logging
+from foundation.models import TerminalLogRouting
 from foundation.observability import (
     EVENT_EXCEPTION,
     EVENT_PROVIDER_CALL_STARTED,
@@ -17,6 +20,14 @@ from foundation.observability import (
     emit_event,
     emit_exception,
 )
+
+
+def _write_executable(path: Path, content: str) -> None:
+    path.write_text(
+        f"#!{sys.executable}\n{textwrap.dedent(content)}",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
 
 
 def _write_doctor_config(tmp_path: Path, *, log_dir: Path) -> Path:
@@ -50,16 +61,16 @@ def _write_doctor_config(tmp_path: Path, *, log_dir: Path) -> Path:
     return config_path
 
 
-def _stub_external_tools_check(
+def _stub_capability_registry_check(
     _settings: object,
     *,
     environment: dict[str, str] | None = None,
 ) -> DoctorCheck:
     del environment
     return DoctorCheck(
-        name="External tools",
+        name="Capability registry",
         status=DoctorStatus.PASS,
-        summary="External tool checks are stubbed in this unit test.",
+        summary="Capability registry checks are stubbed in this unit test.",
     )
 
 
@@ -170,6 +181,25 @@ def test_configure_logging_writes_structured_json_events(
     assert payload["event_payload"] == {"session_id": "session-123"}
 
 
+def test_configure_logging_file_only_omits_terminal_stream_handler(
+    tmp_path: Path,
+    preserve_root_logger: Iterator[None],
+) -> None:
+    del preserve_root_logger
+    log_path = tmp_path / "foundation.log"
+
+    configure_logging(
+        level="INFO",
+        structured=False,
+        log_path=log_path,
+        routing=TerminalLogRouting.FILE_ONLY,
+    )
+
+    handlers = logging.getLogger().handlers
+    assert any(isinstance(handler, logging.FileHandler) for handler in handlers)
+    assert not any(type(handler) is logging.StreamHandler for handler in handlers)
+
+
 def test_run_doctor_warns_when_log_dir_is_missing_but_creatable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -178,7 +208,10 @@ def test_run_doctor_warns_when_log_dir_is_missing_but_creatable(
         tmp_path,
         log_dir=tmp_path / "state" / "logs",
     )
-    monkeypatch.setattr("foundation.doctor._external_tools_check", _stub_external_tools_check)
+    monkeypatch.setattr(
+        "foundation.doctor._capability_registry_check",
+        _stub_capability_registry_check,
+    )
 
     report = run_doctor(
         config_path=config_path,
@@ -200,7 +233,10 @@ def test_run_doctor_fails_when_log_dir_is_a_file(
     blocked_log_path = tmp_path / "logs-file"
     blocked_log_path.write_text("not a directory\n", encoding="utf-8")
     config_path = _write_doctor_config(tmp_path, log_dir=blocked_log_path)
-    monkeypatch.setattr("foundation.doctor._external_tools_check", _stub_external_tools_check)
+    monkeypatch.setattr(
+        "foundation.doctor._capability_registry_check",
+        _stub_capability_registry_check,
+    )
 
     report = run_doctor(
         config_path=config_path,
@@ -214,3 +250,32 @@ def test_run_doctor_fails_when_log_dir_is_a_file(
     assert (
         checks["Log path"].detail == f"{blocked_log_path.resolve()} exists but is not a directory."
     )
+
+
+def test_run_doctor_warns_when_capability_store_is_missing_but_creatable(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_doctor_config(
+        tmp_path,
+        log_dir=tmp_path / "state" / "logs",
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("rg", "git", "fd", "man", "tldr"):
+        _write_executable(bin_dir / name, "print('')\n")
+
+    report = run_doctor(
+        config_path=config_path,
+        environment={
+            "OPENAI_API_KEY": "doctor-secret",
+            "PATH": str(bin_dir),
+        },
+    )
+    checks = {check.name: check for check in report.checks}
+
+    assert report.exit_code == 0
+    assert checks["Capability registry"].status is DoctorStatus.WARN
+    assert checks["Capability registry"].summary == "Capability store is missing but creatable."
+    assert checks["Capability registry"].detail is not None
+    assert "Capability store root:" in checks["Capability registry"].detail
+    assert not (tmp_path / "data" / "capabilities").exists()
