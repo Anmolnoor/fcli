@@ -1,4 +1,4 @@
-"""Planner service for Stage 3 runtime splitting."""
+"""Planner service for Stage 4 bounded replan loop."""
 
 from __future__ import annotations
 
@@ -17,12 +17,29 @@ from foundation.models import (
     ProviderResponseMetadata,
     UserRequest,
 )
+from foundation.models.file import (
+    FileApplyDiffRequest,
+    FileEditRequest,
+    FileReadChunkRequest,
+    FileReadRequest,
+    FileWriteRequest,
+)
+from foundation.models.git import (
+    GitCommitRequest,
+    GitDiffRequest,
+    GitLogRequest,
+    GitShowRequest,
+    GitStageRequest,
+    GitStatusRequest,
+    GitUnstageRequest,
+)
 from foundation.services.capabilities import GIT_CAPABILITY_ID, CapabilityRegistry
 from foundation.services.provider import ProviderAdapter, ProviderError, ProviderErrorCode
 from foundation.services.tools import GitContextRequest, LocalToolService, ToolExecutionError
 from foundation.settings import ApprovalMode
 
-_MAX_PLAN_ACTIONS = 5
+_MAX_PLAN_ACTIONS = 10
+_MAX_TOTAL_ACTIONS = 50
 
 
 class PlanningError(RuntimeError):
@@ -89,8 +106,23 @@ class PlannerService:
         context: ContextSnapshot,
         *,
         request_id: str,
+        observation_messages: list[ProviderMessage] | None = None,
+        iteration: int = 1,
+        remaining_actions: int = _MAX_TOTAL_ACTIONS,
     ) -> tuple[AssistantPlan, ProviderResponseMetadata]:
-        base_messages = self._base_plan_messages(request, context)
+        # Fold observation into the system prompt instead of appending as
+        # multi-turn messages.  Many structured-output models (Qwen 3.x)
+        # generate empty responses when the conversation alternates
+        # assistant→system after the user turn.
+        observation_text: str | None = None
+        if observation_messages:
+            observation_text = "\n\n".join(m.content for m in observation_messages)
+        base_messages = self._base_plan_messages(
+            request, context,
+            iteration=iteration,
+            remaining_actions=remaining_actions,
+            observation_text=observation_text,
+        )
         supplemental_messages: list[ProviderMessage] = []
         last_error: Exception | None = None
 
@@ -152,6 +184,10 @@ class PlannerService:
         self,
         request: UserRequest,
         context: ContextSnapshot,
+        *,
+        iteration: int = 1,
+        remaining_actions: int = _MAX_TOTAL_ACTIONS,
+        observation_text: str | None = None,
     ) -> list[ProviderMessage]:
         schema_outline = {
             "assistant_message": "string",
@@ -192,26 +228,61 @@ class PlannerService:
             }
             for snapshot in context.available_capabilities
         ]
+        effective_max = min(_MAX_PLAN_ACTIONS, remaining_actions)
         instructions = (
-            "You are the planning model for Foundation CLI v2 Stage 3. "
-            f"Return at most {_MAX_PLAN_ACTIONS} actions. "
-            "Prefer typed tool_call actions that reference one available capability. "
-            "Use shell actions only for simple read-only inspection commands. "
+            "You are the planning model for Foundation CLI v3 Stage 4. "
+            "You MUST respond with a single JSON object matching the action "
+            "shape guide below. Do NOT include markdown fences, commentary, "
+            "or any text outside the JSON object. "
+            f"This is iteration {iteration} of a bounded replan loop. "
+            f"Return at most {effective_max} actions. "
+            "Prefer typed file capabilities (foundation.file.read, "
+            "foundation.file.write, foundation.file.edit, foundation.file.apply_diff) "
+            "for reading and editing files. "
+            "Prefer typed git capabilities (foundation.git.*) for repository "
+            "inspection and staging. "
+            "The git.commit capability requires approval and never stages implicitly. "
+            "Do NOT use shell commands for operations that have typed "
+            "capability equivalents. "
+            "Use shell actions for running tests, builds, linters, and "
+            "environment inspection only. "
+            "Shell args are passed directly to the target binary via execve, "
+            "NOT interpreted by a shell. Do NOT wrap args in single or double "
+            "quotes, do NOT expect glob expansion or variable substitution, "
+            "and pass each argument as a separate string. For example, for "
+            "`gh api users/x --jq '.name'` use "
+            "`command=\"gh\", args=[\"api\", \"users/x\", \"--jq\", \".name\"]` — "
+            "no surrounding quotes on the jq expression. "
             "Do not assume command or tool output before execution. "
+            "If verification (tests, type checks, linters) fails, diagnose the error and issue "
+            "repair actions in the next iteration. "
+            "For code-changing turns, run at least one relevant verification command before "
+            "completing with zero actions, unless verification is unavailable and you explain why. "
             "If an action is risky, mutating, networked, or uncertain, mark requires_approval=true "
             "and explain why in approval_reason. "
-            "If the user can be answered directly, return zero actions or an explanation action. "
+            "If the user can be answered directly, return zero actions with your final answer. "
+            "When returning zero actions to finish, your assistant_message "
+            "becomes the user-facing answer. "
             "Available capability snapshot:\n"
             f"{json.dumps(capability_guide, indent=2)}\n"
             "Action shape guide:\n"
             f"{json.dumps(schema_outline, indent=2)}\n"
             "Context JSON:\n"
-            f"{json.dumps(context.model_dump(mode='json'), indent=2)}"
+            f"{json.dumps(
+                context.model_dump(mode='json', exclude={'available_capabilities'}),
+                indent=2,
+            )}"
+        )
+        if observation_text:
+            instructions += f"\n\n{observation_text}"
+        user_content = (
+            f"{request.message}\n\n"
+            "Respond with a JSON object only. No markdown, no commentary."
         )
         return [
             ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=instructions),
             *request.conversation_history,
-            ProviderMessage(role=ProviderMessageRole.USER, content=request.message),
+            ProviderMessage(role=ProviderMessageRole.USER, content=user_content),
         ]
 
     def _repair_messages(
@@ -264,42 +335,59 @@ class PlannerService:
         arguments: dict[str, object],
     ) -> None:
         manifest = self._capability_registry.resolve(capability_id, version)
-        if manifest.runtime_endpoint == "builtin.search":
+        endpoint = manifest.runtime_endpoint
+        if endpoint == "builtin.search":
             from foundation.services.tools import SearchRequest
 
             SearchRequest.model_validate(arguments)
             return
-        if manifest.runtime_endpoint == "builtin.files":
+        if endpoint == "builtin.files":
             from foundation.services.tools import FileDiscoveryRequest
 
             FileDiscoveryRequest.model_validate(arguments)
             return
-        if manifest.runtime_endpoint == "builtin.git":
+        if endpoint == "builtin.git":
             GitContextRequest.model_validate(arguments)
             return
-        if manifest.runtime_endpoint == "builtin.man":
+        if endpoint == "builtin.man":
             from foundation.services.tools import HelpLookupRequest, HelpLookupSource
 
             HelpLookupRequest.model_validate(
-                {
-                    **arguments,
-                    "source": HelpLookupSource.MAN,
-                }
+                {**arguments, "source": HelpLookupSource.MAN}
             )
             return
-        if manifest.runtime_endpoint == "builtin.tldr":
+        if endpoint == "builtin.tldr":
             from foundation.services.tools import HelpLookupRequest, HelpLookupSource
 
             HelpLookupRequest.model_validate(
-                {
-                    **arguments,
-                    "source": HelpLookupSource.TLDR,
-                }
+                {**arguments, "source": HelpLookupSource.TLDR}
             )
             return
-        if manifest.runtime_endpoint == "builtin.shell":
+        if endpoint == "builtin.shell":
             from foundation.models import ShellAction
 
             ShellAction.model_validate(arguments)
+            return
+        _FILE_VALIDATORS: dict[str, type] = {
+            "builtin.file.read": FileReadRequest,
+            "builtin.file.read_chunk": FileReadChunkRequest,
+            "builtin.file.write": FileWriteRequest,
+            "builtin.file.edit": FileEditRequest,
+            "builtin.file.apply_diff": FileApplyDiffRequest,
+        }
+        if endpoint in _FILE_VALIDATORS:
+            _FILE_VALIDATORS[endpoint].model_validate(arguments)
+            return
+        _GIT_VALIDATORS: dict[str, type] = {
+            "builtin.git.status": GitStatusRequest,
+            "builtin.git.diff": GitDiffRequest,
+            "builtin.git.show": GitShowRequest,
+            "builtin.git.log": GitLogRequest,
+            "builtin.git.stage": GitStageRequest,
+            "builtin.git.unstage": GitUnstageRequest,
+            "builtin.git.commit": GitCommitRequest,
+        }
+        if endpoint in _GIT_VALIDATORS:
+            _GIT_VALIDATORS[endpoint].model_validate(arguments)
             return
         raise PlanningError(f"Unsupported capability id: {capability_id}")

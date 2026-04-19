@@ -368,6 +368,15 @@ def _capability_registry_check(
         line = (
             f"{capability.id}@{capability.version}: {capability.state.value}, {status}"
         )
+        boundary_parts = [
+            f"risk={capability.risk_class.value}",
+            f"trust={capability.trust_tier.value}",
+        ]
+        if capability.declared_side_effects:
+            boundary_parts.append(
+                "side_effects=" + ",".join(sorted(capability.declared_side_effects))
+            )
+        line = f"{line} [{'; '.join(boundary_parts)}]"
         if capability.health_detail:
             line = f"{line} | {capability.health_detail}"
         detail_lines.append(line)

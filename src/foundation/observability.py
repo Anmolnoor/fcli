@@ -42,6 +42,8 @@ EVENT_APPROVAL_REQUESTED = "approval_requested"
 EVENT_APPROVAL_RESOLVED = "approval_resolved"
 EVENT_EXCEPTION = "exception"
 EVENT_RETRY = "retry"
+EVENT_ITERATION_STARTED = "iteration_started"
+EVENT_ITERATION_COMPLETED = "iteration_completed"
 
 _SENSITIVE_KEY_HINTS = {
     "api_key",

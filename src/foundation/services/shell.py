@@ -48,6 +48,21 @@ class OutputStream(StrEnum):
     PTY = "pty"
 
 
+def _strip_wrapping_quotes(arg: str) -> str:
+    """Strip matching outer single or double quotes from a shell arg.
+
+    LLM planners frequently emit args like ``--jq '[] | .foo'`` expecting
+    shell quoting semantics, but the shell runtime executes via subprocess
+    without a shell, so literal quote characters leak through to the target
+    binary.  Mimic the shell behavior for the common case: if ``arg`` has at
+    least two characters and starts and ends with the same quote char
+    (``'`` or ``"``), drop those wrapping quotes.
+    """
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in ('"', "'"):
+        return arg[1:-1]
+    return arg
+
+
 class ShellOutputEvent(BaseModel):
     """A chunk of output emitted during streaming execution."""
 
@@ -83,7 +98,7 @@ class ShellCommandRequest(BaseModel):
             return []
         if not isinstance(value, list | tuple):
             raise TypeError("args must be a list or tuple of strings")
-        return [str(item) for item in value]
+        return [_strip_wrapping_quotes(str(item)) for item in value]
 
     @field_validator("env_overlay", mode="before")
     @classmethod

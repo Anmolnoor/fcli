@@ -1,7 +1,8 @@
-"""Typed Stage 5 request orchestration."""
+"""Typed Stage 4 request orchestration with bounded replan loop."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -9,19 +10,18 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import ValidationError
-
 from foundation.models import (
     ActionKind,
-    ApprovalDecisionStatus,
-    ApprovalRequest,
-    ApprovalResolution,
+    ActionOutcome,
     AssistantMessage,
     AssistantPlan,
     ContextSnapshot,
     ExecutionArtifactType,
     ExecutionResult,
     ExecutionStatus,
+    IterationObservation,
+    LoopStopReason,
+    OrchestrationIteration,
     OrchestrationResult,
     OrchestrationSummary,
     PlannedAction,
@@ -30,81 +30,179 @@ from foundation.models import (
     PolicyEvaluationRecord,
     ProviderMessage,
     ProviderMessageRole,
-    ProviderPrompt,
-    ProviderResponseFormat,
-    ProviderResponseMetadata,
     SessionKind,
     SessionStatus,
-    ShellAction,
-    ToolCall,
     UserRequest,
+    VerificationNotice,
+    VerificationOutcome,
 )
+from foundation.models.trace import TraceEdge, TraceEdgeKind
 from foundation.observability import (
-    EVENT_APPROVAL_REQUESTED,
-    EVENT_APPROVAL_RESOLVED,
     EVENT_EXCEPTION,
+    EVENT_ITERATION_COMPLETED,
+    EVENT_ITERATION_STARTED,
     EVENT_PLAN_FAILED,
     EVENT_PLAN_FINISHED,
     EVENT_PLAN_STARTED,
-    EVENT_RETRY,
     EVENT_SESSION_END,
     EVENT_SESSION_START,
-    EVENT_TOOL_CALL_FAILED,
-    EVENT_TOOL_CALL_FINISHED,
-    EVENT_TOOL_CALL_STARTED,
-    EVENT_TOOL_EXECUTION_FAILED,
-    EVENT_TOOL_EXECUTION_FINISHED,
-    EVENT_TOOL_EXECUTION_STARTED,
     EVENT_USER_REQUEST,
-    emit_event,
 )
 from foundation.services.approval import ApprovalService
-from foundation.services.capabilities import (
-    GIT_CAPABILITY_ID,
-    CapabilityRegistry,
-    CapabilityStore,
-)
+from foundation.services.capabilities import CapabilityRegistry, CapabilityStore
 from foundation.services.executor import ActionExecutor
+from foundation.services.file_service import FileService
+from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
 from foundation.services.observer import ObserverService
 from foundation.services.planner import PlannerService, PlanningError
-from foundation.services.provider import ProviderAdapter, ProviderError, ProviderErrorCode
-from foundation.services.shell import (
-    ExecutionMode,
-    OutputCallback,
-    ShellCommandRequest,
-    ShellExecutionCancelled,
-    ShellExecutionSpawnError,
-    ShellExecutionTimeout,
-    ShellRuntime,
-)
-from foundation.services.tools import (
-    FileDiscoveryRequest,
-    FileDiscoveryResult,
-    GitContextRequest,
-    GitContextResult,
-    HelpLookupRequest,
-    HelpLookupResult,
-    HelpLookupSource,
-    LocalToolService,
-    SearchRequest,
-    SearchResult,
-    ToolExecutionError,
-)
+from foundation.services.provider import ProviderAdapter
+from foundation.services.shell import OutputCallback, ShellRuntime
+from foundation.services.tools import LocalToolService
 from foundation.settings import ApprovalMode
 
 logger = logging.getLogger("foundation.services.orchestrator")
 
-_MAX_PLAN_ACTIONS = 5
+_MAX_PLAN_ACTIONS = 10
+_MAX_LOOP_ITERATIONS = 8
+_MAX_TOTAL_ACTIONS = 50
+_OBSERVATION_MAX_BYTES = 8 * 1024
+_OBSERVATION_MAX_LINES = 200
+
+_FATAL_ERROR_PATTERNS = frozenset({
+    "failed to start",
+    "could not start command",
+    "unsupported capability",
+    "invalid_capability",
+    "no such file or directory",
+})
+
+# Errors that indicate the binary could not run at all (vs. tests failed).
+_VERIFICATION_UNAVAILABLE_PATTERNS = frozenset({
+    "failed to start",
+    "could not start command",
+    "no such file or directory",
+    "command not found",
+})
+
+
+def _verification_outcome_for_result(
+    result: ExecutionResult,
+) -> VerificationOutcome:
+    if result.status is ExecutionStatus.EXECUTED:
+        return VerificationOutcome.PASSED
+    if result.status is ExecutionStatus.FAILED:
+        error_lower = (result.error or "").lower()
+        if any(p in error_lower for p in _VERIFICATION_UNAVAILABLE_PATTERNS):
+            return VerificationOutcome.UNAVAILABLE
+        return VerificationOutcome.FAILED
+    # Blocked / pending-approval verification commands count as not-attempted.
+    return VerificationOutcome.NOT_ATTEMPTED
+
+
+_VERIFICATION_OUTCOME_SEVERITY = {
+    VerificationOutcome.NOT_ATTEMPTED: 0,
+    VerificationOutcome.PASSED: 1,
+    VerificationOutcome.FAILED: 2,
+    VerificationOutcome.UNAVAILABLE: 3,
+}
+
+
+def _worst_verification_outcome(
+    a: VerificationOutcome, b: VerificationOutcome,
+) -> VerificationOutcome:
+    """Return whichever outcome reflects the more severe state (worst-wins)."""
+    if (
+        _VERIFICATION_OUTCOME_SEVERITY[b]
+        > _VERIFICATION_OUTCOME_SEVERITY[a]
+    ):
+        return b
+    return a
+
+_CODE_CHANGING_ARTIFACT_TYPES = frozenset({
+    ExecutionArtifactType.FILE_WRITE,
+    ExecutionArtifactType.FILE_EDIT,
+    ExecutionArtifactType.FILE_APPLY_DIFF,
+})
+
+_VERIFICATION_COMMANDS = frozenset({
+    "pytest", "python", "npm", "yarn", "make", "cargo", "go",
+    "mypy", "ruff", "flake8", "eslint", "tsc",
+})
+
+_STOP_REASON_SUFFIXES = {
+    LoopStopReason.MAX_ITERATIONS: (
+        "\n\n[Loop stopped: maximum iteration limit reached. Work may be incomplete.]"
+    ),
+    LoopStopReason.MAX_ACTIONS: (
+        "\n\n[Loop stopped: maximum action budget exhausted. Work may be incomplete.]"
+    ),
+    LoopStopReason.PENDING_APPROVAL: (
+        "\n\n[Loop stopped: an action requires approval before continuing.]"
+    ),
+    LoopStopReason.FATAL_EXECUTION_FAILURE: (
+        "\n\n[Loop stopped: a fatal execution failure occurred.]"
+    ),
+    LoopStopReason.NO_PROGRESS: (
+        "\n\n[Loop stopped: no progress detected across iterations.]"
+    ),
+}
 
 
 def _utcnow() -> str:
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+class NoProgressDetector:
+    """Detect replanning loops that make no forward progress."""
+
+    def __init__(self) -> None:
+        self._failure_fingerprints: list[str] = []
+        self._action_fingerprints: list[str] = []
+
+    def is_stuck(
+        self,
+        execution_results: list[ExecutionResult],
+        changed_paths: list[str],
+        actions: list[PlannedAction],
+    ) -> bool:
+        failures = sorted(
+            r.error or "" for r in execution_results if r.status is ExecutionStatus.FAILED
+        )
+        has_failures = len(failures) > 0
+        failure_fp = hashlib.sha256("|".join(failures).encode()).hexdigest()[:16]
+
+        action_sigs = sorted(
+            f"{a.kind}:{a.tool_call.capability_id if a.tool_call else ''}:"
+            f"{a.shell.command if a.shell else ''}"
+            for a in actions
+        )
+        action_fp = hashlib.sha256("|".join(action_sigs).encode()).hexdigest()[:16]
+
+        has_changes = len(changed_paths) > 0
+
+        # Only detect no-progress when there are actual failures
+        if has_failures and not has_changes:
+            if (
+                self._failure_fingerprints
+                and failure_fp == self._failure_fingerprints[-1]
+            ):
+                return True
+
+            if (
+                self._action_fingerprints
+                and action_fp == self._action_fingerprints[-1]
+            ):
+                return True
+
+        self._failure_fingerprints.append(failure_fp)
+        self._action_fingerprints.append(action_fp)
+        return False
+
+
 class OrchestrationError(RuntimeError):
-    """Base error for Stage 5 orchestration failures."""
+    """Base error for orchestration failures."""
 
 
 class OrchestrationPlanError(OrchestrationError):
@@ -164,6 +262,8 @@ class RequestOrchestrator:
             capability_registry=self._capability_registry,
             max_plan_attempts=max_plan_attempts,
         )
+        state_dir = self._workspace_root / ".foundation" / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
         self._executor = ActionExecutor(
             workspace_root=self._workspace_root,
             shell_runtime=self._shell_runtime,
@@ -173,10 +273,17 @@ class RequestOrchestrator:
             capability_registry=self._capability_registry,
             observer=self._observer,
             shell_output_callback=self._shell_output_callback,
+            file_service=FileService(
+                workspace_root=self._workspace_root,
+                state_dir=state_dir,
+            ),
+            git_service=GitService(
+                workspace_root=self._workspace_root,
+            ),
         )
 
     def orchestrate(self, request: UserRequest) -> OrchestrationResult:
-        """Run the Stage 6 orchestration flow for one user request."""
+        """Run the Stage 4 orchestration flow with bounded replan loop."""
         request_id = f"req-{uuid.uuid4().hex}"
         resolved_request_cwd = self._resolve_request_cwd(request.cwd)
         session_id: str | None = None
@@ -214,194 +321,44 @@ class RequestOrchestrator:
         )
 
         try:
-            context = self._planner.gather_context(request_cwd=str(resolved_request_cwd))
-            planning_started_at = _utcnow()
-            planning_started_monotonic = time.monotonic()
-            self._observer.emit(
-                EVENT_PLAN_STARTED,
-                payload={"request_id": request_id, "request_text": request.message},
-                session_id=session_id,
-                logger_name="foundation.services.orchestrator",
-            )
-            try:
-                plan, planning_metadata = self._planner.request_plan(
-                    request,
-                    context,
-                    request_id=request_id,
-                )
-            except PlanningError as exc:
-                raise OrchestrationPlanError(str(exc)) from exc
-            planning_completed_at = _utcnow()
-            planning_duration_seconds = max(time.monotonic() - planning_started_monotonic, 0.0)
-
-            if self._history_store is not None and session_id is not None:
-                self._history_store.record_plan(
-                    session_id,
-                    assistant_message=plan.assistant_message,
-                    context=context.model_dump(mode="json"),
-                    plan=plan.model_dump(mode="json"),
-                    planning_metadata=planning_metadata.model_dump(mode="json"),
-                )
-            planning_step_id = self._observer.record_planning_step(
-                session_id,
+            result = self._run_replan_loop(
+                request=request,
                 request_id=request_id,
-                request_text=request.message,
-                context=context,
-                plan_assistant_message=plan.assistant_message,
-                actions=plan.actions,
-                action_ids=[action.id for action in plan.actions],
-                planning_metadata=planning_metadata,
-                started_at=planning_started_at,
-                completed_at=planning_completed_at,
-                duration_seconds=planning_duration_seconds,
-            )
-
-            logger.info(
-                "orchestration_plan_ready actions=%s approval_mode=%s",
-                len(plan.actions),
-                self._approval_mode.value,
-            )
-            self._observer.emit(
-                EVENT_PLAN_FINISHED,
-                payload={
-                    "request_id": request_id,
-                    "session_id": session_id,
-                    "action_count": len(plan.actions),
-                    "approval_mode": self._approval_mode.value,
-                    "provider": planning_metadata.provider,
-                    "model": planning_metadata.model,
-                },
+                resolved_request_cwd=resolved_request_cwd,
                 session_id=session_id,
-                logger_name="foundation.services.orchestrator",
             )
-
-            evaluations = [
-                self._policy_engine.evaluate(
-                    action,
-                    request_cwd=resolved_request_cwd,
-                    approval_mode=self._approval_mode,
-                )
-                for action in plan.actions
-            ]
-            decisions = [
-                self._policy_engine.to_policy_decision(evaluation)
-                if evaluation is not None
-                else PolicyDecision(
-                    action_id=action.id,
-                    decision=PolicyDecisionType.ALLOW,
-                    reason="Explanation-only actions do not execute anything.",
-                )
-                for action, evaluation in zip(plan.actions, evaluations, strict=True)
-            ]
-            execution_results: list[ExecutionResult] = []
-            candidate_capability_ids = [
-                str(snapshot.capability_id) for snapshot in context.available_capabilities
-            ]
-            prior_step_id: str | None = None
-            for action, decision, evaluation in zip(
-                plan.actions,
-                decisions,
-                evaluations,
-                strict=True,
-            ):
-                if (
-                    self._history_store is not None
-                    and session_id is not None
-                    and evaluation is not None
-                ):
-                    self._history_store.record_policy_evaluation(
-                        session_id,
-                        record=evaluation,
-                    )
-                execution = self._executor.execute(
-                    action,
-                    decision,
-                    policy_evaluation=evaluation,
-                    plan_only=request.plan_only,
-                    request_cwd=resolved_request_cwd,
-                    request_id=request_id,
-                    session_id=session_id,
-                )
-                execution_results.append(execution.execution_result)
-                if self._history_store is not None and session_id is not None:
-                    if (
-                        execution.approval_request is not None
-                        and execution.approval_resolution is not None
-                    ):
-                        self._history_store.record_approval(
-                            session_id,
-                            request=execution.approval_request,
-                            resolution=execution.approval_resolution,
-                        )
-                    self._record_action_history(
-                        session_id,
-                        action=action,
-                        decision=decision,
-                        execution_result=execution.execution_result,
-                        resolved_request_cwd=resolved_request_cwd,
-                    )
-                prior_step_id = self._observer.record_execution_step(
-                    session_id,
-                    request_id=request_id,
-                    action=action,
-                    request_cwd=resolved_request_cwd,
-                    execution_result=execution.execution_result,
-                    policy_evaluation=evaluation,
-                    approval_request=execution.approval_request,
-                    approval_resolution=execution.approval_resolution,
-                    candidate_capability_ids=candidate_capability_ids,
-                    planning_step_id=planning_step_id,
-                    prior_step_id=prior_step_id,
-                    started_at=execution.started_at,
-                    completed_at=execution.completed_at,
-                    duration_seconds=execution.duration_seconds,
-                )
-
-            summary = self._build_summary(plan, execution_results, plan_only=request.plan_only)
             self._observer.emit(
                 EVENT_SESSION_END,
                 payload={
                     "request_id": request_id,
                     "session_id": session_id,
-                    "status": self._session_status_for_summary(summary).value,
-                    "executed_actions": summary.executed_actions,
-                    "pending_approval_actions": summary.pending_approval_actions,
-                    "blocked_actions": summary.blocked_actions,
-                    "failed_actions": summary.failed_actions,
-                    "skipped_actions": summary.skipped_actions,
+                    "status": self._session_status_for_summary(result.summary).value,
+                    "executed_actions": result.summary.executed_actions,
+                    "pending_approval_actions": result.summary.pending_approval_actions,
+                    "blocked_actions": result.summary.blocked_actions,
+                    "failed_actions": result.summary.failed_actions,
+                    "skipped_actions": result.summary.skipped_actions,
                 },
                 session_id=session_id,
                 logger_name="foundation.services.orchestrator",
             )
-            assistant_message = AssistantMessage(content=plan.assistant_message)
             if self._history_store is not None and session_id is not None:
                 self._history_store.record_summary(
                     session_id,
-                    assistant_message=assistant_message.content,
-                    summary_text=summary.text,
-                    executed_actions=summary.executed_actions,
-                    pending_approval_actions=summary.pending_approval_actions,
-                    blocked_actions=summary.blocked_actions,
-                    failed_actions=summary.failed_actions,
-                    skipped_actions=summary.skipped_actions,
+                    assistant_message=result.assistant_message.content,
+                    summary_text=result.summary.text,
+                    executed_actions=result.summary.executed_actions,
+                    pending_approval_actions=result.summary.pending_approval_actions,
+                    blocked_actions=result.summary.blocked_actions,
+                    failed_actions=result.summary.failed_actions,
+                    skipped_actions=result.summary.skipped_actions,
+                    total_iterations=result.summary.total_iterations,
                 )
                 self._history_store.finalize_session(
                     session_id,
-                    status=self._session_status_for_summary(summary),
+                    status=self._session_status_for_summary(result.summary),
                 )
-
-            return OrchestrationResult(
-                session_id=session_id,
-                request=request,
-                context=context,
-                plan=plan,
-                planning_metadata=planning_metadata,
-                policy_decisions=decisions,
-                execution_results=execution_results,
-                policy_evaluations=[item for item in evaluations if item is not None],
-                assistant_message=assistant_message,
-                summary=summary,
-            )
+            return result
         except Exception as exc:
             self._observer.emit_exception(
                 EVENT_EXCEPTION,
@@ -437,410 +394,583 @@ class RequestOrchestrator:
                 self._history_store.finalize_session(session_id, status=SessionStatus.FAILED)
             raise
 
-    def _gather_context(self, request_cwd: Path) -> ContextSnapshot:
-        capability_snapshots = self._capability_registry.planner_snapshot()
-        available_tools = [
-            str(item.capability_id)
-            for item in capability_snapshots
-            if item.kind.value == "tool"
-        ]
-        notes: list[str] = []
-        git_context: dict[str, object] | None = None
+    # ------------------------------------------------------------------
+    # Bounded replan loop
+    # ------------------------------------------------------------------
 
-        if any(str(item.capability_id) == GIT_CAPABILITY_ID for item in capability_snapshots):
-            try:
-                git_result = self._tool_service.git_context(
-                    GitContextRequest(
-                        scope=request_cwd,
-                        max_status_entries=10,
-                        max_recent_commits=3,
-                    )
-                )
-            except ToolExecutionError as exc:
-                notes.append(f"Git context unavailable: {exc.error.message}")
-            else:
-                git_context = git_result.model_dump(mode="json")
-
-        return ContextSnapshot(
-            workspace_root=str(self._workspace_root),
-            request_cwd=str(request_cwd),
-            approval_mode=self._approval_mode.value,
-            available_tools=available_tools,
-            available_capabilities=capability_snapshots,
-            git_context=git_context,
-            notes=notes,
-        )
-
-    def _request_plan(
+    def _run_replan_loop(
         self,
+        *,
         request: UserRequest,
-        context: ContextSnapshot,
         request_id: str,
-    ) -> tuple[AssistantPlan, ProviderResponseMetadata]:
-        base_messages = self._base_plan_messages(request, context)
-        supplemental_messages: list[ProviderMessage] = []
-        last_error: Exception | None = None
+        resolved_request_cwd: Path,
+        session_id: str | None,
+    ) -> OrchestrationResult:
+        iterations: list[OrchestrationIteration] = []
+        total_actions_executed = 0
+        observation_messages: list[ProviderMessage] = []
+        observation_message_history: list[ProviderMessage] = []
+        executed_command_log: list[str] = []
+        stop_reason: LoopStopReason | None = None
+        had_code_changes = False
+        verification_outcome: VerificationOutcome = VerificationOutcome.NOT_ATTEMPTED
+        verification_commands: list[str] = []
+        progress_detector = NoProgressDetector()
+        prev_last_step_id: str | None = None
 
-        for attempt in range(1, self._max_plan_attempts + 1):
-            prompt = ProviderPrompt(
-                messages=[*base_messages, *supplemental_messages],
-                response_format=ProviderResponseFormat.JSON_OBJECT,
-                schema_name="assistant_plan",
-                output_schema=AssistantPlan.model_json_schema(),
+        for iteration_index in range(1, _MAX_LOOP_ITERATIONS + 1):
+            self._observer.emit(
+                EVENT_ITERATION_STARTED,
+                payload={
+                    "request_id": request_id,
+                    "iteration": iteration_index,
+                    "total_actions_so_far": total_actions_executed,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+
+            # 1. Regather context
+            context = self._planner.gather_context(request_cwd=str(resolved_request_cwd))
+
+            # 2. Request plan
+            remaining_actions = _MAX_TOTAL_ACTIONS - total_actions_executed
+            planning_started_at = _utcnow()
+            planning_started_monotonic = time.monotonic()
+            self._observer.emit(
+                EVENT_PLAN_STARTED,
+                payload={
+                    "request_id": request_id,
+                    "request_text": request.message,
+                    "iteration": iteration_index,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
             )
             try:
-                response = self._provider.complete(prompt)
-            except ProviderError as exc:
-                last_error = exc
+                plan, planning_metadata = self._planner.request_plan(
+                    request,
+                    context,
+                    request_id=request_id,
+                    observation_messages=observation_messages or None,
+                    iteration=iteration_index,
+                    remaining_actions=remaining_actions,
+                )
+            except PlanningError as exc:
+                raise OrchestrationPlanError(str(exc)) from exc
+            planning_completed_at = _utcnow()
+            planning_duration = max(time.monotonic() - planning_started_monotonic, 0.0)
+
+            # Record plan
+            if self._history_store is not None and session_id is not None:
+                self._history_store.record_plan(
+                    session_id,
+                    iteration=iteration_index,
+                    assistant_message=plan.assistant_message,
+                    context=context.model_dump(mode="json"),
+                    plan=plan.model_dump(mode="json"),
+                    planning_metadata=planning_metadata.model_dump(mode="json"),
+                )
+            planning_step_id = self._observer.record_planning_step(
+                session_id,
+                request_id=request_id,
+                request_text=request.message,
+                context=context,
+                plan_assistant_message=plan.assistant_message,
+                actions=plan.actions,
+                action_ids=[a.id for a in plan.actions],
+                planning_metadata=planning_metadata,
+                started_at=planning_started_at,
+                completed_at=planning_completed_at,
+                duration_seconds=planning_duration,
+                iteration=iteration_index,
+            )
+
+            # REPLANNED_FROM edge from prior iteration's last step
+            if (
+                prev_last_step_id is not None
+                and self._history_store is not None
+                and session_id is not None
+            ):
+                self._history_store.record_trace_edge(
+                    session_id,
+                    edge=TraceEdge(
+                        trace_id=session_id,
+                        source_step_id=prev_last_step_id,
+                        target_step_id=planning_step_id,
+                        edge_kind=TraceEdgeKind.REPLANNED_FROM,
+                    ),
+                )
+
+            self._observer.emit(
+                EVENT_PLAN_FINISHED,
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "action_count": len(plan.actions),
+                    "iteration": iteration_index,
+                    "approval_mode": self._approval_mode.value,
+                    "provider": planning_metadata.provider,
+                    "model": planning_metadata.model,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+
+            # 3. Zero-action plan → stop
+            if not plan.actions:
+                stop_reason = LoopStopReason.ZERO_ACTION_PLAN
+                iterations.append(OrchestrationIteration(
+                    iteration=iteration_index,
+                    context=context,
+                    plan=plan,
+                    planning_metadata=planning_metadata,
+                    stop_reason=stop_reason,
+                ))
+                break
+
+            # 4. Enforce action budget
+            budget = _MAX_TOTAL_ACTIONS - total_actions_executed
+            actions_to_execute = plan.actions[:budget]
+
+            # 5. Policy evaluate + execute
+            execution_results, decisions, evaluations, last_step_id = (
+                self._execute_iteration_actions(
+                    actions_to_execute,
+                    context=context,
+                    request=request,
+                    resolved_request_cwd=resolved_request_cwd,
+                    request_id=request_id,
+                    session_id=session_id,
+                    planning_step_id=planning_step_id,
+                    iteration=iteration_index,
+                )
+            )
+            total_actions_executed += len(actions_to_execute)
+            prev_last_step_id = last_step_id
+
+            # 6. Track mutations and verification
+            iter_changed, iter_code_change, iter_outcome, iter_verify_cmds = (
+                self._classify_results(execution_results, actions_to_execute)
+            )
+            had_code_changes = had_code_changes or iter_code_change
+            verification_outcome = _worst_verification_outcome(
+                verification_outcome, iter_outcome,
+            )
+            verification_commands.extend(iter_verify_cmds)
+
+            # Append every executed shell action to the running command log so
+            # future iterations' observation prompts can surface the
+            # do-not-re-run history.
+            for action, result in zip(
+                actions_to_execute, execution_results, strict=True,
+            ):
                 if (
-                    exc.code is ProviderErrorCode.INVALID_RESPONSE
-                    and attempt < self._max_plan_attempts
+                    action.kind is ActionKind.SHELL
+                    and action.shell is not None
+                    and result.status is ExecutionStatus.EXECUTED
                 ):
-                    emit_event(
-                        EVENT_RETRY,
-                        payload={
-                            "request_id": request_id,
-                            "attempt": attempt,
-                            "error": str(exc),
-                        },
-                        logger_name="foundation.services.orchestrator",
-                    )
-                    emit_event(
-                        EVENT_PLAN_FAILED,
-                        payload={
-                            "request_id": request_id,
-                            "attempt": attempt,
-                            "error": str(exc),
-                        },
-                        logger_name="foundation.services.orchestrator",
-                    )
-                    supplemental_messages = self._repair_messages(
-                        "The previous response was not valid JSON.",
-                        invalid_output=exc.response_text,
-                    )
-                    continue
-                raise
+                    display = " ".join([action.shell.command, *action.shell.args])
+                    entry = f"[iter {iteration_index}] $ {display}"
+                    if entry not in executed_command_log:
+                        executed_command_log.append(entry)
 
-            if response.structured_output is None:
-                last_error = OrchestrationPlanError(
-                    "Provider did not return structured output for the plan request."
+            # 7. Check stop conditions
+            has_pending = any(
+                r.status is ExecutionStatus.PENDING_APPROVAL for r in execution_results
+            )
+            has_fatal = any(self._is_fatal_result(r) for r in execution_results)
+
+            if has_pending:
+                stop_reason = LoopStopReason.PENDING_APPROVAL
+            elif has_fatal:
+                stop_reason = LoopStopReason.FATAL_EXECUTION_FAILURE
+            elif total_actions_executed >= _MAX_TOTAL_ACTIONS:
+                stop_reason = LoopStopReason.MAX_ACTIONS
+            elif iteration_index >= _MAX_LOOP_ITERATIONS:
+                stop_reason = LoopStopReason.MAX_ITERATIONS
+
+            # 8. Build observation
+            observation = self._build_observation(
+                iteration_index,
+                execution_results,
+                actions_to_execute,
+                iter_changed,
+                remaining_iterations=_MAX_LOOP_ITERATIONS - iteration_index,
+                remaining_actions=_MAX_TOTAL_ACTIONS - total_actions_executed,
+            )
+
+            iterations.append(OrchestrationIteration(
+                iteration=iteration_index,
+                context=context,
+                plan=plan,
+                planning_metadata=planning_metadata,
+                policy_decisions=decisions,
+                policy_evaluations=[e for e in evaluations if e is not None],
+                execution_results=execution_results,
+                observation=observation if stop_reason is None else None,
+                stop_reason=stop_reason,
+            ))
+
+            self._observer.emit(
+                EVENT_ITERATION_COMPLETED,
+                payload={
+                    "request_id": request_id,
+                    "iteration": iteration_index,
+                    "actions_executed": len(actions_to_execute),
+                    "stop_reason": stop_reason.value if stop_reason else None,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+
+            if stop_reason is not None:
+                break
+
+            # 9. No-progress detection
+            if progress_detector.is_stuck(execution_results, iter_changed, actions_to_execute):
+                iterations[-1] = iterations[-1].model_copy(
+                    update={"stop_reason": LoopStopReason.NO_PROGRESS},
                 )
-                if attempt < self._max_plan_attempts:
-                    emit_event(
-                        EVENT_RETRY,
-                        payload={
-                            "request_id": request_id,
-                            "attempt": attempt,
-                            "error": str(last_error),
-                        },
-                        logger_name="foundation.services.orchestrator",
-                    )
-                    emit_event(
-                        EVENT_PLAN_FAILED,
-                        payload={
-                            "request_id": request_id,
-                            "attempt": attempt,
-                            "error": str(last_error),
-                        },
-                        logger_name="foundation.services.orchestrator",
-                    )
-                    supplemental_messages = self._repair_messages(
-                        "The previous response omitted the required JSON object."
-                    )
-                    continue
+                stop_reason = LoopStopReason.NO_PROGRESS
                 break
 
-            try:
-                plan = AssistantPlan.model_validate(response.structured_output)
-                self._validate_supported_actions(plan)
-            except (ValidationError, OrchestrationPlanError) as exc:
-                last_error = exc
-                if attempt < self._max_plan_attempts:
-                    emit_event(
-                        EVENT_RETRY,
-                        payload={
-                            "request_id": request_id,
-                            "attempt": attempt,
-                            "error": str(exc),
-                        },
-                        logger_name="foundation.services.orchestrator",
+            # 10. Accumulate observation messages for next iteration.  We
+            # append this iteration's observation to a running history so the
+            # planner sees every prior iteration's plan + outcome.  Then we
+            # rebuild observation_messages for the next iteration as:
+            # [all prior observations] + [one cumulative "already executed"
+            # summary], so the model can't re-plan commands it has run.
+            observation_message_history.extend(
+                self._observation_to_messages(plan, observation)
+            )
+            observation_messages = list(observation_message_history)
+            if executed_command_log:
+                summary_content = (
+                    "COMMANDS ALREADY EXECUTED (do NOT re-run these unless "
+                    "the workspace state has meaningfully changed since — "
+                    "their stdout is in the observation blocks above):\n"
+                    + "\n".join(executed_command_log)
+                )
+                observation_messages.append(
+                    ProviderMessage(
+                        role=ProviderMessageRole.DEVELOPER,
+                        content=summary_content,
                     )
-                    emit_event(
-                        EVENT_PLAN_FAILED,
-                        payload={
-                            "request_id": request_id,
-                            "attempt": attempt,
-                            "error": str(exc),
-                        },
-                        logger_name="foundation.services.orchestrator",
-                    )
-                if attempt < self._max_plan_attempts:
-                    supplemental_messages = self._repair_messages(
-                        f"The previous JSON failed validation: {exc}",
-                        invalid_output=response.content,
-                    )
-                    continue
-                break
+                )
 
-            return plan, response.metadata
+        # Fallback
+        if stop_reason is None:
+            stop_reason = LoopStopReason.MAX_ITERATIONS
 
-        detail = str(last_error) if last_error is not None else "Unknown planning failure."
-        raise OrchestrationPlanError(
-            "The provider did not produce a valid structured plan after "
-            f"{self._max_plan_attempts} attempt(s): {detail}"
+        # Build result
+        terminal_plan = iterations[-1].plan
+        terminal_context = iterations[-1].context
+        terminal_metadata = iterations[-1].planning_metadata
+        all_decisions = [d for it in iterations for d in it.policy_decisions]
+        all_evaluations = [e for it in iterations for e in it.policy_evaluations]
+        all_results = [r for it in iterations for r in it.execution_results]
+
+        msg_content = self._augment_message_with_stop_reason(
+            terminal_plan.assistant_message, stop_reason,
+        )
+        assistant_message = AssistantMessage(content=msg_content)
+
+        verification_notice = self._build_verification_notice(
+            had_code_changes, verification_outcome, verification_commands,
         )
 
-    def _base_plan_messages(
+        summary = self._build_summary(
+            iterations, all_results,
+            plan_only=request.plan_only,
+            stop_reason=stop_reason,
+        )
+
+        return OrchestrationResult(
+            session_id=session_id,
+            request=request,
+            context=terminal_context,
+            plan=terminal_plan,
+            planning_metadata=terminal_metadata,
+            policy_decisions=all_decisions,
+            policy_evaluations=all_evaluations,
+            execution_results=all_results,
+            assistant_message=assistant_message,
+            summary=summary,
+            iterations=iterations,
+            stop_reason=stop_reason,
+            verification_notice=verification_notice,
+        )
+
+    # ------------------------------------------------------------------
+    # Iteration action execution
+    # ------------------------------------------------------------------
+
+    def _execute_iteration_actions(
         self,
-        request: UserRequest,
+        actions: list[PlannedAction],
+        *,
         context: ContextSnapshot,
-    ) -> list[ProviderMessage]:
-        schema_outline = {
-            "assistant_message": "string",
-            "actions": [
-                {
-                    "id": "unique action identifier",
-                    "kind": "explanation | shell | tool_call",
-                    "summary": "short description",
-                    "requires_approval": "boolean",
-                    "approval_reason": "string | null",
-                    "explanation": "required for explanation actions",
-                    "shell": {
-                        "command": "string",
-                        "args": ["string"],
-                        "cwd": "string | null",
-                        "timeout_seconds": "integer | null",
-                        "mode": "buffered | stream | pty",
-                    },
-                    "tool_call": {
-                        "capability_id": "foundation.search",
-                        "version": "1.0.0 | null",
-                        "arguments": "tool-specific JSON object",
-                    },
-                }
-            ],
-        }
-        capability_guide = [
-            {
-                "capability_id": str(snapshot.capability_id),
-                "version": str(snapshot.version),
-                "name": snapshot.name,
-                "description": snapshot.description,
-                "transport": snapshot.transport.value,
-                "risk_class": snapshot.risk_class.value,
-                "trust_tier": snapshot.trust_tier.value,
-                "declared_side_effects": list(snapshot.declared_side_effects),
-                "input_schema": snapshot.input_schema,
-            }
-            for snapshot in context.available_capabilities
-        ]
-        instructions = (
-            "You are the planning model for Foundation CLI v2 Stage 1. "
-            f"Return at most {_MAX_PLAN_ACTIONS} actions. "
-            "Prefer typed tool_call actions that reference one available capability. "
-            "Use shell actions only for simple read-only inspection commands. "
-            "Do not assume command or tool output before execution. "
-            "If an action is risky, mutating, networked, or uncertain, mark requires_approval=true "
-            "and explain why in approval_reason. "
-            "If the user can be answered directly, return zero actions or an explanation action. "
-            "Available capability snapshot:\n"
-            f"{json.dumps(capability_guide, indent=2)}\n"
-            "Action shape guide:\n"
-            f"{json.dumps(schema_outline, indent=2)}\n"
-            "Context JSON:\n"
-            f"{json.dumps(context.model_dump(mode='json'), indent=2)}"
-        )
-        return [
-            ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=instructions),
-            *request.conversation_history,
-            ProviderMessage(role=ProviderMessageRole.USER, content=request.message),
-        ]
-
-    def _session_status_for_summary(self, summary: OrchestrationSummary) -> SessionStatus:
-        if summary.failed_actions > 0:
-            return SessionStatus.FAILED
-        if summary.pending_approval_actions > 0:
-            return SessionStatus.PENDING_APPROVAL
-        return SessionStatus.COMPLETED
-
-    def _repair_messages(
-        self,
-        validation_feedback: str,
-        *,
-        invalid_output: str | None = None,
-    ) -> list[ProviderMessage]:
-        messages: list[ProviderMessage] = []
-        if invalid_output:
-            messages.append(
-                ProviderMessage(
-                    role=ProviderMessageRole.ASSISTANT,
-                    content=invalid_output,
-                )
-            )
-        messages.append(
-            ProviderMessage(
-                role=ProviderMessageRole.DEVELOPER,
-                content=(
-                    f"{validation_feedback} Return a corrected JSON object only. "
-                    "Do not include markdown fences."
-                ),
-            )
-        )
-        return messages
-
-    def _validate_supported_actions(self, plan: AssistantPlan) -> None:
-        if len(plan.actions) > _MAX_PLAN_ACTIONS:
-            raise OrchestrationPlanError(
-                f"Structured plans are bounded to {_MAX_PLAN_ACTIONS} actions."
-            )
-        for action in plan.actions:
-            if action.kind is ActionKind.SHELL:
-                assert action.shell is not None
-                if any(character.isspace() for character in action.shell.command):
-                    raise OrchestrationPlanError(
-                        f"Shell action {action.id!r} must split the executable and args."
-                    )
-            if action.kind is ActionKind.TOOL_CALL:
-                assert action.tool_call is not None
-                self._validated_tool_request(action.tool_call)
-
-    def _handle_action(
-        self,
-        action: PlannedAction,
-        decision: PolicyDecision,
-        policy_evaluation: PolicyEvaluationRecord | None,
-        *,
         request: UserRequest,
         resolved_request_cwd: Path,
         request_id: str,
-    ) -> tuple[ExecutionResult, ApprovalRequest | None, ApprovalResolution | None]:
-        if request.plan_only:
-            return (
-                ExecutionResult(
-                    action_id=action.id,
-                    status=ExecutionStatus.NOT_EXECUTED,
-                    summary="Execution skipped because plan_only was requested.",
-                ),
-                None,
-                None,
-            )
-
-        if decision.decision is PolicyDecisionType.BLOCK:
-            return (
-                ExecutionResult(
-                    action_id=action.id,
-                    status=ExecutionStatus.BLOCKED,
-                    summary=decision.reason,
-                    error=decision.reason,
-                ),
-                None,
-                None,
-            )
-
-        if decision.decision is PolicyDecisionType.REQUIRE_APPROVAL:
-            if policy_evaluation is None:
-                raise OrchestrationError(
-                    f"Approval-required action {action.id!r} is missing a policy evaluation."
-                )
-            approval_request, approval_resolution = self._approval_service.resolve(
+        session_id: str | None,
+        planning_step_id: str,
+        iteration: int = 1,
+    ) -> tuple[
+        list[ExecutionResult],
+        list[PolicyDecision],
+        list[PolicyEvaluationRecord | None],
+        str | None,
+    ]:
+        evaluations = [
+            self._policy_engine.evaluate(
                 action,
-                policy_evaluation,
                 request_cwd=resolved_request_cwd,
+                approval_mode=self._approval_mode,
             )
-            emit_event(
-                EVENT_APPROVAL_REQUESTED,
-                payload={
-                    "request_id": request_id,
-                    "action_id": action.id,
-                    "risk_categories": list(decision.risk_categories),
-                    "mode": approval_resolution.mode,
-                },
-                logger_name="foundation.services.approval",
+            for action in actions
+        ]
+        decisions = [
+            self._policy_engine.to_policy_decision(evaluation)
+            if evaluation is not None
+            else PolicyDecision(
+                action_id=action.id,
+                decision=PolicyDecisionType.ALLOW,
+                reason="Explanation-only actions do not execute anything.",
             )
-            if approval_resolution.status is ApprovalDecisionStatus.PENDING:
-                emit_event(
-                    EVENT_APPROVAL_RESOLVED,
-                    payload={
-                        "request_id": request_id,
-                        "action_id": action.id,
-                        "status": approval_resolution.status.value,
-                    },
-                    logger_name="foundation.services.approval",
-                )
-                return (
-                    ExecutionResult(
-                        action_id=action.id,
-                        status=ExecutionStatus.PENDING_APPROVAL,
-                        summary=decision.reason,
-                    ),
-                    approval_request,
-                    approval_resolution,
-                )
-            if approval_resolution.status is ApprovalDecisionStatus.DENIED:
-                emit_event(
-                    EVENT_APPROVAL_RESOLVED,
-                    payload={
-                        "request_id": request_id,
-                        "action_id": action.id,
-                        "status": approval_resolution.status.value,
-                    },
-                    logger_name="foundation.services.approval",
-                )
-                return (
-                    ExecutionResult(
-                        action_id=action.id,
-                        status=ExecutionStatus.BLOCKED,
-                        summary=approval_resolution.reason,
-                        error=approval_resolution.reason,
-                    ),
-                    approval_request,
-                    approval_resolution,
-                )
-        else:
-            approval_request = None
-            approval_resolution = None
+            for action, evaluation in zip(actions, evaluations, strict=True)
+        ]
+        execution_results: list[ExecutionResult] = []
+        candidate_capability_ids = [
+            str(s.capability_id) for s in context.available_capabilities
+        ]
+        prior_step_id: str | None = None
+        last_step_id: str | None = None
 
-        if action.kind is ActionKind.EXPLANATION:
-            return (
-                ExecutionResult(
-                    action_id=action.id,
-                    status=ExecutionStatus.NOT_EXECUTED,
-                    summary=action.explanation or action.summary,
-                    artifact_type=ExecutionArtifactType.EXPLANATION,
-                    artifact={"message": action.explanation or action.summary},
-                ),
-                approval_request,
-                approval_resolution,
-            )
+        for action, decision, evaluation in zip(
+            actions, decisions, evaluations, strict=True,
+        ):
+            if (
+                self._history_store is not None
+                and session_id is not None
+                and evaluation is not None
+            ):
+                self._history_store.record_policy_evaluation(session_id, record=evaluation)
 
-        if policy_evaluation is not None:
-            self._policy_engine.register_invocation(policy_evaluation)
-
-        if action.kind is ActionKind.TOOL_CALL:
-            assert action.tool_call is not None
-            return (
-                self._execute_tool_call(
-                    action,
-                    action.tool_call,
-                    policy_evaluation=policy_evaluation,
-                    request_cwd=resolved_request_cwd,
-                    request_id=request_id,
-                ),
-                approval_request,
-                approval_resolution,
-            )
-
-        assert action.shell is not None
-        return (
-            self._execute_shell_action(
+            execution = self._executor.execute(
                 action,
-                policy_evaluation=policy_evaluation,
+                decision,
+                policy_evaluation=evaluation,
+                plan_only=request.plan_only,
                 request_cwd=resolved_request_cwd,
                 request_id=request_id,
-            ),
-            approval_request,
-            approval_resolution,
+                session_id=session_id,
+            )
+            execution_results.append(execution.execution_result)
+
+            if self._history_store is not None and session_id is not None:
+                if (
+                    execution.approval_request is not None
+                    and execution.approval_resolution is not None
+                ):
+                    self._history_store.record_approval(
+                        session_id,
+                        request=execution.approval_request,
+                        resolution=execution.approval_resolution,
+                    )
+                self._record_action_history(
+                    session_id,
+                    action=action,
+                    decision=decision,
+                    execution_result=execution.execution_result,
+                    resolved_request_cwd=resolved_request_cwd,
+                )
+
+            last_step_id = self._observer.record_execution_step(
+                session_id,
+                request_id=request_id,
+                action=action,
+                request_cwd=resolved_request_cwd,
+                execution_result=execution.execution_result,
+                policy_evaluation=evaluation,
+                approval_request=execution.approval_request,
+                approval_resolution=execution.approval_resolution,
+                candidate_capability_ids=candidate_capability_ids,
+                planning_step_id=planning_step_id,
+                prior_step_id=prior_step_id,
+                started_at=execution.started_at,
+                completed_at=execution.completed_at,
+                duration_seconds=execution.duration_seconds,
+                iteration=iteration,
+            )
+            prior_step_id = last_step_id
+
+        return execution_results, decisions, evaluations, last_step_id
+
+    # ------------------------------------------------------------------
+    # Observation block builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_observation(
+        iteration: int,
+        execution_results: list[ExecutionResult],
+        actions: list[PlannedAction],
+        changed_paths: list[str],
+        remaining_iterations: int,
+        remaining_actions: int,
+    ) -> IterationObservation:
+        action_outcomes: list[ActionOutcome] = []
+        approval_outcomes: list[str] = []
+
+        for action, result in zip(actions, execution_results, strict=True):
+            capability_id = None
+            if action.kind is ActionKind.TOOL_CALL and action.tool_call:
+                capability_id = action.tool_call.capability_id
+
+            exit_code = None
+            action_changed: list[str] = []
+            stdout_preview = None
+            stderr_preview = None
+
+            if result.artifact:
+                exit_code = result.artifact.get("exit_code")
+                stdout_preview = _truncate_preview(str(result.artifact.get("stdout", "")))
+                stderr_preview = _truncate_preview(str(result.artifact.get("stderr", "")))
+                if result.artifact.get("path"):
+                    action_changed.append(str(result.artifact["path"]))
+
+            if result.status is ExecutionStatus.PENDING_APPROVAL:
+                approval_outcomes.append(f"{action.id}: pending approval")
+
+            action_outcomes.append(ActionOutcome(
+                action_id=action.id,
+                capability_id=capability_id,
+                status=result.status,
+                exit_code=exit_code,
+                changed_paths=action_changed,
+                stdout_preview=stdout_preview,
+                stderr_preview=stderr_preview,
+                error=result.error,
+            ))
+
+        return IterationObservation(
+            iteration=iteration,
+            action_outcomes=action_outcomes,
+            approval_outcomes=approval_outcomes,
+            changed_paths=changed_paths,
+            remaining_iterations=remaining_iterations,
+            remaining_actions=remaining_actions,
         )
+
+    @staticmethod
+    def _observation_to_messages(
+        plan: AssistantPlan,
+        observation: IterationObservation,
+    ) -> list[ProviderMessage]:
+        assistant_content = json.dumps(plan.model_dump(mode="json"), indent=2)
+        observation_content = (
+            f"EXECUTION OBSERVATION (iteration {observation.iteration}):\n"
+            f"{json.dumps(observation.model_dump(mode='json'), indent=2)}\n\n"
+            f"You have {observation.remaining_iterations} iteration(s) and "
+            f"{observation.remaining_actions} action(s) remaining.\n"
+            "Based on these results, decide your next actions. "
+            "If verification failed, diagnose the error and issue repair actions. "
+            "If all work is complete and verified, return zero actions with your final answer."
+        )
+        return [
+            ProviderMessage(role=ProviderMessageRole.ASSISTANT, content=assistant_content),
+            ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=observation_content),
+        ]
+
+    # ------------------------------------------------------------------
+    # Result classification helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _classify_results(
+        execution_results: list[ExecutionResult],
+        actions: list[PlannedAction],
+    ) -> tuple[list[str], bool, VerificationOutcome, list[str]]:
+        """Return (changed_paths, had_code_changes, iter_outcome, verify_cmds).
+
+        ``iter_outcome`` is the worst observed verification outcome across all
+        verification commands in this iteration (UNAVAILABLE > FAILED > PASSED),
+        or NOT_ATTEMPTED if none was planned.
+        """
+        changed_paths: list[str] = []
+        had_code_changes = False
+        verify_cmds: list[str] = []
+        iter_outcome = VerificationOutcome.NOT_ATTEMPTED
+
+        for action, result in zip(actions, execution_results, strict=True):
+            if result.artifact_type in _CODE_CHANGING_ARTIFACT_TYPES:
+                had_code_changes = True
+                if result.artifact and result.artifact.get("path"):
+                    changed_paths.append(str(result.artifact["path"]))
+
+            if action.kind is ActionKind.SHELL and action.shell:
+                cmd_basename = action.shell.command.split("/")[-1]
+                if cmd_basename in _VERIFICATION_COMMANDS:
+                    display = " ".join([action.shell.command, *action.shell.args])
+                    verify_cmds.append(display)
+                    cmd_outcome = _verification_outcome_for_result(result)
+                    iter_outcome = _worst_verification_outcome(
+                        iter_outcome, cmd_outcome
+                    )
+
+        return changed_paths, had_code_changes, iter_outcome, verify_cmds
+
+    @staticmethod
+    def _is_fatal_result(result: ExecutionResult) -> bool:
+        if result.status is not ExecutionStatus.FAILED:
+            return False
+        if result.error is None:
+            return False
+        error_lower = result.error.lower()
+        return any(p in error_lower for p in _FATAL_ERROR_PATTERNS)
+
+    @staticmethod
+    def _build_verification_notice(
+        had_code_changes: bool,
+        outcome: VerificationOutcome,
+        verification_commands: list[str] | None = None,
+    ) -> VerificationNotice | None:
+        if not had_code_changes:
+            return None
+        reason_by_outcome = {
+            VerificationOutcome.PASSED: None,
+            VerificationOutcome.FAILED: (
+                "A verification command ran and reported failure."
+            ),
+            VerificationOutcome.UNAVAILABLE: (
+                "Verification was attempted but the command could not run "
+                "(binary missing or spawn error)."
+            ),
+            VerificationOutcome.NOT_ATTEMPTED: (
+                "Code was modified but no verification command was executed."
+            ),
+        }
+        return VerificationNotice(
+            outcome=outcome,
+            verification_commands_run=verification_commands or [],
+            reason=reason_by_outcome[outcome],
+        )
+
+    @staticmethod
+    def _augment_message_with_stop_reason(
+        message: str,
+        stop_reason: LoopStopReason,
+    ) -> str:
+        suffix = _STOP_REASON_SUFFIXES.get(stop_reason)
+        if suffix:
+            return message + suffix
+        return message
+
+    # ------------------------------------------------------------------
+    # History and session helpers
+    # ------------------------------------------------------------------
 
     def _record_action_history(
         self,
@@ -921,296 +1051,13 @@ class RequestOrchestrator:
             },
         )
 
-    def _execute_tool_call(
-        self,
-        action: PlannedAction,
-        tool_call: ToolCall,
-        *,
-        policy_evaluation: PolicyEvaluationRecord | None,
-        request_cwd: Path,
-        request_id: str,
-    ) -> ExecutionResult:
-        emit_event(
-            EVENT_TOOL_CALL_STARTED,
-            payload={
-                "request_id": request_id,
-                "action_id": action.id,
-                "tool": tool_call.capability_id,
-            },
-            logger_name="foundation.services.orchestrator",
-        )
-        emit_event(
-            EVENT_TOOL_EXECUTION_STARTED,
-            payload={
-                "request_id": request_id,
-                "action_id": action.id,
-                "tool": tool_call.capability_id,
-            },
-            logger_name="foundation.services.orchestrator",
-        )
-        result: SearchResult | FileDiscoveryResult | GitContextResult | HelpLookupResult
-        try:
-            manifest = self._capability_registry.resolve(
-                tool_call.capability_id,
-                tool_call.version,
-            )
-            if manifest.runtime_endpoint == "builtin.search":
-                search_request = SearchRequest.model_validate(tool_call.arguments)
-                result = self._tool_service.search(search_request)
-                artifact_type = ExecutionArtifactType.SEARCH
-            elif manifest.runtime_endpoint == "builtin.files":
-                result = self._tool_service.discover_files(
-                    FileDiscoveryRequest.model_validate(tool_call.arguments)
-                )
-                artifact_type = ExecutionArtifactType.FILES
-            elif manifest.runtime_endpoint == "builtin.git":
-                result = self._tool_service.git_context(
-                    GitContextRequest.model_validate(tool_call.arguments)
-                )
-                artifact_type = ExecutionArtifactType.GIT
-            elif manifest.runtime_endpoint == "builtin.man":
-                result = self._tool_service.lookup_help(
-                    HelpLookupRequest.model_validate(
-                        {
-                            **tool_call.arguments,
-                            "source": HelpLookupSource.MAN,
-                        }
-                    )
-                )
-                artifact_type = ExecutionArtifactType.MAN
-            elif manifest.runtime_endpoint == "builtin.tldr":
-                result = self._tool_service.lookup_help(
-                    HelpLookupRequest.model_validate(
-                        {
-                            **tool_call.arguments,
-                            "source": HelpLookupSource.TLDR,
-                        }
-                    )
-                )
-                artifact_type = ExecutionArtifactType.TLDR
-            elif manifest.runtime_endpoint == "builtin.shell":
-                shell_action = ShellAction.model_validate(tool_call.arguments)
-                shell_planned_action = action.model_copy(
-                    update={
-                        "kind": ActionKind.SHELL,
-                        "shell": shell_action,
-                        "tool_call": None,
-                    }
-                )
-                return self._execute_shell_action(
-                    shell_planned_action,
-                    policy_evaluation=policy_evaluation,
-                    request_cwd=request_cwd,
-                    request_id=request_id,
-                )
-            else:
-                raise OrchestrationPlanError(
-                    f"Unsupported capability runtime endpoint: {manifest.runtime_endpoint}"
-                )
-        except (OrchestrationPlanError, ValueError) as exc:
-            emit_event(
-                EVENT_TOOL_EXECUTION_FAILED,
-                payload={
-                    "request_id": request_id,
-                    "action_id": action.id,
-                    "tool": tool_call.capability_id,
-                    "error": str(exc),
-                    "code": "invalid_capability",
-                },
-                logger_name="foundation.services.orchestrator",
-            )
-            emit_event(
-                EVENT_TOOL_CALL_FAILED,
-                payload={
-                    "request_id": request_id,
-                    "action_id": action.id,
-                    "tool": tool_call.capability_id,
-                    "error": str(exc),
-                    "code": "invalid_capability",
-                },
-                logger_name="foundation.services.orchestrator",
-            )
-            return ExecutionResult(
-                action_id=action.id,
-                status=ExecutionStatus.FAILED,
-                summary=f"Capability execution failed: {exc}",
-                error=str(exc),
-            )
-        except ToolExecutionError as exc:
-            emit_event(
-                EVENT_TOOL_EXECUTION_FAILED,
-                payload={
-                    "request_id": request_id,
-                    "action_id": action.id,
-                    "tool": tool_call.capability_id,
-                    "error": exc.error.message,
-                    "code": exc.error.code.value,
-                },
-                logger_name="foundation.services.orchestrator",
-            )
-            emit_event(
-                EVENT_TOOL_CALL_FAILED,
-                payload={
-                    "request_id": request_id,
-                    "action_id": action.id,
-                    "tool": tool_call.capability_id,
-                    "error": exc.error.message,
-                    "code": exc.error.code.value,
-                },
-                logger_name="foundation.services.orchestrator",
-            )
-            return ExecutionResult(
-                action_id=action.id,
-                status=ExecutionStatus.FAILED,
-                summary=f"Tool execution failed: {exc.error.message}",
-                error=exc.error.message,
-            )
-
-        summary = f"Executed capability `{tool_call.capability_id}` for action {action.id}."
-        emit_event(
-            EVENT_TOOL_EXECUTION_FINISHED,
-            payload={
-                "request_id": request_id,
-                "action_id": action.id,
-                "tool": tool_call.capability_id,
-                "artifact_type": artifact_type.value,
-            },
-            logger_name="foundation.services.orchestrator",
-        )
-        emit_event(
-            EVENT_TOOL_CALL_FINISHED,
-            payload={
-                "request_id": request_id,
-                "action_id": action.id,
-                "tool": tool_call.capability_id,
-            },
-            logger_name="foundation.services.orchestrator",
-        )
-        return ExecutionResult(
-            action_id=action.id,
-            status=ExecutionStatus.EXECUTED,
-            summary=summary,
-            artifact_type=artifact_type,
-            artifact=result.model_dump(mode="json"),
-        )
-
-    def _execute_shell_action(
-        self,
-        action: PlannedAction,
-        *,
-        policy_evaluation: PolicyEvaluationRecord | None,
-        request_cwd: Path,
-        request_id: str,
-    ) -> ExecutionResult:
-        assert action.shell is not None
-        shell_action = action.shell
-        shell_cwd = request_cwd if shell_action.cwd is None else Path(shell_action.cwd)
-        effective_timeout = shell_action.timeout_seconds
-        effective_capture_limit_kb: int | None = None
-        if policy_evaluation is not None:
-            budget = (
-                policy_evaluation.verdict.constraints or policy_evaluation.policy_input.constraints
-            ).invocation_budget
-            if budget is not None:
-                effective_capture_limit_kb = budget.output_limit_kb
-                if budget.timeout_seconds is not None and effective_timeout is not None:
-                    effective_timeout = min(effective_timeout, budget.timeout_seconds)
-        try:
-            result = self._shell_runtime.execute(
-                ShellCommandRequest(
-                    command=shell_action.command,
-                    args=shell_action.args,
-                    cwd=shell_cwd,
-                    timeout_seconds=effective_timeout,
-                    capture_limit_kb=effective_capture_limit_kb,
-                    mode=ExecutionMode(shell_action.mode.value),
-                    approval_context={
-                        "source": "orchestrator",
-                        "action_id": action.id,
-                        "request_id": request_id,
-                    },
-                ),
-                on_event=self._shell_output_callback,
-            )
-        except ValueError as exc:
-            return ExecutionResult(
-                action_id=action.id,
-                status=ExecutionStatus.FAILED,
-                summary=f"Shell execution was rejected: {exc}",
-                error=str(exc),
-            )
-        except ShellExecutionSpawnError as exc:
-            return ExecutionResult(
-                action_id=action.id,
-                status=ExecutionStatus.FAILED,
-                summary=f"Shell execution failed to start: {exc}",
-                error=str(exc),
-            )
-        except ShellExecutionTimeout as exc:
-            artifact = exc.result.model_dump(mode="json") if exc.result is not None else None
-            return ExecutionResult(
-                action_id=action.id,
-                status=ExecutionStatus.FAILED,
-                summary=f"Shell execution timed out: {exc}",
-                artifact_type=ExecutionArtifactType.SHELL if artifact is not None else None,
-                artifact=artifact,
-                error=str(exc),
-            )
-        except ShellExecutionCancelled as exc:
-            artifact = exc.result.model_dump(mode="json") if exc.result is not None else None
-            return ExecutionResult(
-                action_id=action.id,
-                status=ExecutionStatus.FAILED,
-                summary=f"Shell execution was cancelled: {exc}",
-                artifact_type=ExecutionArtifactType.SHELL if artifact is not None else None,
-                artifact=artifact,
-                error=str(exc),
-            )
-
-        status = ExecutionStatus.EXECUTED if result.ok else ExecutionStatus.FAILED
-        return ExecutionResult(
-            action_id=action.id,
-            status=status,
-            summary=f"Executed shell command `{result.display_command}`.",
-            artifact_type=ExecutionArtifactType.SHELL,
-            artifact=result.model_dump(mode="json"),
-            error=None if result.ok else result.stderr or f"Exit code {result.exit_code}",
-        )
-
-    def _validated_tool_request(
-        self,
-        tool_call: ToolCall,
-    ) -> SearchRequest | FileDiscoveryRequest | GitContextRequest | HelpLookupRequest | ShellAction:
-        manifest = self._capability_registry.resolve(
-            tool_call.capability_id,
-            tool_call.version,
-        )
-        arguments = dict(tool_call.arguments)
-        if manifest.runtime_endpoint == "builtin.search":
-            return SearchRequest.model_validate(arguments)
-        if manifest.runtime_endpoint == "builtin.files":
-            return FileDiscoveryRequest.model_validate(arguments)
-        if manifest.runtime_endpoint == "builtin.git":
-            return GitContextRequest.model_validate(arguments)
-        if manifest.runtime_endpoint == "builtin.man":
-            return HelpLookupRequest.model_validate(
-                {
-                    **arguments,
-                    "source": HelpLookupSource.MAN,
-                }
-            )
-        if manifest.runtime_endpoint == "builtin.tldr":
-            return HelpLookupRequest.model_validate(
-                {
-                    **arguments,
-                    "source": HelpLookupSource.TLDR,
-                }
-            )
-        if manifest.runtime_endpoint == "builtin.shell":
-            return ShellAction.model_validate(arguments)
-        raise OrchestrationPlanError(
-            f"Unsupported capability id: {tool_call.capability_id}"
-        )
+    @staticmethod
+    def _session_status_for_summary(summary: OrchestrationSummary) -> SessionStatus:
+        if summary.failed_actions > 0:
+            return SessionStatus.FAILED
+        if summary.pending_approval_actions > 0:
+            return SessionStatus.PENDING_APPROVAL
+        return SessionStatus.COMPLETED
 
     def _resolve_request_cwd(self, value: Path | None) -> Path:
         if value is None:
@@ -1229,33 +1076,45 @@ class RequestOrchestrator:
             raise OrchestrationError(f"Request cwd is not a directory: {resolved}")
         return resolved
 
+    # ------------------------------------------------------------------
+    # Summary builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
     def _build_summary(
-        self,
-        plan: AssistantPlan,
+        iterations: list[OrchestrationIteration],
         execution_results: list[ExecutionResult],
         *,
         plan_only: bool,
+        stop_reason: LoopStopReason,
     ) -> OrchestrationSummary:
-        executed = sum(result.status is ExecutionStatus.EXECUTED for result in execution_results)
-        pending = sum(
-            result.status is ExecutionStatus.PENDING_APPROVAL for result in execution_results
-        )
-        blocked = sum(result.status is ExecutionStatus.BLOCKED for result in execution_results)
-        failed = sum(result.status is ExecutionStatus.FAILED for result in execution_results)
-        skipped = sum(result.status is ExecutionStatus.NOT_EXECUTED for result in execution_results)
+        executed = sum(r.status is ExecutionStatus.EXECUTED for r in execution_results)
+        pending = sum(r.status is ExecutionStatus.PENDING_APPROVAL for r in execution_results)
+        blocked = sum(r.status is ExecutionStatus.BLOCKED for r in execution_results)
+        failed = sum(r.status is ExecutionStatus.FAILED for r in execution_results)
+        skipped = sum(r.status is ExecutionStatus.NOT_EXECUTED for r in execution_results)
+        total_planned = sum(len(it.plan.actions) for it in iterations)
 
-        if not plan.actions:
+        if not any(it.plan.actions for it in iterations):
             text = "No actions were needed for this request."
         elif plan_only:
             text = (
-                f"Planned {len(plan.actions)} action(s); execution was skipped because plan_only "
+                f"Planned {total_planned} action(s); execution was skipped because plan_only "
                 "was requested."
             )
         else:
-            text = (
-                f"Executed {executed} action(s), {pending} pending approval, "
-                f"{failed} failed, {blocked} blocked, and {skipped} skipped."
-            )
+            parts = [f"Executed {executed} action(s)"]
+            if pending:
+                parts.append(f"{pending} pending approval")
+            if failed:
+                parts.append(f"{failed} failed")
+            if blocked:
+                parts.append(f"{blocked} blocked")
+            if skipped:
+                parts.append(f"{skipped} skipped")
+            text = ", ".join(parts) + "."
+            if len(iterations) > 1:
+                text += f" ({len(iterations)} iterations)"
 
         return OrchestrationSummary(
             executed_actions=executed,
@@ -1263,5 +1122,26 @@ class RequestOrchestrator:
             blocked_actions=blocked,
             failed_actions=failed,
             skipped_actions=skipped,
+            total_iterations=len(iterations),
+            total_actions_planned=total_planned,
             text=text,
         )
+
+
+# ------------------------------------------------------------------
+# Module-level helpers
+# ------------------------------------------------------------------
+
+
+def _truncate_preview(text: str) -> str | None:
+    if not text:
+        return None
+    lines = text.split("\n")
+    if len(lines) > _OBSERVATION_MAX_LINES:
+        lines = lines[:_OBSERVATION_MAX_LINES]
+        text = "\n".join(lines) + "\n... (truncated)"
+    encoded = text.encode("utf-8")
+    if len(encoded) > _OBSERVATION_MAX_BYTES:
+        text = encoded[:_OBSERVATION_MAX_BYTES].decode("utf-8", errors="ignore")
+        text += "\n... (truncated)"
+    return text if text else None

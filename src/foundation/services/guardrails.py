@@ -297,16 +297,40 @@ class CapabilityPolicyEngine:
         invalid_summary: str | None = None
 
         scope = arguments.get("scope")
-        if manifest.runtime_endpoint in {"builtin.search", "builtin.files", "builtin.git"}:
+        endpoint = manifest.runtime_endpoint
+        if endpoint in {"builtin.search", "builtin.files", "builtin.git"}:
             resolved_scope = self._resolve_tool_scope(scope)
             if resolved_scope is not None:
                 requested_paths.append(str(resolved_scope))
             requested_side_effects.append("filesystem_read")
-        elif manifest.runtime_endpoint in {"builtin.man", "builtin.tldr"}:
+        elif endpoint in {"builtin.man", "builtin.tldr"}:
             requested_side_effects.append("local_help_read")
+        elif endpoint in {
+            "builtin.file.read", "builtin.file.read_chunk",
+        }:
+            path = arguments.get("path")
+            if isinstance(path, str):
+                requested_paths.append(path)
+            requested_side_effects.append("filesystem_read")
+        elif endpoint in {
+            "builtin.file.write", "builtin.file.edit", "builtin.file.apply_diff",
+        }:
+            path = arguments.get("path")
+            if isinstance(path, str):
+                requested_paths.append(path)
+            requested_side_effects.append("workspace_write")
+        elif endpoint in {
+            "builtin.git.status", "builtin.git.diff",
+            "builtin.git.show", "builtin.git.log",
+        }:
+            requested_side_effects.append("filesystem_read")
+        elif endpoint in {"builtin.git.stage", "builtin.git.unstage"}:
+            requested_side_effects.append("workspace_write")
+        elif endpoint == "builtin.git.commit":
+            requested_side_effects.append("workspace_write")
         else:
             invalid_summary = (
-                f"Unsupported capability runtime endpoint: {manifest.runtime_endpoint}"
+                f"Unsupported capability runtime endpoint: {endpoint}"
             )
 
         budget = manifest.constraints.invocation_budget

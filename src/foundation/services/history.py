@@ -36,7 +36,7 @@ from foundation.observability import redact_payload
 
 logger = logging.getLogger("foundation.services.history")
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 5
 _DEFAULT_MAX_BLOB_BYTES = 64 * 1024
 
 _SCHEMA_SQL = """
@@ -64,12 +64,14 @@ CREATE TABLE IF NOT EXISTS user_messages (
 
 CREATE TABLE IF NOT EXISTS assistant_plans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL DEFAULT 1,
     assistant_message TEXT NOT NULL,
     context_json TEXT,
     plan_json TEXT NOT NULL,
     planning_metadata_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, iteration)
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -152,6 +154,7 @@ CREATE TABLE IF NOT EXISTS summarized_outcomes (
     blocked_actions INTEGER NOT NULL,
     failed_actions INTEGER NOT NULL,
     skipped_actions INTEGER NOT NULL,
+    total_iterations INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
 
@@ -298,6 +301,7 @@ class HistoryStore:
         self,
         session_id: str,
         *,
+        iteration: int = 1,
         assistant_message: str,
         context: dict[str, object],
         plan: dict[str, object],
@@ -309,16 +313,18 @@ class HistoryStore:
                 """
                 INSERT OR REPLACE INTO assistant_plans (
                     session_id,
+                    iteration,
                     assistant_message,
                     context_json,
                     plan_json,
                     planning_metadata_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
+                    iteration,
                     assistant_message,
                     self._encode_json_blob(context),
                     self._encode_json_blob(plan),
@@ -331,7 +337,11 @@ class HistoryStore:
         self.record_event(
             session_id,
             "plan_recorded",
-            {"assistant_message": assistant_message, "action_count": action_count},
+            {
+                "assistant_message": assistant_message,
+                "action_count": action_count,
+                "iteration": iteration,
+            },
         )
 
     def record_tool_call(
@@ -588,6 +598,7 @@ class HistoryStore:
         blocked_actions: int,
         failed_actions: int,
         skipped_actions: int,
+        total_iterations: int = 1,
     ) -> None:
         created_at = _utcnow()
         with self._connect() as connection:
@@ -602,9 +613,10 @@ class HistoryStore:
                     blocked_actions,
                     failed_actions,
                     skipped_actions,
+                    total_iterations,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -615,6 +627,7 @@ class HistoryStore:
                     blocked_actions,
                     failed_actions,
                     skipped_actions,
+                    total_iterations,
                     created_at,
                 ),
             )
@@ -895,6 +908,11 @@ class HistoryStore:
                     ON summarized_outcomes.session_id = sessions.id
                 LEFT JOIN assistant_plans
                     ON assistant_plans.session_id = sessions.id
+                    AND assistant_plans.iteration = (
+                        SELECT COALESCE(MAX(ap2.iteration), 1)
+                        FROM assistant_plans ap2
+                        WHERE ap2.session_id = sessions.id
+                    )
                 WHERE sessions.id = ?
                 """,
                 (session_id,),
@@ -1150,6 +1168,11 @@ class HistoryStore:
                 ON summarized_outcomes.session_id = sessions.id
             LEFT JOIN assistant_plans
                 ON assistant_plans.session_id = sessions.id
+                AND assistant_plans.iteration = (
+                    SELECT COALESCE(MAX(ap2.iteration), 1)
+                    FROM assistant_plans ap2
+                    WHERE ap2.session_id = sessions.id
+                )
             WHERE sessions.id = ?
             """,
             (session_id,),
@@ -1321,8 +1344,42 @@ class HistoryStore:
 
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
+            current_version = connection.execute("PRAGMA user_version").fetchone()[0]
             connection.executescript(_SCHEMA_SQL)
+            if current_version < 4:
+                self._migrate_to_v4(connection)
+            if current_version < 5:
+                self._migrate_to_v5(connection)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_to_v4(connection: sqlite3.Connection) -> None:
+        """Migrate from schema v3 to v4: add iteration columns."""
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(assistant_plans)").fetchall()
+        }
+        if "iteration" not in columns:
+            connection.execute(
+                "ALTER TABLE assistant_plans ADD COLUMN iteration INTEGER NOT NULL DEFAULT 1"
+            )
+        so_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(summarized_outcomes)").fetchall()
+        }
+        if "total_iterations" not in so_columns:
+            connection.execute(
+                "ALTER TABLE summarized_outcomes "
+                "ADD COLUMN total_iterations INTEGER NOT NULL DEFAULT 1"
+            )
+
+    @staticmethod
+    def _migrate_to_v5(connection: sqlite3.Connection) -> None:
+        """Migrate from schema v4 to v5: rename REPLAN edges to REPLANNED_FROM."""
+        connection.execute(
+            "UPDATE trace_edges SET edge_kind = 'replanned_from' "
+            "WHERE edge_kind = 'replan'"
+        )
 
     def _encode_json_blob(self, payload: object) -> str:
         raw = _json_dumps(payload)

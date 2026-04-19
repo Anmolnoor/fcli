@@ -103,8 +103,9 @@ class ObserverService:
         started_at: str,
         completed_at: str,
         duration_seconds: float,
+        iteration: int = 1,
     ) -> str:
-        step_id = self.planning_step_id(request_id)
+        step_id = self.planning_step_id(request_id, iteration=iteration)
         if self._history_store is None or session_id is None:
             return step_id
         candidate_capability_ids = [
@@ -117,6 +118,7 @@ class ObserverService:
             request_id=request_id,
             request_text=request_text,
             request_cwd=context.request_cwd,
+            iteration_index=iteration,
             candidate_capability_ids=candidate_capability_ids,
             selection_reasons=[
                 self.selection_reason_for_action(
@@ -168,8 +170,11 @@ class ObserverService:
         started_at: str,
         completed_at: str,
         duration_seconds: float,
+        iteration: int = 1,
     ) -> str:
-        step_id = f"action:{action.id}"
+        step_id = self.execution_step_id(
+            request_id, iteration=iteration, action_id=action.id
+        )
         if self._history_store is None or session_id is None:
             return step_id
         capability_id, capability_version, capability_name, manifest_fingerprint = (
@@ -188,6 +193,7 @@ class ObserverService:
             action_summary=action.summary,
             status=execution_result.status,
             request_cwd=str(request_cwd),
+            iteration_index=iteration,
             capability_id=capability_id,
             capability_version=capability_version,
             capability_name=capability_name,
@@ -238,9 +244,16 @@ class ObserverService:
         return step_id
 
     @staticmethod
-    def planning_step_id(request_id: str) -> str:
-        """Return the canonical planning step id for one request."""
-        return f"planning:{request_id}"
+    def planning_step_id(request_id: str, *, iteration: int = 1) -> str:
+        """Return the canonical planning step id for one request iteration."""
+        return f"planning:{request_id}:{iteration}"
+
+    @staticmethod
+    def execution_step_id(
+        request_id: str, *, iteration: int, action_id: str
+    ) -> str:
+        """Return the canonical execution step id for one planned action."""
+        return f"action:{request_id}:{iteration}:{action_id}"
 
     def selection_reason_for_action(
         self,

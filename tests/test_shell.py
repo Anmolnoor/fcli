@@ -241,3 +241,58 @@ def test_pty_timeout_preserves_termination_output(tmp_path: Path) -> None:
     assert result.timed_out is True
     assert "started" in result.stdout
     assert "terminated" in result.stdout
+
+
+# ------------------------------------------------------------------
+# Quote-stripping for LLM-planned shell args
+# ------------------------------------------------------------------
+
+
+def test_shell_args_strip_matching_wrapping_quotes() -> None:
+    """Args wrapped in matching single or double quotes get unwrapped."""
+    request = ShellCommandRequest(
+        command="gh",
+        args=[
+            "api",
+            "users/anmolnoor/repos",
+            "--jq",
+            "'[] | .name'",
+            "--header",
+            '"X-Thing: value"',
+            ".name",
+        ],
+    )
+    assert request.args == [
+        "api",
+        "users/anmolnoor/repos",
+        "--jq",
+        "[] | .name",
+        "--header",
+        "X-Thing: value",
+        ".name",
+    ]
+
+
+def test_shell_args_preserve_mismatched_or_inner_quotes() -> None:
+    """Only matching outer quotes are stripped — inner/mismatched stay."""
+    request = ShellCommandRequest(
+        command="echo",
+        args=[
+            "hello",          # plain
+            "",               # empty
+            "'",              # single char, no wrapping possible
+            "'unclosed",      # opens but doesn't close
+            'closed"',        # opposite
+            "it's",           # inner quote, no wrapping
+            "'a'b'",          # matches outer, strips leaving a'b
+        ],
+    )
+    assert request.args == [
+        "hello",
+        "",
+        "'",
+        "'unclosed",
+        'closed"',
+        "it's",
+        "a'b",
+    ]

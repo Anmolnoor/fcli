@@ -31,6 +31,7 @@ class TraceEdgeKind(StrEnum):
     PLANNED = "planned"
     DEPENDS_ON = "depends_on"
     SEQUENTIAL = "sequential"
+    REPLANNED_FROM = "replanned_from"
 
 
 class TraceArtifactRole(StrEnum):
@@ -93,6 +94,7 @@ class PlanningStep(StrictModel):
     request_id: str = Field(min_length=1)
     request_text: str = Field(min_length=1)
     request_cwd: str = Field(min_length=1)
+    iteration_index: int = Field(default=1, ge=1)
     candidate_capability_ids: list[str] = Field(default_factory=list)
     selection_reasons: list[SelectionReason] = Field(default_factory=list)
     action_ids: list[str] = Field(default_factory=list)
@@ -115,6 +117,7 @@ class ExecutionStep(StrictModel):
     action_summary: str = Field(min_length=1)
     status: ExecutionStatus
     request_cwd: str = Field(min_length=1)
+    iteration_index: int = Field(default=1, ge=1)
     capability_id: str | None = None
     capability_version: str | None = None
     capability_name: str | None = None

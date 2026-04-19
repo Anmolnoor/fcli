@@ -31,6 +31,30 @@ from foundation.models import (
     ShellAction,
     TrustTier,
 )
+from foundation.models.file import (
+    FileApplyDiffRequest,
+    FileEditRequest,
+    FileMutationResult,
+    FileReadChunkRequest,
+    FileReadChunkResult,
+    FileReadRequest,
+    FileReadResult,
+    FileWriteRequest,
+)
+from foundation.models.git import (
+    GitCommitRequest,
+    GitDiffRequest,
+    GitDiffResult,
+    GitLogRequest,
+    GitLogResult,
+    GitMutationResult,
+    GitShowRequest,
+    GitShowResult,
+    GitStageRequest,
+    GitStatusRequest,
+    GitStatusResult,
+    GitUnstageRequest,
+)
 from foundation.services.shell import ShellCommandResult
 from foundation.services.tools import (
     FileDiscoveryRequest,
@@ -52,6 +76,18 @@ GIT_CAPABILITY_ID = "foundation.git"
 MAN_CAPABILITY_ID = "foundation.man"
 TLDR_CAPABILITY_ID = "foundation.tldr"
 SHELL_CAPABILITY_ID = "foundation.shell.command"
+FILE_READ_CAPABILITY_ID = "foundation.file.read"
+FILE_READ_CHUNK_CAPABILITY_ID = "foundation.file.read_chunk"
+FILE_WRITE_CAPABILITY_ID = "foundation.file.write"
+FILE_EDIT_CAPABILITY_ID = "foundation.file.edit"
+FILE_APPLY_DIFF_CAPABILITY_ID = "foundation.file.apply_diff"
+GIT_STATUS_CAPABILITY_ID = "foundation.git.status"
+GIT_DIFF_CAPABILITY_ID = "foundation.git.diff"
+GIT_SHOW_CAPABILITY_ID = "foundation.git.show"
+GIT_LOG_CAPABILITY_ID = "foundation.git.log"
+GIT_STAGE_CAPABILITY_ID = "foundation.git.stage"
+GIT_UNSTAGE_CAPABILITY_ID = "foundation.git.unstage"
+GIT_COMMIT_CAPABILITY_ID = "foundation.git.commit"
 _BUILTIN_VERSION = "1.0.0"
 
 
@@ -256,6 +292,293 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
         binary="tldr",
     ),
     _BuiltinCapabilitySpec(
+        capability_id=FILE_READ_CAPABILITY_ID,
+        name="File Read",
+        description=(
+            "Read a workspace text file up to 256 KB,"
+            " returning content, encoding, line count, and sha256."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.file.read",
+        input_model=FileReadRequest,
+        output_model=FileReadResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read",),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[_side_effect_rule("filesystem_read")],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=20, rate_limit_count=30,
+            ),
+        ),
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=FILE_READ_CHUNK_CAPABILITY_ID,
+        name="File Read Chunk",
+        description=(
+            "Read a line-based chunk from a workspace text file,"
+            " default 200 lines, maximum 400."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.file.read_chunk",
+        input_model=FileReadChunkRequest,
+        output_model=FileReadChunkResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read",),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[_side_effect_rule("filesystem_read")],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=20, rate_limit_count=30,
+            ),
+        ),
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=FILE_WRITE_CAPABILITY_ID,
+        name="File Write",
+        description=(
+            "Create a new workspace text file or overwrite"
+            " an existing one when overwrite=true."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.file.write",
+        input_model=FileWriteRequest,
+        output_model=FileMutationResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read", "workspace_write"),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[
+                _side_effect_rule("filesystem_read"),
+                _side_effect_rule("workspace_write"),
+            ],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=10, rate_limit_count=20,
+            ),
+        ),
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=FILE_EDIT_CAPABILITY_ID,
+        name="File Edit",
+        description=(
+            "Rewrite an existing workspace text file"
+            " with conflict detection via expected_sha256."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.file.edit",
+        input_model=FileEditRequest,
+        output_model=FileMutationResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read", "workspace_write"),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[
+                _side_effect_rule("filesystem_read"),
+                _side_effect_rule("workspace_write"),
+            ],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=10, rate_limit_count=20,
+            ),
+        ),
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=FILE_APPLY_DIFF_CAPABILITY_ID,
+        name="File Apply Diff",
+        description=(
+            "Apply a unified diff to a workspace text file atomically."
+            " All hunks must succeed or no changes are made."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.file.apply_diff",
+        input_model=FileApplyDiffRequest,
+        output_model=FileMutationResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read", "workspace_write"),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[
+                _side_effect_rule("filesystem_read"),
+                _side_effect_rule("workspace_write"),
+            ],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=10, rate_limit_count=20,
+            ),
+        ),
+    ),
+    # -- v3 Stage 3: Typed Git Capabilities ----------------------------------
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_STATUS_CAPABILITY_ID,
+        name="Git Status",
+        description=(
+            "Inspect repository branch, staged state,"
+            " unstaged changes, and conflict indicators."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.status",
+        input_model=GitStatusRequest,
+        output_model=GitStatusResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read",),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[_side_effect_rule("filesystem_read")],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=128,
+                max_invocations=20, rate_limit_count=30,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_DIFF_CAPABILITY_ID,
+        name="Git Diff",
+        description="Inspect staged or unstaged diffs with optional path filter and diff stats.",
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.diff",
+        input_model=GitDiffRequest,
+        output_model=GitDiffResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read",),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[_side_effect_rule("filesystem_read")],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=20, rate_limit_count=30,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_SHOW_CAPABILITY_ID,
+        name="Git Show",
+        description="Inspect a commit or object by ref, returning its content.",
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.show",
+        input_model=GitShowRequest,
+        output_model=GitShowResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read",),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[_side_effect_rule("filesystem_read")],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=256,
+                max_invocations=20, rate_limit_count=30,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_LOG_CAPABILITY_ID,
+        name="Git Log",
+        description="Inspect recent commit history with structured entries.",
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.log",
+        input_model=GitLogRequest,
+        output_model=GitLogResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read",),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[_side_effect_rule("filesystem_read")],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=128,
+                max_invocations=20, rate_limit_count=30,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_STAGE_CAPABILITY_ID,
+        name="Git Stage",
+        description="Stage explicit workspace paths into the git index.",
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.stage",
+        input_model=GitStageRequest,
+        output_model=GitMutationResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read", "workspace_write"),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[
+                _side_effect_rule("filesystem_read"),
+                _side_effect_rule("workspace_write"),
+            ],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=128,
+                max_invocations=10, rate_limit_count=20,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_UNSTAGE_CAPABILITY_ID,
+        name="Git Unstage",
+        description="Unstage explicit workspace paths from the git index.",
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.unstage",
+        input_model=GitUnstageRequest,
+        output_model=GitMutationResult,
+        risk_class=RiskClass.LOW,
+        declared_side_effects=("filesystem_read", "workspace_write"),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[
+                _side_effect_rule("filesystem_read"),
+                _side_effect_rule("workspace_write"),
+            ],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=128,
+                max_invocations=10, rate_limit_count=20,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
+        capability_id=GIT_COMMIT_CAPABILITY_ID,
+        name="Git Commit",
+        description=(
+            "Commit already-staged changes with a non-empty message."
+            " Never stages implicitly. Requires approval under default policy."
+        ),
+        transport=CapabilityTransport.BUILTIN_TOOL,
+        runtime_endpoint="builtin.git.commit",
+        input_model=GitCommitRequest,
+        output_model=GitMutationResult,
+        risk_class=RiskClass.MEDIUM,
+        declared_side_effects=("filesystem_read", "workspace_write"),
+        constraints=CapabilityConstraintSet(
+            path_rules=[_workspace_path_rule()],
+            network_rules=[_no_network_rule()],
+            side_effect_rules=[
+                _side_effect_rule("filesystem_read"),
+                _side_effect_rule("workspace_write", CapabilitySideEffectMode.REQUIRE_APPROVAL),
+            ],
+            invocation_budget=_budget(
+                timeout_seconds=30, output_limit_kb=128,
+                max_invocations=5, rate_limit_count=10,
+            ),
+        ),
+        binary="git",
+    ),
+    _BuiltinCapabilitySpec(
         capability_id=SHELL_CAPABILITY_ID,
         name="Shell Runtime",
         description="Execute one shell command through the Foundation runtime.",
@@ -289,7 +612,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("subprocess"),
                 _side_effect_rule("unknown", CapabilitySideEffectMode.REQUIRE_APPROVAL),
             ],
-            invocation_budget=_budget(timeout_seconds=300, output_limit_kb=256),
+            invocation_budget=_budget(
+                timeout_seconds=300, output_limit_kb=256,
+                max_invocations=15, rate_limit_count=20,
+            ),
         ),
     ),
 )
@@ -630,6 +956,8 @@ class CapabilityRegistry:
 
         if manifest.transport is CapabilityTransport.BUILTIN_TOOL:
             binary_name = manifest.transport_config.get("binary")
+            if binary_name is None:
+                return CapabilityHealth.HEALTHY, "Built-in tool requires no external binary."
             if not isinstance(binary_name, str) or not binary_name:
                 return CapabilityHealth.UNHEALTHY, "Built-in tool manifests must declare a binary."
             availability = {

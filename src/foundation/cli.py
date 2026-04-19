@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import logging
 import shlex
 import uuid
@@ -9,12 +10,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
 
+import click
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from typer.core import TyperGroup
 
 from foundation import __version__
 from foundation.doctor import DoctorReport, DoctorStatus, run_doctor
@@ -31,9 +34,11 @@ from foundation.models import (
     ChatTurnPresentation,
     ExecutionArtifactType,
     ExecutionResult,
+    ExecutionStatus,
     HistorySessionDetail,
     HistorySessionSummary,
     InteractiveDetailCommand,
+    LoopStopReason,
     MemoryEnvelope,
     MemoryLayer,
     MemorySource,
@@ -55,6 +60,7 @@ from foundation.models import (
     TraceRecord,
     TraceSummary,
     UserRequest,
+    VerificationOutcome,
 )
 from foundation.services import (
     ApprovalService,
@@ -103,10 +109,84 @@ from foundation.settings import (
     render_settings_payload,
 )
 
+
+class AgentInvocationMode(enum.Enum):
+    """How the agent was invoked from the CLI."""
+
+    INTERACTIVE = "interactive"
+    ONE_SHOT = "one_shot"
+
+
+class CLIRequestRoute(enum.Enum):
+    """Resolved routing decision for a top-level CLI invocation."""
+
+    ADMIN_SUBCOMMAND = "admin_subcommand"
+    AGENT_INTERACTIVE = "agent_interactive"
+    AGENT_ONE_SHOT = "agent_one_shot"
+
+
+# ---------------------------------------------------------------------------
+# Admin subcommand names that take precedence over agent routing.
+# Any bare token matching one of these is dispatched as an admin command,
+# not as one-shot agent request text.
+# ---------------------------------------------------------------------------
+_ADMIN_SUBCOMMANDS: frozenset[str] = frozenset(
+    {"run", "tools", "history", "trace", "config", "doctor", "chat"}
+)
+
+
+class FoundationGroup(TyperGroup):
+    """CLI group that routes bare and one-shot invocations to the agent.
+
+    Routing rules:
+    1. If the first positional token matches a registered subcommand, dispatch
+       to that subcommand (admin precedence).
+    2. If there are positional tokens but the first one is *not* a registered
+       subcommand, treat them all as one-shot agent request text and forward to
+       the ``chat`` command.
+    3. If there are no positional tokens, forward to the ``chat`` command with
+       no arguments (interactive shell).
+    """
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        """Route unknown first tokens to the chat command."""
+        if not args:
+            # Should not normally be called with no args, but guard anyway.
+            chat_cmd = self.get_command(ctx, "chat")
+            return "chat", chat_cmd, []
+
+        cmd_name = click.utils.make_str(args[0])
+        cmd = self.get_command(ctx, cmd_name)
+
+        if cmd is not None:
+            return cmd_name, cmd, args[1:]
+
+        # Not a recognised subcommand — forward all tokens to `chat` so they
+        # become the one-shot request text.
+        chat_cmd = self.get_command(ctx, "chat")
+        return "chat", chat_cmd, args
+
+    def invoke(self, ctx: click.Context) -> Any:
+        """Route bare invocation (no args) to the agent interactive shell."""
+        if not ctx._protected_args and not ctx.args:
+            # Bare `foundation` — synthesise a chat sub-invocation.
+            ctx._protected_args = ["chat"]
+        return super().invoke(ctx)
+
+
 app = typer.Typer(
     name="foundation",
-    help="Foundation CLI is a local-first shell-native assistant.",
-    no_args_is_help=True,
+    help=(
+        "Foundation CLI — a local-first, shell-native coding agent.\n\n"
+        "Run `foundation` to start the interactive agent shell.\n"
+        "Run `foundation <request>` for a one-shot agent turn.\n"
+        "Use admin subcommands (run, tools, config, doctor, …) for "
+        "operational tasks."
+    ),
+    cls=FoundationGroup,
+    no_args_is_help=False,
     invoke_without_command=True,
     add_completion=False,
 )
@@ -1751,13 +1831,142 @@ def _artifact_preview_notice(result: ExecutionResult) -> ChatNotice | None:
             level=PresentationNoticeLevel.DIM,
             text="\n".join(preview_lines),
         )
-    help_result = HelpLookupResult.model_validate(result.artifact)
-    content_preview = _preview_transcript_text(help_result.content)
-    if not content_preview:
+    if result.artifact_type in (ExecutionArtifactType.MAN, ExecutionArtifactType.TLDR):
+        help_result = HelpLookupResult.model_validate(result.artifact)
+        content_preview = _preview_transcript_text(help_result.content)
+        if not content_preview:
+            return None
+        return ChatNotice(
+            level=PresentationNoticeLevel.DIM,
+            text=f"{help_result.source.value}: {help_result.topic}\n{content_preview}",
+        )
+    return None
+
+
+_CODE_CHANGING_ARTIFACT_TYPES = frozenset({
+    ExecutionArtifactType.FILE_WRITE,
+    ExecutionArtifactType.FILE_EDIT,
+    ExecutionArtifactType.FILE_APPLY_DIFF,
+})
+
+_CHANGED_FILES_DISPLAY_CAP = 6
+_COMMANDS_RUN_DISPLAY_CAP = 6
+
+
+def _iteration_changed_files_notice(
+    result: OrchestrationResult,
+) -> ChatNotice | None:
+    """Dedup and summarize file paths changed across all iterations."""
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for item in result.execution_results:
+        if (
+            item.artifact_type in _CODE_CHANGING_ARTIFACT_TYPES
+            and item.artifact is not None
+        ):
+            path = item.artifact.get("path")
+            if isinstance(path, str) and path and path not in seen_set:
+                seen.append(path)
+                seen_set.add(path)
+    if not seen:
         return None
+    shown = seen[:_CHANGED_FILES_DISPLAY_CAP]
+    suffix = ""
+    if len(seen) > _CHANGED_FILES_DISPLAY_CAP:
+        suffix = f", +{len(seen) - _CHANGED_FILES_DISPLAY_CAP} more"
+    label = "Changed file" if len(seen) == 1 else "Changed files"
+    return ChatNotice(
+        level=PresentationNoticeLevel.INFO,
+        text=f"{label}: {', '.join(shown)}{suffix}",
+    )
+
+
+def _iteration_commands_notice(
+    result: OrchestrationResult,
+) -> ChatNotice | None:
+    """Collect shell commands run across iterations, dedup consecutive duplicates."""
+    commands: list[str] = []
+    for iteration in result.iterations:
+        for action, exec_result in zip(
+            iteration.plan.actions, iteration.execution_results, strict=False,
+        ):
+            if action.kind is not ActionKind.SHELL or action.shell is None:
+                continue
+            if exec_result.status is not ExecutionStatus.EXECUTED:
+                continue
+            parts = [action.shell.command, *action.shell.args]
+            display = " ".join(parts).strip()
+            if not display:
+                continue
+            if len(display) > 80:
+                display = display[:77] + "..."
+            if commands and commands[-1] == display:
+                continue
+            commands.append(display)
+    if not commands:
+        return None
+    shown = commands[:_COMMANDS_RUN_DISPLAY_CAP]
+    suffix = ""
+    if len(commands) > _COMMANDS_RUN_DISPLAY_CAP:
+        suffix = f"\n  +{len(commands) - _COMMANDS_RUN_DISPLAY_CAP} more"
+    label = "Command" if len(commands) == 1 else "Commands"
+    formatted = "\n  ".join(f"$ {cmd}" for cmd in shown)
     return ChatNotice(
         level=PresentationNoticeLevel.DIM,
-        text=f"{help_result.source.value}: {help_result.topic}\n{content_preview}",
+        text=f"{label} run:\n  {formatted}{suffix}",
+    )
+
+
+def _verification_outcome_notice(
+    result: OrchestrationResult,
+) -> ChatNotice | None:
+    """Render the orchestrator's verification notice as a user-facing notice."""
+    notice = result.verification_notice
+    if notice is None:
+        return None
+    outcome = notice.outcome
+    if outcome is VerificationOutcome.PASSED:
+        cmds = ", ".join(notice.verification_commands_run[:3])
+        detail = f" ({cmds})" if cmds else ""
+        return ChatNotice(
+            level=PresentationNoticeLevel.INFO,
+            text=f"Verification: passed{detail}",
+        )
+    if outcome is VerificationOutcome.FAILED:
+        cmds = ", ".join(notice.verification_commands_run[:3])
+        detail = f" ({cmds})" if cmds else ""
+        return ChatNotice(
+            level=PresentationNoticeLevel.WARNING,
+            text=f"Verification: failed{detail}",
+        )
+    if outcome is VerificationOutcome.UNAVAILABLE:
+        cmds = ", ".join(notice.verification_commands_run[:3])
+        detail = f" ({cmds})" if cmds else ""
+        return ChatNotice(
+            level=PresentationNoticeLevel.WARNING,
+            text=f"Verification: unavailable{detail}",
+        )
+    # NOT_ATTEMPTED
+    return ChatNotice(
+        level=PresentationNoticeLevel.WARNING,
+        text="Verification: code changed but no verification command ran",
+    )
+
+
+def _approval_required_notice(
+    result: OrchestrationResult,
+) -> ChatNotice | None:
+    """Surface pending-approval stops as a warning-level notice."""
+    if result.stop_reason is not LoopStopReason.PENDING_APPROVAL:
+        return None
+    pending = result.summary.pending_approval_actions
+    plural = "s" if pending != 1 else ""
+    return ChatNotice(
+        level=PresentationNoticeLevel.WARNING,
+        text=(
+            f"Approval required for {pending} action{plural}. "
+            "Run `foundation approve` or re-issue with approval mode set."
+        ),
     )
 
 
@@ -1795,6 +2004,16 @@ def _build_chat_turn_presentation(
             ),
         )
         seen_messages.add(summary_text)
+
+    for iteration_notice in (
+        _iteration_changed_files_notice(result),
+        _iteration_commands_notice(result),
+        _verification_outcome_notice(result),
+        _approval_required_notice(result),
+    ):
+        if iteration_notice is not None and iteration_notice.text not in seen_messages:
+            notices.append(iteration_notice)
+            seen_messages.add(iteration_notice.text)
 
     for execution_result in result.execution_results:
         artifact_notice = _artifact_preview_notice(execution_result)
@@ -2377,7 +2596,11 @@ def callback(
         ),
     ] = False,
 ) -> None:
-    """Foundation CLI entrypoint."""
+    """Foundation CLI — local-first, shell-native coding agent.
+
+    Run ``foundation`` to open the interactive agent shell.
+    Run ``foundation <request>`` for a one-shot agent turn.
+    """
     if version:
         console.print(f"foundation {__version__}")
         raise typer.Exit()
@@ -2562,7 +2785,7 @@ def run(
         raise typer.Exit(code=result.exit_code)
 
 
-@app.command(context_settings={"allow_extra_args": True})
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def chat(
     ctx: typer.Context,
     cwd: Annotated[
@@ -2612,12 +2835,26 @@ def chat(
         ),
     ] = None,
 ) -> None:
-    """Run the Stage 7 interactive chat loop or the one-shot planning flow."""
+    """Run the interactive agent shell or a one-shot agent turn.
+
+    This is the shared implementation behind both ``foundation`` and
+    ``foundation chat``.  When invoked without request text the interactive
+    shell opens; when request text is provided a single agent turn executes.
+    """
     settings = _load_runtime_settings(ctx)
     request_parts = list(ctx.args)
     if request_parts and request_parts[0] == "--":
         request_parts = request_parts[1:]
     request_text = " ".join(request_parts).strip()
+
+    # Reject explicit empty-string input like `foundation ""`.
+    if not request_text and request_parts:
+        console.print(
+            "[bold red]Chat error:[/bold red] Empty request text. "
+            "Use `foundation` for the interactive shell or "
+            "`foundation <request>` for a one-shot turn."
+        )
+        raise typer.Exit(code=2)
 
     logger.info(
         "command_invoked name=chat plan_only=%s render_mode=%s cwd=%s new_session=%s "

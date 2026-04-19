@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Mapping
 from enum import StrEnum
@@ -389,17 +390,21 @@ class OpenAIResponsesAdapter:
         )
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
+        cleaned = _try_extract_json(text)
+        logger.debug("parse_json_object raw_text=%s", text[:500])
         try:
-            payload = json.loads(text)
+            payload = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             raise ProviderError(
-                "Provider returned invalid JSON for a structured response.",
+                "Provider returned invalid JSON for a structured response. "
+                f"Raw (first 300 chars): {text[:300]!r}",
                 code=ProviderErrorCode.INVALID_RESPONSE,
                 response_text=text,
             ) from exc
         if not isinstance(payload, dict):
             raise ProviderError(
-                "Provider returned structured output that was not a JSON object.",
+                "Provider returned structured output that was not a JSON object. "
+                f"Raw (first 300 chars): {text[:300]!r}",
                 code=ProviderErrorCode.INVALID_RESPONSE,
                 response_text=text,
             )
@@ -463,7 +468,15 @@ class OllamaChatAdapter:
                     payload=payload,
                     timeout_seconds=self._timeout_seconds,
                 )
-                content = self._extract_content(response_payload)
+                logger.debug(
+                    "ollama_raw_response keys=%s payload=%s",
+                    list(response_payload.keys()),
+                    json.dumps(response_payload, default=str)[:2000],
+                )
+                content = self._extract_content(
+                    response_payload,
+                    response_format=prompt.response_format,
+                )
                 structured_output: dict[str, Any] | None = None
                 if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
                     structured_output = self._parse_json_object(content)
@@ -543,12 +556,30 @@ class OllamaChatAdapter:
         assert last_error is not None
         raise last_error
 
+    @staticmethod
+    def _ollama_role(role: str) -> str:
+        """Map provider roles to Ollama-supported roles.
+
+        Ollama only accepts system, user, and assistant.
+        The OpenAI 'developer' role is equivalent to 'system'.
+        """
+        if role == "developer":
+            return "system"
+        return role
+
+    @staticmethod
+    def _needs_think_for_structured_output(model: str) -> bool:
+        # Qwen 3.x is the only family we've confirmed needs think=true
+        # with format=<schema>; other thinking models (e.g. deepseek-v3.2)
+        # regress into free-form thinking when think=true is forced.
+        return model.lower().startswith("qwen3")
+
     def _build_payload(self, prompt: ProviderPrompt) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {
-                    "role": message.role.value,
+                    "role": self._ollama_role(message.role.value),
                     "content": message.content,
                 }
                 for message in prompt.messages
@@ -561,41 +592,137 @@ class OllamaChatAdapter:
             payload["options"] = {
                 "temperature": 0,
             }
+            if self._needs_think_for_structured_output(self._model):
+                payload["think"] = True
         return payload
 
-    def _extract_content(self, payload: Mapping[str, Any]) -> str:
+    def _extract_content(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        response_format: ProviderResponseFormat,
+    ) -> str:
+        json_requested = response_format is ProviderResponseFormat.JSON_OBJECT
+
+        # Standard Ollama local format: {"message": {"content": "...", "thinking": "..."}}
         message = payload.get("message")
-        if not isinstance(message, Mapping):
-            raise ProviderError(
-                "Provider returned a chat response without a message payload.",
-                code=ProviderErrorCode.INVALID_RESPONSE,
+        if isinstance(message, Mapping):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            # For free-form calls, thinking is an acceptable fallback when
+            # content is empty.  For JSON_OBJECT calls it is NOT — thinking
+            # is reasoning narrative, never schema-constrained output — so
+            # we skip the fallback and surface a clear error instead.
+            if not json_requested:
+                thinking = message.get("thinking")
+                if isinstance(thinking, str) and thinking.strip():
+                    return thinking.strip()
+
+        # OpenAI-compatible format used by some Ollama cloud endpoints:
+        # {"choices": [{"message": {"content": "..."}}]}
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0]
+            if isinstance(first_choice, Mapping):
+                choice_message = first_choice.get("message")
+                if isinstance(choice_message, Mapping):
+                    content = choice_message.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+
+        # Surface the actual response shape to help diagnose format mismatches.
+        keys = list(payload.keys())
+        msg_detail = ""
+        thinking_seen = False
+        if isinstance(message, Mapping):
+            msg_content = message.get("content")
+            msg_thinking = message.get("thinking")
+            thinking_seen = isinstance(msg_thinking, str) and bool(msg_thinking.strip())
+            msg_detail = (
+                f" message.content={msg_content!r}"
+                f" message.thinking={msg_thinking!r}"
             )
-
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-
+        eval_count = payload.get("eval_count")
+        prompt_eval_count = payload.get("prompt_eval_count")
+        if json_requested and thinking_seen:
+            error_msg = (
+                "Provider produced only thinking tokens and no structured JSON "
+                "output. This usually means the model emitted reasoning "
+                "narrative instead of honoring the requested schema"
+                f" (response keys: {keys},"
+                f" eval_count={eval_count},"
+                f" prompt_eval_count={prompt_eval_count},"
+                f"{msg_detail})."
+            )
+        else:
+            error_msg = (
+                f"Provider returned an empty chat response"
+                f" (response keys: {keys},"
+                f" eval_count={eval_count},"
+                f" prompt_eval_count={prompt_eval_count},"
+                f"{msg_detail})."
+            )
         raise ProviderError(
-            "Provider returned an empty chat response.",
+            error_msg,
             code=ProviderErrorCode.INVALID_RESPONSE,
+            response_text=json.dumps(payload, default=str)[:2000],
         )
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
+        cleaned = _try_extract_json(text)
+        logger.debug("parse_json_object raw_text=%s", text[:500])
         try:
-            payload = json.loads(text)
+            payload = json.loads(cleaned)
         except json.JSONDecodeError as exc:
             raise ProviderError(
-                "Provider returned invalid JSON for a structured response.",
+                "Provider returned invalid JSON for a structured response. "
+                f"Raw (first 300 chars): {text[:300]!r}",
                 code=ProviderErrorCode.INVALID_RESPONSE,
                 response_text=text,
             ) from exc
         if not isinstance(payload, dict):
             raise ProviderError(
-                "Provider returned structured output that was not a JSON object.",
+                "Provider returned structured output that was not a JSON object. "
+                f"Raw (first 300 chars): {text[:300]!r}",
                 code=ProviderErrorCode.INVALID_RESPONSE,
                 response_text=text,
             )
         return payload
+
+
+_CODE_FENCE_RE = re.compile(
+    r"```(?:json)?\s*\n(.*?)\n\s*```",
+    re.DOTALL,
+)
+
+
+def _try_extract_json(text: str) -> str:
+    """Best-effort extraction of a JSON object from model output.
+
+    Many models wrap valid JSON in markdown code fences or include
+    conversational preamble.  This helper tries common patterns before
+    falling back to the original text so ``json.loads`` can report the
+    real error.
+    """
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        return stripped
+
+    # Try markdown code-fence extraction (```json ... ``` or ``` ... ```)
+    match = _CODE_FENCE_RE.search(text)
+    if match:
+        candidate = match.group(1).strip()
+        if candidate.startswith("{"):
+            return candidate
+
+    # Greedy brace extraction: first '{' to last '}'
+    first = stripped.find("{")
+    last = stripped.rfind("}")
+    if first != -1 and last > first:
+        return stripped[first : last + 1]
+
+    return stripped
 
 
 def _coerce_optional_string(value: object) -> str | None:

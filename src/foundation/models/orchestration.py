@@ -77,6 +77,38 @@ class ExecutionArtifactType(StrEnum):
     GIT = "git"
     MAN = "man"
     TLDR = "tldr"
+    FILE_READ = "file_read"
+    FILE_READ_CHUNK = "file_read_chunk"
+    FILE_WRITE = "file_write"
+    FILE_EDIT = "file_edit"
+    FILE_APPLY_DIFF = "file_apply_diff"
+    GIT_STATUS = "git_status"
+    GIT_DIFF = "git_diff"
+    GIT_SHOW = "git_show"
+    GIT_LOG = "git_log"
+    GIT_STAGE = "git_stage"
+    GIT_UNSTAGE = "git_unstage"
+    GIT_COMMIT = "git_commit"
+
+
+class LoopStopReason(StrEnum):
+    """Why the bounded replan loop terminated."""
+
+    ZERO_ACTION_PLAN = "zero_action_plan"
+    PENDING_APPROVAL = "pending_approval"
+    FATAL_EXECUTION_FAILURE = "fatal_execution_failure"
+    MAX_ITERATIONS = "max_iterations"
+    MAX_ACTIONS = "max_actions"
+    NO_PROGRESS = "no_progress"
+
+
+class VerificationOutcome(StrEnum):
+    """Outcome of verification for a code-changing turn."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+    NOT_ATTEMPTED = "not_attempted"
 
 
 class ProviderMessage(StrictModel):
@@ -226,7 +258,7 @@ class AssistantPlan(StrictModel):
     """Structured plan returned by the provider before execution."""
 
     assistant_message: str = Field(min_length=1)
-    actions: list[PlannedAction] = Field(default_factory=list, max_length=5)
+    actions: list[PlannedAction] = Field(default_factory=list, max_length=10)
 
     @field_validator("actions")
     @classmethod
@@ -279,6 +311,42 @@ class AssistantMessage(StrictModel):
     content: str = Field(min_length=1)
 
 
+class ActionOutcome(StrictModel):
+    """One executed action's outcome as seen by the observation block."""
+
+    action_id: str
+    capability_id: str | None = None
+    status: ExecutionStatus
+    exit_code: int | None = None
+    changed_paths: list[str] = Field(default_factory=list)
+    stdout_preview: str | None = None
+    stderr_preview: str | None = None
+    error: str | None = None
+
+
+class IterationObservation(StrictModel):
+    """Normalized observation block fed back to the planner after one iteration."""
+
+    iteration: int = Field(ge=1)
+    action_outcomes: list[ActionOutcome] = Field(default_factory=list)
+    approval_outcomes: list[str] = Field(default_factory=list)
+    changed_paths: list[str] = Field(default_factory=list)
+    remaining_iterations: int = Field(ge=0)
+    remaining_actions: int = Field(ge=0)
+
+
+class VerificationNotice(StrictModel):
+    """Notice about verification state for code-changing turns."""
+
+    outcome: VerificationOutcome = VerificationOutcome.NOT_ATTEMPTED
+    verification_commands_run: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.outcome is VerificationOutcome.PASSED
+
+
 class OrchestrationSummary(StrictModel):
     """High-level summary of what the orchestrator did."""
 
@@ -287,11 +355,27 @@ class OrchestrationSummary(StrictModel):
     blocked_actions: int = Field(ge=0)
     failed_actions: int = Field(ge=0)
     skipped_actions: int = Field(ge=0)
+    total_iterations: int = Field(default=1, ge=1)
+    total_actions_planned: int = Field(default=0, ge=0)
     text: str = Field(min_length=1)
 
 
+class OrchestrationIteration(StrictModel):
+    """One planning+execution pass within the bounded replan loop."""
+
+    iteration: int = Field(ge=1)
+    context: ContextSnapshot
+    plan: AssistantPlan
+    planning_metadata: ProviderResponseMetadata
+    policy_decisions: list[PolicyDecision] = Field(default_factory=list)
+    policy_evaluations: list[PolicyEvaluationRecord] = Field(default_factory=list)
+    execution_results: list[ExecutionResult] = Field(default_factory=list)
+    observation: IterationObservation | None = None
+    stop_reason: LoopStopReason | None = None
+
+
 class OrchestrationResult(StrictModel):
-    """End-to-end Stage 5 orchestration result."""
+    """End-to-end orchestration result."""
 
     session_id: str | None = None
     request: UserRequest
@@ -303,3 +387,6 @@ class OrchestrationResult(StrictModel):
     execution_results: list[ExecutionResult] = Field(default_factory=list)
     assistant_message: AssistantMessage
     summary: OrchestrationSummary
+    iterations: list[OrchestrationIteration] = Field(default_factory=list)
+    stop_reason: LoopStopReason | None = None
+    verification_notice: VerificationNotice | None = None

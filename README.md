@@ -1,6 +1,16 @@
 # Foundation CLI
 
-Foundation CLI is a local-first, shell-native assistant that follows an explicit `plan -> approve -> execute -> observe` loop. This repository now includes the Stage 6 foundation, the Stage 00 bridge for persistent conversational sessions, the v2 Stage 1 capability registry, the v2 Stage 2 capability policy engine, the v2 Stage 3 trace and audit foundation, and the v2 Stage 4 quiet chat surface: typed configuration, config inspection and validation commands, environment readiness checks, a real shell runtime with buffered, streaming, and PTY-backed execution, typed local-context tooling, model adapters for OpenAI and Ollama, a one-shot orchestrator split across planner, executor, and observer responsibilities, a local capability store with built-in manifest seeding and health checks, capability-aware approval flows, executor-side policy constraints, SQLite-backed history plus step-level trace persistence, trace and audit inspection commands, and an interactive `foundation chat` session shell with layered memory, resume support, and concise-by-default chat rendering.
+Foundation CLI is a local-first, shell-native coding agent that follows an explicit `plan -> approve -> execute -> observe` loop. The current runtime is **v3**: `foundation` is the primary agent entrypoint, typed file and git capabilities replace raw shell mutations, one user turn iterates through read / edit / run / fix cycles inside a bounded replan loop, and output stays concise by default with full trace detail available on demand.
+
+## v3 Highlights
+
+- **Agent entrypoint.** `foundation` starts the interactive shell; `foundation <request>` runs a one-shot turn; admin subcommands (`run`, `tools`, `history`, `trace`, `config`, `doctor`) keep precedence. `foundation chat` remains a strict alias.
+- **Typed file capabilities.** `foundation.file.{read,read_chunk,write,edit,apply_diff}` — atomic writes with sha256 conflict detection, pure-Python unified-diff applier. Planner prefers these over `sed`/`echo`.
+- **Typed git capabilities.** `foundation.git.{status,diff,show,log,stage,unstage,commit}` — workspace-confined, porcelain v2 parsing. Stage / unstage are auto-allowed; `commit` requires approval and never stages implicitly.
+- **Bounded replan loop.** Max 8 planning iterations × 10 actions each × 50 total per user turn. Six stop reasons surface why a turn ended (`zero_action_plan`, `pending_approval`, `fatal_execution_failure`, `max_iterations`, `max_actions`, `no_progress`).
+- **Iteration-aware trace.** Step ids are scoped `planning:{req}:{iter}` and `action:{req}:{iter}:{action_id}`; `REPLANNED_FROM` edges link iterations. Older v2 traces remain inspectable via schema v5 migration.
+- **Concise notices.** Multi-iteration turns summarize with changed-files, commands-run, verification outcome, and approval-required notices. Verification reports PASSED / FAILED / UNAVAILABLE / NOT_ATTEMPTED distinctly so missing binaries aren't misreported as success.
+- **Approval boundaries visible.** `foundation doctor` prints risk class, trust tier, and declared side effects for every capability.
 
 ## Requirements
 - Python 3.12
@@ -194,11 +204,14 @@ foundation --provider ollama --model gpt-oss:120b-cloud --base-url https://ollam
 `foundation config show` prints the effective configuration without exposing secret values, including the resolved provider base URL. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, history and log readiness, and capability registry health for the seeded built-ins.
 
 ## Known Limitations
-- The persistent chat shell is still a bridge stage on top of the v1 runtime. Built-in tools now flow through the Stage 3 trace-aware runtime, but external-service and user-authored capabilities are still modeled locally before later stages make them executable.
-- Approval decisions are per-action and per-invocation. Persistent allowlists or reusable approval rules are not implemented yet.
-- Secret lookup is read-only in Stage 2. The CLI can validate and consume keychain or environment credentials, but it does not write credentials yet.
+- **Binary file editing** is out of scope — text capabilities only.
+- **Networked git** (`push`, `fetch`, `pull`, PR automation) is not implemented.
+- **One generic shell capability.** `foundation.shell.command` remains the only non-typed execution surface; the planner is steered toward typed file/git capabilities for mutations.
+- External-service and user-authored capabilities are modeled locally but not yet executable.
+- Approval decisions are per-action and per-invocation — no persistent allowlists or reusable rules.
+- Secret lookup is read-only. Keychain and environment credentials are consumed; the CLI does not write them.
 - `foundation doctor` reports missing-but-creatable directories as warnings rather than mutating the filesystem.
-- `foundation tools files` depends on `fd` or `fdfind`, and `foundation tools tldr` depends on a local TLDR client. Missing binaries are reported clearly but are not installed automatically.
+- `foundation tools files` depends on `fd` / `fdfind`; `foundation tools tldr` depends on a local TLDR client. Missing binaries are reported clearly but not auto-installed.
 
 ## Development Notes
 - `foundation --help` is the primary smoke check for the CLI entrypoint.

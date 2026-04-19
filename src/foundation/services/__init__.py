@@ -8,6 +8,8 @@ from foundation.services.capabilities import (
     CapabilityStore,
 )
 from foundation.services.executor import ActionExecutionEnvelope, ActionExecutor
+from foundation.services.file_service import FileService
+from foundation.services.git_service import GitService
 from foundation.services.guardrails import (
     CapabilityPolicyEngine,
     GuardrailPolicyEngine,
@@ -79,6 +81,8 @@ __all__ = [
     "CapabilityPolicyEngine",
     "ConversationCompactor",
     "ExecutionMode",
+    "FileService",
+    "GitService",
     "FileDiscoveryRequest",
     "FileDiscoveryResult",
     "FileDiscoveryType",

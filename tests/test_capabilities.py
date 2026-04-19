@@ -75,6 +75,18 @@ def test_registry_seeds_builtins_and_filters_snapshot_by_health(
         "foundation.search",
         "foundation.shell.command",
         "foundation.tldr",
+        "foundation.file.read",
+        "foundation.file.read_chunk",
+        "foundation.file.write",
+        "foundation.file.edit",
+        "foundation.file.apply_diff",
+        "foundation.git.status",
+        "foundation.git.diff",
+        "foundation.git.show",
+        "foundation.git.log",
+        "foundation.git.stage",
+        "foundation.git.unstage",
+        "foundation.git.commit",
     }
     assert manifests["foundation.search"].health is CapabilityHealth.HEALTHY
     assert manifests["foundation.git"].health is CapabilityHealth.HEALTHY
@@ -82,10 +94,34 @@ def test_registry_seeds_builtins_and_filters_snapshot_by_health(
     assert manifests["foundation.man"].health is CapabilityHealth.UNHEALTHY
     assert manifests["foundation.tldr"].health is CapabilityHealth.UNHEALTHY
     assert manifests["foundation.shell.command"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.file.read"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.file.read_chunk"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.file.write"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.file.edit"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.file.apply_diff"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.status"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.diff"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.show"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.log"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.stage"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.unstage"].health is CapabilityHealth.HEALTHY
+    assert manifests["foundation.git.commit"].health is CapabilityHealth.HEALTHY
     assert snapshot_ids == {
         "foundation.git",
         "foundation.search",
         "foundation.shell.command",
+        "foundation.file.read",
+        "foundation.file.read_chunk",
+        "foundation.file.write",
+        "foundation.file.edit",
+        "foundation.file.apply_diff",
+        "foundation.git.status",
+        "foundation.git.diff",
+        "foundation.git.show",
+        "foundation.git.log",
+        "foundation.git.stage",
+        "foundation.git.unstage",
+        "foundation.git.commit",
     }
 
 

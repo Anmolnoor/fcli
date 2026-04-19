@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 from foundation.models import SessionKind, SessionStatus
@@ -74,3 +76,91 @@ def test_workspace_rewrite_stager_stages_before_commit(tmp_path: Path) -> None:
 
     assert target_path.read_text(encoding="utf-8") == "hello\n"
     assert not Path(staged.staged_path).exists()
+
+
+def test_schema_v5_migration_rewrites_replan_edges_and_loads_old_steps(
+    tmp_path: Path,
+) -> None:
+    """v4 DB with REPLAN edges and steps lacking iteration_index upgrades cleanly."""
+    database_path = tmp_path / "history.sqlite3"
+
+    # Build a v4-shaped DB by running the current schema script then forcing
+    # user_version back to 4 and inserting legacy rows.
+    HistoryStore(database_path=database_path)  # creates fresh schema @ v5
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("PRAGMA user_version = 4")
+        connection.execute(
+            "INSERT INTO sessions (id, kind, status, workspace_root, request_cwd, "
+            "approval_mode, plan_only, command_preview, started_at) "
+            "VALUES ('sess-legacy', 'chat', 'completed', '/ws', '/ws', 'prompt', 0, "
+            "'legacy', '2026-01-01T00:00:00Z')"
+        )
+        legacy_planning = {
+            "step_type": "planning",
+            "step_id": "planning:req-legacy",
+            "trace_id": "sess-legacy",
+            "session_id": "sess-legacy",
+            "request_id": "req-legacy",
+            "request_text": "do thing",
+            "request_cwd": "/ws",
+            "candidate_capability_ids": [],
+            "selection_reasons": [],
+            "action_ids": ["a1"],
+            "planning_metadata": {
+                "provider": "stub",
+                "model": "stub-model",
+                "response_id": None,
+                "latency_seconds": 0.0,
+                "attempts": 1,
+                "usage": None,
+            },
+            "artifacts": [],
+            "started_at": "2026-01-01T00:00:00Z",
+            "completed_at": "2026-01-01T00:00:00Z",
+            "duration_seconds": 0.0,
+        }
+        connection.execute(
+            "INSERT INTO trace_steps (session_id, trace_id, step_id, step_type, "
+            "action_id, capability_id, capability_version, status, record_json, "
+            "created_at) "
+            "VALUES ('sess-legacy', 'sess-legacy', 'planning:req-legacy', 'planning', "
+            "NULL, NULL, NULL, NULL, ?, '2026-01-01T00:00:00Z')",
+            (json.dumps(legacy_planning),),
+        )
+        connection.execute(
+            "INSERT INTO trace_edges (session_id, trace_id, source_step_id, "
+            "target_step_id, edge_kind, created_at) "
+            "VALUES ('sess-legacy', 'sess-legacy', 'action:old', "
+            "'planning:next', 'replan', '2026-01-01T00:00:00Z')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # Re-open: triggers _ensure_schema → _migrate_to_v5
+    HistoryStore(database_path=database_path)
+
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 5
+        edges = connection.execute(
+            "SELECT edge_kind FROM trace_edges WHERE session_id = 'sess-legacy'"
+        ).fetchall()
+        assert [row["edge_kind"] for row in edges] == ["replanned_from"]
+    finally:
+        connection.close()
+
+    # Legacy step loads with default iteration_index=1
+    from foundation.models import TraceQuery
+
+    trace = HistoryStore(database_path=database_path).get_trace(
+        TraceQuery(session_id="sess-legacy")
+    )
+    assert trace is not None
+    assert len(trace.steps) == 1
+    legacy_step = trace.steps[0]
+    assert legacy_step.step_type.value == "planning"
+    assert legacy_step.iteration_index == 1

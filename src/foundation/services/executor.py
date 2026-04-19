@@ -22,6 +22,32 @@ from foundation.models import (
     ShellAction,
     ToolCall,
 )
+from foundation.models.file import (
+    FileApplyDiffRequest,
+    FileEditRequest,
+    FileMutationResult,
+    FileReadChunkRequest,
+    FileReadChunkResult,
+    FileReadRequest,
+    FileReadResult,
+    FileServiceError,
+    FileWriteRequest,
+)
+from foundation.models.git import (
+    GitCommitRequest,
+    GitDiffRequest,
+    GitDiffResult,
+    GitLogRequest,
+    GitLogResult,
+    GitMutationResult,
+    GitServiceError,
+    GitShowRequest,
+    GitShowResult,
+    GitStageRequest,
+    GitStatusRequest,
+    GitStatusResult,
+    GitUnstageRequest,
+)
 from foundation.observability import (
     EVENT_APPROVAL_REQUESTED,
     EVENT_APPROVAL_RESOLVED,
@@ -34,6 +60,8 @@ from foundation.observability import (
 )
 from foundation.services.approval import ApprovalService
 from foundation.services.capabilities import CapabilityRegistry
+from foundation.services.file_service import FileService
+from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.observer import ObserverService
 from foundation.services.shell import (
@@ -90,6 +118,8 @@ class ActionExecutor:
         capability_registry: CapabilityRegistry,
         observer: ObserverService,
         shell_output_callback: OutputCallback | None = None,
+        file_service: FileService | None = None,
+        git_service: GitService | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._shell_runtime = shell_runtime
@@ -99,6 +129,8 @@ class ActionExecutor:
         self._capability_registry = capability_registry
         self._observer = observer
         self._shell_output_callback = shell_output_callback
+        self._file_service = file_service
+        self._git_service = git_service
 
     def execute(
         self,
@@ -315,7 +347,11 @@ class ActionExecutor:
             session_id=session_id,
             logger_name="foundation.services.orchestrator",
         )
-        result: SearchResult | FileDiscoveryResult | GitContextResult | HelpLookupResult
+        result: (
+            SearchResult | FileDiscoveryResult | GitContextResult | HelpLookupResult
+            | FileReadResult | FileReadChunkResult | FileMutationResult
+            | GitStatusResult | GitDiffResult | GitShowResult | GitLogResult | GitMutationResult
+        )
         try:
             manifest = self._capability_registry.resolve(
                 tool_call.capability_id,
@@ -355,6 +391,78 @@ class ActionExecutor:
                     )
                 )
                 artifact_type = ExecutionArtifactType.TLDR
+            elif manifest.runtime_endpoint == "builtin.file.read":
+                assert self._file_service is not None
+                result = self._file_service.read(
+                    FileReadRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.FILE_READ
+            elif manifest.runtime_endpoint == "builtin.file.read_chunk":
+                assert self._file_service is not None
+                result = self._file_service.read_chunk(
+                    FileReadChunkRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.FILE_READ_CHUNK
+            elif manifest.runtime_endpoint == "builtin.file.write":
+                assert self._file_service is not None
+                result = self._file_service.write(
+                    FileWriteRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.FILE_WRITE
+            elif manifest.runtime_endpoint == "builtin.file.edit":
+                assert self._file_service is not None
+                result = self._file_service.edit(
+                    FileEditRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.FILE_EDIT
+            elif manifest.runtime_endpoint == "builtin.file.apply_diff":
+                assert self._file_service is not None
+                result = self._file_service.apply_diff(
+                    FileApplyDiffRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.FILE_APPLY_DIFF
+            elif manifest.runtime_endpoint == "builtin.git.status":
+                assert self._git_service is not None
+                result = self._git_service.status(
+                    GitStatusRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_STATUS
+            elif manifest.runtime_endpoint == "builtin.git.diff":
+                assert self._git_service is not None
+                result = self._git_service.diff(
+                    GitDiffRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_DIFF
+            elif manifest.runtime_endpoint == "builtin.git.show":
+                assert self._git_service is not None
+                result = self._git_service.show(
+                    GitShowRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_SHOW
+            elif manifest.runtime_endpoint == "builtin.git.log":
+                assert self._git_service is not None
+                result = self._git_service.log(
+                    GitLogRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_LOG
+            elif manifest.runtime_endpoint == "builtin.git.stage":
+                assert self._git_service is not None
+                result = self._git_service.stage(
+                    GitStageRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_STAGE
+            elif manifest.runtime_endpoint == "builtin.git.unstage":
+                assert self._git_service is not None
+                result = self._git_service.unstage(
+                    GitUnstageRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_UNSTAGE
+            elif manifest.runtime_endpoint == "builtin.git.commit":
+                assert self._git_service is not None
+                result = self._git_service.commit(
+                    GitCommitRequest.model_validate(tool_call.arguments)
+                )
+                artifact_type = ExecutionArtifactType.GIT_COMMIT
             elif manifest.runtime_endpoint == "builtin.shell":
                 shell_action = ShellAction.model_validate(tool_call.arguments)
                 shell_planned_action = action.model_copy(
@@ -404,6 +512,70 @@ class ActionExecutor:
                 status=ExecutionStatus.FAILED,
                 summary=f"Capability execution failed: {exc}",
                 error=str(exc),
+            )
+        except GitServiceError as exc:
+            self._observer.emit(
+                EVENT_TOOL_EXECUTION_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "tool": tool_call.capability_id,
+                    "error": exc.error.message,
+                    "code": exc.error.code.value,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+            self._observer.emit(
+                EVENT_TOOL_CALL_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "tool": tool_call.capability_id,
+                    "error": exc.error.message,
+                    "code": exc.error.code.value,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+            return ExecutionResult(
+                action_id=action.id,
+                status=ExecutionStatus.FAILED,
+                summary=f"Git operation failed: {exc.error.message}",
+                error=exc.error.message,
+                artifact=exc.error.model_dump(mode="json"),
+            )
+        except FileServiceError as exc:
+            self._observer.emit(
+                EVENT_TOOL_EXECUTION_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "tool": tool_call.capability_id,
+                    "error": exc.error.message,
+                    "code": exc.error.code.value,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+            self._observer.emit(
+                EVENT_TOOL_CALL_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "action_id": action.id,
+                    "tool": tool_call.capability_id,
+                    "error": exc.error.message,
+                    "code": exc.error.code.value,
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+            return ExecutionResult(
+                action_id=action.id,
+                status=ExecutionStatus.FAILED,
+                summary=f"File operation failed: {exc.error.message}",
+                error=exc.error.message,
+                artifact=exc.error.model_dump(mode="json"),
             )
         except ToolExecutionError as exc:
             self._observer.emit(

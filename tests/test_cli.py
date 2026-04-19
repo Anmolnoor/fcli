@@ -11,11 +11,19 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import typer.main
 from keyring.errors import NoKeyringError
 from rich.console import Console
 from typer.testing import CliRunner
 
-from foundation.cli import _build_chat_prompt_session, _render_interactive_chat_help, app
+from foundation.cli import (
+    AgentInvocationMode,
+    CLIRequestRoute,
+    FoundationGroup,
+    _build_chat_prompt_session,
+    _render_interactive_chat_help,
+    app,
+)
 from foundation.models import (
     ActionKind,
     AssistantMessage,
@@ -421,6 +429,11 @@ def test_doctor_reports_healthy_environment(
     assert "Resolved provider credentials from $OPENAI_API_KEY." in result.stdout
     assert "Model: gpt-5-mini" in result.stdout
     assert "Base URL: https://api.openai.com/v1" in result.stdout
+    # Stage 06: approval-boundary detail is visible for each capability.
+    assert "foundation.git.commit@1.0.0" in result.stdout
+    assert "risk=medium" in result.stdout
+    assert "risk=low" in result.stdout
+    assert "trust=foundation" in result.stdout
 
 
 def test_doctor_respects_provider_cli_overrides(
@@ -1380,3 +1393,556 @@ def test_history_can_render_session_detail_as_json(
     payload = json.loads(detail_result.stdout)
     assert payload["session_id"] == session_id
     assert payload["commands"][0]["source"] == "cli.run"
+
+
+# ---------------------------------------------------------------------------
+# Stage 01 — Shell Entrypoint and Routing
+# ---------------------------------------------------------------------------
+
+
+def test_routing_models_are_importable() -> None:
+    """AgentInvocationMode and CLIRequestRoute are part of the public API."""
+    assert AgentInvocationMode.INTERACTIVE.value == "interactive"
+    assert AgentInvocationMode.ONE_SHOT.value == "one_shot"
+    assert CLIRequestRoute.ADMIN_SUBCOMMAND.value == "admin_subcommand"
+    assert CLIRequestRoute.AGENT_INTERACTIVE.value == "agent_interactive"
+    assert CLIRequestRoute.AGENT_ONE_SHOT.value == "agent_one_shot"
+
+
+def test_foundation_group_is_used_by_app() -> None:
+    """The top-level Typer app uses FoundationGroup for routing."""
+    click_app = typer.main.get_command(app)
+    assert isinstance(click_app, FoundationGroup)
+
+
+def test_bare_foundation_starts_interactive_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running `foundation` with no args opens the interactive shell."""
+    config_path = _write_stage_2_config(tmp_path)
+    prompt_session = FakePromptSession(["/exit"])
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    monkeypatch.setattr(
+        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+    )
+
+    result = runner.invoke(app, ["--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert "Interactive Chat" in result.stdout
+
+
+def test_bare_foundation_one_shot_routes_to_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running `foundation <request>` runs a one-shot agent turn."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    requests: list[UserRequest] = []
+
+    class StubOrchestrator:
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            requests.append(request)
+            return _chat_result(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "fix", "the", "failing", "test"],
+    )
+
+    assert result.exit_code == 0
+    assert len(requests) == 1
+    assert requests[0].message == "fix the failing test"
+
+
+def test_bare_foundation_one_shot_quoted_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Running `foundation 'fix the bug'` (single token) routes correctly."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    requests: list[UserRequest] = []
+
+    class StubOrchestrator:
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            requests.append(request)
+            return _chat_result(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "fix the failing test"],
+    )
+
+    assert result.exit_code == 0
+    assert len(requests) == 1
+    assert requests[0].message == "fix the failing test"
+
+
+def test_admin_run_keeps_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation run` must route to the admin `run` subcommand."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "run"],
+    )
+
+    # The `run` subcommand without a command arg gives exit code 2
+    assert result.exit_code == 2
+    assert "No command provided" in result.stdout
+
+
+def test_admin_config_keeps_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation config` routes to admin config, not agent one-shot."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "config"],
+    )
+
+    assert result.exit_code == 0
+    # Config show emits JSON with settings
+    payload = json.loads(result.stdout)
+    assert "settings" in payload
+
+
+def test_admin_doctor_keeps_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation doctor` routes to admin doctor, not agent."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "doctor"],
+        env={"OPENAI_API_KEY": "test-key"},
+    )
+
+    # Doctor runs and reports status — exit code 0 (healthy) or 1 (issues).
+    # It was dispatched to the admin subcommand, not the agent, so it
+    # contains doctor-specific output (PASS/FAIL lines).
+    assert result.exit_code in {0, 1}
+    assert "PASS" in result.stdout or "FAIL" in result.stdout
+
+
+def test_quoted_run_tests_routes_to_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation 'run tests'` (quoted) is a one-shot agent request, not admin."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    requests: list[UserRequest] = []
+
+    class StubOrchestrator:
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            requests.append(request)
+            return _chat_result(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "run tests"],
+    )
+
+    assert result.exit_code == 0
+    assert len(requests) == 1
+    assert requests[0].message == "run tests"
+
+
+def test_chat_alias_parity_interactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation chat` still opens the interactive shell."""
+    config_path = _write_stage_2_config(tmp_path)
+    prompt_session = FakePromptSession(["/exit"])
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    monkeypatch.setattr(
+        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+    )
+
+    result = runner.invoke(app, ["--config", str(config_path), "chat"])
+
+    assert result.exit_code == 0
+    assert "Interactive Chat" in result.stdout
+
+
+def test_chat_alias_parity_one_shot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation chat <request>` runs the same one-shot path."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    requests: list[UserRequest] = []
+
+    class StubOrchestrator:
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            requests.append(request)
+            return _chat_result(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "chat", "fix", "the", "bug"],
+    )
+
+    assert result.exit_code == 0
+    assert len(requests) == 1
+    assert requests[0].message == "fix the bug"
+
+
+def test_empty_string_request_fails_with_usage_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`foundation ''` should fail with a clear usage error."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), ""],
+    )
+
+    assert result.exit_code == 2
+    assert "Empty request text" in result.stdout
+
+
+def test_version_flag_still_works() -> None:
+    """`foundation --version` still shows the version."""
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert "foundation 0.1.0" in result.stdout
+
+
+def test_help_flag_still_works() -> None:
+    """`foundation --help` still shows help."""
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "foundation" in result.stdout.lower()
+
+
+def test_global_flags_not_swallowed_as_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global flags like --debug should not appear in request text."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    requests: list[UserRequest] = []
+
+    class StubOrchestrator:
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            requests.append(request)
+            return _chat_result(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "--debug", "fix the bug"],
+    )
+
+    assert result.exit_code == 0
+    assert len(requests) == 1
+    assert requests[0].message == "fix the bug"
+    assert "--debug" not in requests[0].message
+
+
+# ------------------------------------------------------------------
+# Stage 05: Iteration-aware concise notices
+# ------------------------------------------------------------------
+
+
+def _iteration_result_for_notices(
+    *,
+    changed_paths: list[str] | None = None,
+    shell_commands: list[tuple[str, list[str]]] | None = None,
+    verification: dict[str, Any] | None = None,
+    stop_reason: Any = None,
+    pending_approval_actions: int = 0,
+) -> OrchestrationResult:
+    """Build an OrchestrationResult with configurable iteration data."""
+    from foundation.models import (
+        IterationObservation,
+        LoopStopReason,
+        OrchestrationIteration,
+        ShellAction,
+        VerificationNotice,
+    )
+
+    changed_paths = changed_paths or []
+    shell_commands = shell_commands or []
+
+    actions: list[PlannedAction] = []
+    execution_results: list[ExecutionResult] = []
+
+    for idx, path in enumerate(changed_paths):
+        action_id = f"write_{idx}"
+        actions.append(
+            PlannedAction(
+                id=action_id,
+                kind=ActionKind.TOOL_CALL,
+                summary=f"Write {path}",
+                tool_call=ToolCall(
+                    capability_id="foundation.file.write",
+                    arguments={"path": path, "content": ""},
+                ),
+            )
+        )
+        execution_results.append(
+            ExecutionResult(
+                action_id=action_id,
+                status=ExecutionStatus.EXECUTED,
+                summary=f"Wrote {path}.",
+                artifact_type=ExecutionArtifactType.FILE_WRITE,
+                artifact={"path": path},
+            )
+        )
+
+    for idx, (cmd, args) in enumerate(shell_commands):
+        action_id = f"shell_{idx}"
+        actions.append(
+            PlannedAction(
+                id=action_id,
+                kind=ActionKind.SHELL,
+                summary=f"Run {cmd}",
+                shell=ShellAction(command=cmd, args=args),
+            )
+        )
+        execution_results.append(
+            ExecutionResult(
+                action_id=action_id,
+                status=ExecutionStatus.EXECUTED,
+                summary=f"Ran {cmd}.",
+                artifact_type=ExecutionArtifactType.SHELL,
+                artifact={
+                    "ok": True,
+                    "exit_code": 0,
+                    "duration_seconds": 0.01,
+                    "stdout": "",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                },
+            )
+        )
+
+    plan = AssistantPlan(
+        assistant_message="Working on it.",
+        actions=actions,
+    )
+    context = ContextSnapshot(
+        workspace_root="/tmp/workspace",
+        request_cwd="/tmp/workspace",
+        approval_mode="prompt",
+    )
+    planning_metadata = ProviderResponseMetadata(
+        provider="stub", model="stub-model", latency_seconds=0.01,
+    )
+
+    iteration = OrchestrationIteration(
+        iteration=1,
+        context=context,
+        plan=plan,
+        planning_metadata=planning_metadata,
+        policy_decisions=[],
+        policy_evaluations=[],
+        execution_results=execution_results,
+        observation=IterationObservation(
+            iteration=1,
+            changed_paths=changed_paths,
+            remaining_iterations=3,
+            remaining_actions=20,
+        ),
+    )
+
+    verification_notice: VerificationNotice | None = None
+    if verification is not None:
+        verification_notice = VerificationNotice(**verification)
+
+    return OrchestrationResult(
+        session_id="sess-notices-1",
+        request=UserRequest(message="do stuff"),
+        context=context,
+        plan=plan,
+        planning_metadata=planning_metadata,
+        policy_decisions=[],
+        execution_results=execution_results,
+        assistant_message=AssistantMessage(content="Done."),
+        summary=OrchestrationSummary(
+            executed_actions=len(execution_results),
+            pending_approval_actions=pending_approval_actions,
+            blocked_actions=0,
+            failed_actions=0,
+            skipped_actions=0,
+            text="Executed actions.",
+        ),
+        iterations=[iteration],
+        stop_reason=stop_reason or LoopStopReason.ZERO_ACTION_PLAN,
+        verification_notice=verification_notice,
+    )
+
+
+def test_iteration_changed_files_notice_lists_paths() -> None:
+    from foundation.cli import _iteration_changed_files_notice
+
+    result = _iteration_result_for_notices(
+        changed_paths=["src/a.py", "src/b.py"],
+    )
+    notice = _iteration_changed_files_notice(result)
+    assert notice is not None
+    assert "src/a.py" in notice.text
+    assert "src/b.py" in notice.text
+    assert notice.text.startswith("Changed files:")
+
+
+def test_iteration_changed_files_notice_dedups_and_caps() -> None:
+    from foundation.cli import _iteration_changed_files_notice
+
+    # Build a result with execution_results spanning 10 unique writes plus a
+    # duplicate, without tripping the per-plan 5-action cap.  The notice
+    # builder reads `result.execution_results` directly, not the plan, so we
+    # can attach many mutations.
+    result = _iteration_result_for_notices(changed_paths=["src/keep.py"])
+    extra_paths = [f"src/f{i}.py" for i in range(10)] + ["src/f0.py"]
+    for idx, path in enumerate(extra_paths):
+        result.execution_results.append(
+            ExecutionResult(
+                action_id=f"extra_{idx}",
+                status=ExecutionStatus.EXECUTED,
+                summary=f"Wrote {path}.",
+                artifact_type=ExecutionArtifactType.FILE_WRITE,
+                artifact={"path": path},
+            )
+        )
+    notice = _iteration_changed_files_notice(result)
+    assert notice is not None
+    # 11 unique: "src/keep.py" + 10 distinct src/fN.py, cap 6 → 5 hidden
+    assert "+5 more" in notice.text
+
+
+def test_iteration_changed_files_notice_empty() -> None:
+    from foundation.cli import _iteration_changed_files_notice
+
+    result = _iteration_result_for_notices()
+    assert _iteration_changed_files_notice(result) is None
+
+
+def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:
+    from foundation.cli import _iteration_commands_notice
+
+    result = _iteration_result_for_notices(
+        shell_commands=[
+            ("pytest", ["-x"]),
+            ("pytest", ["-x"]),  # consecutive dup, should collapse
+            ("ruff", ["check"]),
+        ]
+    )
+    notice = _iteration_commands_notice(result)
+    assert notice is not None
+    assert notice.text.count("$ pytest -x") == 1
+    assert "$ ruff check" in notice.text
+
+
+def test_verification_outcome_notice_covers_all_outcomes() -> None:
+    from foundation.cli import _verification_outcome_notice
+    from foundation.models import VerificationOutcome
+
+    passed = _iteration_result_for_notices(
+        verification={
+            "outcome": VerificationOutcome.PASSED,
+            "verification_commands_run": ["pytest"],
+        },
+    )
+    notice = _verification_outcome_notice(passed)
+    assert notice is not None
+    assert "passed" in notice.text
+    assert "pytest" in notice.text
+
+    failed = _iteration_result_for_notices(
+        verification={
+            "outcome": VerificationOutcome.FAILED,
+            "verification_commands_run": ["pytest"],
+        },
+    )
+    notice = _verification_outcome_notice(failed)
+    assert notice is not None
+    assert "failed" in notice.text
+
+    unavailable = _iteration_result_for_notices(
+        verification={
+            "outcome": VerificationOutcome.UNAVAILABLE,
+            "verification_commands_run": ["pytest"],
+        },
+    )
+    notice = _verification_outcome_notice(unavailable)
+    assert notice is not None
+    assert "unavailable" in notice.text
+
+    not_attempted = _iteration_result_for_notices(
+        verification={
+            "outcome": VerificationOutcome.NOT_ATTEMPTED,
+            "verification_commands_run": [],
+        },
+    )
+    notice = _verification_outcome_notice(not_attempted)
+    assert notice is not None
+    assert "no verification command" in notice.text
+
+
+def test_approval_required_notice_fires_only_for_pending_approval_stop() -> None:
+    from foundation.cli import _approval_required_notice
+    from foundation.models import LoopStopReason
+
+    pending = _iteration_result_for_notices(
+        stop_reason=LoopStopReason.PENDING_APPROVAL,
+        pending_approval_actions=2,
+    )
+    notice = _approval_required_notice(pending)
+    assert notice is not None
+    assert "2 actions" in notice.text
+
+    completed = _iteration_result_for_notices(
+        stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
+    )
+    assert _approval_required_notice(completed) is None
