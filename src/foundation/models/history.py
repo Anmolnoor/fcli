@@ -33,6 +33,7 @@ class SessionStatus(StrEnum):
     """Persisted session lifecycle states."""
 
     COMPLETED = "completed"
+    COMPLETED_INCONCLUSIVE = "completed_inconclusive"
     FAILED = "failed"
     PENDING_APPROVAL = "pending_approval"
 

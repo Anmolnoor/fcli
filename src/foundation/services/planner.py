@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from foundation.models import (
     ActionKind,
@@ -38,8 +40,18 @@ from foundation.services.provider import ProviderAdapter, ProviderError, Provide
 from foundation.services.tools import GitContextRequest, LocalToolService, ToolExecutionError
 from foundation.settings import ApprovalMode
 
-_MAX_PLAN_ACTIONS = 10
-_MAX_TOTAL_ACTIONS = 50
+_MAX_PLAN_ACTIONS = 40
+_MAX_TOTAL_ACTIONS = 200
+_COMMIT_INTENT_WORD_RE = re.compile(r"\bcommit(?:ing|ted|s)?\b", re.IGNORECASE)
+_COMMIT_INTENT_PHRASES = (
+    "stop for approval",
+    "approve the change",
+)
+_SHELL_EQUIVALENT_COMMANDS = {
+    "cat": "foundation.file.read or foundation.file.read_chunk",
+    "grep": "foundation.search",
+    "printf": "foundation.file.write or foundation.file.edit",
+}
 
 
 class PlanningError(RuntimeError):
@@ -80,7 +92,7 @@ class PlannerService:
             try:
                 git_result = self._tool_service.git_context(
                     GitContextRequest(
-                        scope=request_cwd,
+                        scope=Path(request_cwd),
                         max_status_entries=10,
                         max_recent_commits=3,
                     )
@@ -161,7 +173,11 @@ class PlannerService:
 
             try:
                 plan = AssistantPlan.model_validate(response.structured_output)
-                self._validate_supported_actions(plan)
+                self._validate_supported_actions(
+                    plan,
+                    request=request,
+                    context=context,
+                )
             except (ValidationError, PlanningError) as exc:
                 last_error = exc
                 if attempt < self._max_plan_attempts:
@@ -242,8 +258,13 @@ class PlannerService:
             "Prefer typed git capabilities (foundation.git.*) for repository "
             "inspection and staging. "
             "The git.commit capability requires approval and never stages implicitly. "
+            "If the user asked to commit or stop for approval and git context "
+            "shows staged changes, do not finish with zero actions. Plan "
+            "foundation.git.commit with requires_approval=true instead. "
             "Do NOT use shell commands for operations that have typed "
             "capability equivalents. "
+            "In particular, do NOT use shell cat, grep, or printf for file "
+            "reading, search, or file edits. "
             "Use shell actions for running tests, builds, linters, and "
             "environment inspection only. "
             "Shell args are passed directly to the target binary via execve, "
@@ -310,9 +331,25 @@ class PlannerService:
         )
         return messages
 
-    def _validate_supported_actions(self, plan: AssistantPlan) -> None:
+    def _validate_supported_actions(
+        self,
+        plan: AssistantPlan,
+        *,
+        request: UserRequest,
+        context: ContextSnapshot,
+    ) -> None:
         if len(plan.actions) > _MAX_PLAN_ACTIONS:
             raise PlanningError(f"Structured plans are bounded to {_MAX_PLAN_ACTIONS} actions.")
+        if (
+            not plan.actions
+            and self._has_commit_intent(request.message)
+            and self._context_has_staged_changes(context)
+        ):
+            raise PlanningError(
+                "Zero-action completion is invalid when the user asked for commit "
+                "approval and git context still shows staged changes. Plan "
+                "foundation.git.commit with requires_approval=true."
+            )
         for action in plan.actions:
             if action.kind is ActionKind.SHELL:
                 assert action.shell is not None
@@ -320,13 +357,53 @@ class PlannerService:
                     raise PlanningError(
                         f"Shell action {action.id!r} must split the executable and args."
                     )
+                shell_command = action.shell.command.split("/")[-1]
+                if shell_command in _SHELL_EQUIVALENT_COMMANDS:
+                    equivalent = _SHELL_EQUIVALENT_COMMANDS[shell_command]
+                    raise PlanningError(
+                        f"Shell action {action.id!r} uses `{shell_command}`, but "
+                        f"the typed capability equivalent {equivalent} must be used."
+                    )
             if action.kind is ActionKind.TOOL_CALL:
                 assert action.tool_call is not None
+                if (
+                    action.tool_call.capability_id == "foundation.git.commit"
+                    and not action.requires_approval
+                ):
+                    raise PlanningError(
+                        "foundation.git.commit must set requires_approval=true "
+                        "and provide approval_reason."
+                    )
                 self._validated_tool_request(
                     action.tool_call.capability_id,
                     action.tool_call.version,
                     action.tool_call.arguments,
                 )
+
+    @staticmethod
+    def _has_commit_intent(message: str) -> bool:
+        if _COMMIT_INTENT_WORD_RE.search(message):
+            return True
+        lower = message.lower()
+        return any(phrase in lower for phrase in _COMMIT_INTENT_PHRASES)
+
+    @staticmethod
+    def _context_has_staged_changes(context: ContextSnapshot) -> bool:
+        if not isinstance(context.git_context, dict):
+            return False
+        staged_diff = context.git_context.get("staged_diff")
+        if isinstance(staged_diff, list) and bool(staged_diff):
+            return True
+        status_entries = context.git_context.get("status")
+        if not isinstance(status_entries, list):
+            return False
+        for entry in status_entries:
+            if not isinstance(entry, dict):
+                continue
+            index_status = entry.get("index_status")
+            if isinstance(index_status, str) and index_status.strip():
+                return True
+        return False
 
     def _validated_tool_request(
         self,
@@ -368,7 +445,7 @@ class PlannerService:
 
             ShellAction.model_validate(arguments)
             return
-        _FILE_VALIDATORS: dict[str, type] = {
+        _FILE_VALIDATORS: dict[str, type[BaseModel]] = {
             "builtin.file.read": FileReadRequest,
             "builtin.file.read_chunk": FileReadChunkRequest,
             "builtin.file.write": FileWriteRequest,
@@ -378,7 +455,7 @@ class PlannerService:
         if endpoint in _FILE_VALIDATORS:
             _FILE_VALIDATORS[endpoint].model_validate(arguments)
             return
-        _GIT_VALIDATORS: dict[str, type] = {
+        _GIT_VALIDATORS: dict[str, type[BaseModel]] = {
             "builtin.git.status": GitStatusRequest,
             "builtin.git.diff": GitDiffRequest,
             "builtin.git.show": GitShowRequest,

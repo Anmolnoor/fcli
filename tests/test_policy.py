@@ -9,7 +9,9 @@ import pytest
 
 from foundation.models import (
     ActionKind,
+    CapabilityApprovalRequest,
     CapabilityConstraintSet,
+    CapabilityId,
     CapabilityInstallSource,
     CapabilityInvocationBudget,
     CapabilityKind,
@@ -19,6 +21,8 @@ from foundation.models import (
     CapabilityScopeRule,
     CapabilityScopeTarget,
     CapabilitySideEffectRule,
+    CapabilityTransport,
+    CapabilityVersion,
     PlannedAction,
     PolicyReasonCode,
     RiskClass,
@@ -143,6 +147,67 @@ def test_policy_engine_blocks_out_of_scope_tool_scope(
     assert evaluation.verdict.reason_codes == [PolicyReasonCode.PATH_OUT_OF_SCOPE]
 
 
+def test_policy_engine_allows_relative_file_read_path_within_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, workspace_root = _registry(tmp_path, monkeypatch)
+    engine = CapabilityPolicyEngine(
+        workspace_root=workspace_root,
+        capability_registry=registry,
+    )
+    (workspace_root / "notes.txt").write_text("hello\n", encoding="utf-8")
+    action = PlannedAction(
+        id="read_notes",
+        kind=ActionKind.TOOL_CALL,
+        summary="Read a workspace file by relative path",
+        tool_call=ToolCall(
+            capability_id="foundation.file.read",
+            arguments={"path": "notes.txt"},
+        ),
+    )
+
+    evaluation = engine.evaluate(
+        action,
+        request_cwd=workspace_root,
+        approval_mode=ApprovalMode.PROMPT,
+    )
+
+    assert evaluation is not None
+    assert evaluation.verdict.outcome is CapabilityPolicyOutcome.ALLOW_WITH_CONSTRAINTS
+    assert evaluation.verdict.reason_codes == []
+
+
+def test_policy_engine_blocks_relative_file_read_path_that_escapes_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, workspace_root = _registry(tmp_path, monkeypatch)
+    engine = CapabilityPolicyEngine(
+        workspace_root=workspace_root,
+        capability_registry=registry,
+    )
+    action = PlannedAction(
+        id="read_outside",
+        kind=ActionKind.TOOL_CALL,
+        summary="Try to read outside the workspace with a relative path",
+        tool_call=ToolCall(
+            capability_id="foundation.file.read",
+            arguments={"path": "../outside.txt"},
+        ),
+    )
+
+    evaluation = engine.evaluate(
+        action,
+        request_cwd=workspace_root,
+        approval_mode=ApprovalMode.PROMPT,
+    )
+
+    assert evaluation is not None
+    assert evaluation.verdict.outcome is CapabilityPolicyOutcome.BLOCK
+    assert evaluation.verdict.reason_codes == [PolicyReasonCode.PATH_OUT_OF_SCOPE]
+
+
 def test_policy_engine_requires_approval_for_untrusted_capabilities(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -157,12 +222,12 @@ def test_policy_engine_requires_approval_for_untrusted_capabilities(
     )
     registry.register(
         CapabilityManifest(
-            capability_id="user.search",
-            version="1.0.0",
+            capability_id=CapabilityId(root="user.search"),
+            version=CapabilityVersion(root="1.0.0"),
             kind=CapabilityKind.TOOL,
             name="User Search",
             description="Run the built-in search transport from a user manifest.",
-            transport="builtin_tool",
+            transport=CapabilityTransport.BUILTIN_TOOL,
             runtime_endpoint="builtin.search",
             transport_config={"binary": "rg", "required": True},
             input_schema=SearchRequest.model_json_schema(),
@@ -235,12 +300,12 @@ def test_policy_engine_enforces_invocation_budget(
     )
     registry.register(
         CapabilityManifest(
-            capability_id="user.once",
-            version="1.0.0",
+            capability_id=CapabilityId(root="user.once"),
+            version=CapabilityVersion(root="1.0.0"),
             kind=CapabilityKind.TOOL,
             name="One Shot Search",
             description="Search at most once per session.",
-            transport="builtin_tool",
+            transport=CapabilityTransport.BUILTIN_TOOL,
             runtime_endpoint="builtin.search",
             transport_config={"binary": "rg", "required": True},
             input_schema=SearchRequest.model_json_schema(),
@@ -342,3 +407,106 @@ def test_approval_service_builds_capability_aware_request(
     assert "workspace_write" in request.requested_side_effects
     assert request.constraints is not None
     assert request.constraints.invocation_budget is not None
+
+
+def test_auto_except_commit_approves_workspace_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from foundation.models.history import ApprovalDecisionStatus
+
+    registry, workspace_root = _registry(tmp_path, monkeypatch)
+    engine = CapabilityPolicyEngine(
+        workspace_root=workspace_root,
+        capability_registry=registry,
+    )
+    action = PlannedAction(
+        id="touch_file",
+        kind=ActionKind.SHELL,
+        summary="Create a file",
+        shell=ShellAction(command="touch", args=["note.txt"]),
+    )
+    evaluation = engine.evaluate(
+        action,
+        request_cwd=workspace_root,
+        approval_mode=ApprovalMode.AUTO_EXCEPT_COMMIT,
+    )
+    assert evaluation is not None
+    assert evaluation.verdict.outcome is CapabilityPolicyOutcome.REQUIRE_APPROVAL
+
+    _request, resolution = ApprovalService(
+        mode=ApprovalMode.AUTO_EXCEPT_COMMIT
+    ).resolve(action, evaluation, request_cwd=workspace_root)
+
+    assert resolution.status is ApprovalDecisionStatus.APPROVED
+    assert "auto-except-commit" in resolution.reason
+
+
+def _make_approval_request(
+    *,
+    capability_id: str,
+    side_effects: list[str],
+    network_hosts: list[str] | None = None,
+) -> CapabilityApprovalRequest:
+    return CapabilityApprovalRequest(
+        action_id="a",
+        capability_id=capability_id,
+        capability_version="1.0.0",
+        summary="test action",
+        reason="test",
+        risk_categories=[],
+        risk_class=RiskClass.MEDIUM,
+        trust_tier=TrustTier.FOUNDATION,
+        reason_codes=[],
+        cwd="/workspace",
+        paths=[],
+        network_hosts=network_hosts or [],
+        requested_side_effects=side_effects,
+    )
+
+
+def test_auto_except_commit_gated_helper_detects_commit_capability() -> None:
+    from foundation.services.approval import _auto_except_commit_gated
+
+    request = _make_approval_request(
+        capability_id="foundation.git.commit",
+        side_effects=["workspace_write"],
+    )
+    assert _auto_except_commit_gated(request) == (
+        "commit capability requires explicit approval"
+    )
+
+
+def test_auto_except_commit_gated_helper_detects_network_side_effect() -> None:
+    from foundation.services.approval import _auto_except_commit_gated
+
+    request = _make_approval_request(
+        capability_id="foundation.shell.command",
+        side_effects=["network"],
+        network_hosts=["example.com"],
+    )
+    gated = _auto_except_commit_gated(request)
+    assert gated is not None
+    assert "network" in gated
+
+
+def test_auto_except_commit_gated_helper_detects_outside_workspace() -> None:
+    from foundation.services.approval import _auto_except_commit_gated
+
+    request = _make_approval_request(
+        capability_id="foundation.shell.command",
+        side_effects=["outside_workspace"],
+    )
+    gated = _auto_except_commit_gated(request)
+    assert gated is not None
+    assert "outside_workspace" in gated
+
+
+def test_auto_except_commit_gated_helper_passes_workspace_write() -> None:
+    from foundation.services.approval import _auto_except_commit_gated
+
+    request = _make_approval_request(
+        capability_id="foundation.file.write",
+        side_effects=["workspace_write"],
+    )
+    assert _auto_except_commit_gated(request) is None

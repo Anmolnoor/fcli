@@ -28,6 +28,7 @@ from foundation.observability import (
     emit_event,
     emit_exception,
 )
+from foundation.services._env_scrub import scrub_ambient_env
 
 logger = logging.getLogger("foundation.services.shell")
 
@@ -238,6 +239,7 @@ class ShellRuntime:
         capture_limit_kb: int = 256,
         enforce_workspace_boundary: bool = True,
         termination_grace_seconds: float = 1.0,
+        pass_through_foundation_env: bool = False,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._default_timeout_seconds = default_timeout_seconds
@@ -246,6 +248,7 @@ class ShellRuntime:
         self._capture_limit_bytes = capture_limit_kb * 1024
         self._enforce_workspace_boundary = enforce_workspace_boundary
         self._termination_grace_seconds = termination_grace_seconds
+        self._pass_through_foundation_env = pass_through_foundation_env
 
     def execute(
         self,
@@ -429,7 +432,11 @@ class ShellRuntime:
         if request.mode is ExecutionMode.PTY and not self._allow_pty:
             raise ValueError("PTY execution is disabled by configuration")
 
-        env = os.environ.copy()
+        env = (
+            os.environ.copy()
+            if self._pass_through_foundation_env
+            else scrub_ambient_env(os.environ)
+        )
         env.update(request.env_overlay)
         capture_limit_bytes = self._capture_limit_bytes
         if request.capture_limit_kb is not None:

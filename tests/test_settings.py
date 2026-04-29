@@ -208,6 +208,34 @@ def test_load_settings_rejects_invalid_toml(tmp_path: Path) -> None:
         load_settings(config_path=config_path)
 
 
+def test_history_db_follows_state_dir_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "relocated-state"
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", str(state_dir))
+
+    settings = load_settings(config_path=tmp_path / "missing.toml")
+
+    assert settings.app.state_dir == state_dir.resolve()
+    assert settings.history.database_path == (state_dir / "history.sqlite3").resolve()
+
+
+def test_explicit_history_db_wins_over_state_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    explicit_db = tmp_path / "elsewhere" / "my.sqlite3"
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", str(state_dir))
+    monkeypatch.setenv("FOUNDATION_HISTORY__DATABASE_PATH", str(explicit_db))
+
+    settings = load_settings(config_path=tmp_path / "missing.toml")
+
+    assert settings.app.state_dir == state_dir.resolve()
+    assert settings.history.database_path == explicit_db.resolve()
+
+
 def test_render_settings_payload_redacts_provider_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -224,3 +252,17 @@ def test_render_settings_payload_redacts_provider_secret(
     assert "OPENAI_API_KEY" in rendered
     assert "resolved_base_url" in rendered
     assert "env_file_path" in rendered
+
+
+def test_approval_mode_accepts_auto_except_commit(tmp_path: Path) -> None:
+    settings = load_settings(
+        config_path=tmp_path / "missing.toml",
+        overrides={"approval": {"mode": ApprovalMode.AUTO_EXCEPT_COMMIT}},
+    )
+    assert settings.approval.mode is ApprovalMode.AUTO_EXCEPT_COMMIT
+    assert ApprovalMode("auto-except-commit") is ApprovalMode.AUTO_EXCEPT_COMMIT
+
+
+def test_shell_pass_through_foundation_env_defaults_false(tmp_path: Path) -> None:
+    settings = load_settings(config_path=tmp_path / "missing.toml")
+    assert settings.shell.pass_through_foundation_env is False

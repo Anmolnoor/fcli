@@ -258,7 +258,7 @@ class AssistantPlan(StrictModel):
     """Structured plan returned by the provider before execution."""
 
     assistant_message: str = Field(min_length=1)
-    actions: list[PlannedAction] = Field(default_factory=list, max_length=10)
+    actions: list[PlannedAction] = Field(default_factory=list, max_length=40)
 
     @field_validator("actions")
     @classmethod
@@ -347,6 +347,26 @@ class VerificationNotice(StrictModel):
         return self.outcome is VerificationOutcome.PASSED
 
 
+class GovernanceNoticeCode(StrEnum):
+    """Categories of runtime-governance advisories."""
+
+    COMMIT_APPROVAL_MISSING = "commit_approval_missing"
+
+
+class GovernanceNotice(StrictModel):
+    """Notice emitted when the runtime enforces a governance invariant.
+
+    Distinct from :class:`VerificationNotice`: governance notices describe a
+    deliberate runtime intervention (e.g. overriding session status because
+    the commit-approval contract wasn't satisfied), not the outcome of a
+    user-requested verification step.
+    """
+
+    code: GovernanceNoticeCode
+    message: str = Field(min_length=1)
+    staged_paths: list[str] = Field(default_factory=list)
+
+
 class OrchestrationSummary(StrictModel):
     """High-level summary of what the orchestrator did."""
 
@@ -390,3 +410,4 @@ class OrchestrationResult(StrictModel):
     iterations: list[OrchestrationIteration] = Field(default_factory=list)
     stop_reason: LoopStopReason | None = None
     verification_notice: VerificationNotice | None = None
+    governance_notice: GovernanceNotice | None = None

@@ -316,7 +316,7 @@ def test_cli_version_flag() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert "foundation 0.1.0" in result.stdout
+    assert "foundation 0.2.0" in result.stdout
 
 
 def test_config_show_redacts_secret_values(
@@ -1647,7 +1647,7 @@ def test_version_flag_still_works() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert "foundation 0.1.0" in result.stdout
+    assert "foundation 0.2.0" in result.stdout
 
 
 def test_help_flag_still_works() -> None:

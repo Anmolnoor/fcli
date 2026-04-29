@@ -10,7 +10,7 @@ v4 starts from the v3 runtime without touching the bounded replan loop, approval
 
 v4 starts from v3 (commit `34b2012` and later), which already has:
 - Typed file and git capabilities with approval boundaries.
-- Bounded replan loop (8 iterations × 10 actions × 50 total).
+- Bounded replan loop (32 iterations × 40 actions × 200 total).
 - Iteration-aware traces, `REPLANNED_FROM` edges, schema v5.
 - VerificationOutcome taxonomy; doctor surfaces approval boundaries.
 - Observation accumulation + "commands already executed" summary for the planner.

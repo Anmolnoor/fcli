@@ -84,7 +84,10 @@ class ObserverService:
             level=level,
         )
         if self._history_store is not None and session_id is not None:
-            details = {"error": str(exc), "error_type": exc.__class__.__name__}
+            details: dict[str, object] = {
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
             if payload:
                 details.update(payload)
             self._history_store.record_event(session_id, event_name, details)

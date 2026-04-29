@@ -44,6 +44,7 @@ from foundation.models import (
     MemorySource,
     OrchestrationResult,
     PlannedAction,
+    PlanningStep,
     PolicyDecision,
     PolicyDecisionType,
     PresentationNoticeLevel,
@@ -415,6 +416,7 @@ def _build_shell_runtime(settings: AppSettings) -> ShellRuntime:
         allow_pty=settings.shell.allow_pty,
         capture_limit_kb=settings.shell.capture_limit_kb,
         enforce_workspace_boundary=settings.shell.enforce_workspace_boundary,
+        pass_through_foundation_env=settings.shell.pass_through_foundation_env,
     )
 
 
@@ -423,6 +425,7 @@ def _build_tool_service(settings: AppSettings) -> LocalToolService:
         workspace_root=settings.workspace_root,
         default_timeout_seconds=min(settings.shell.default_timeout_seconds, 30),
         capture_limit_kb=settings.shell.capture_limit_kb,
+        pass_through_foundation_env=settings.shell.pass_through_foundation_env,
     )
 
 
@@ -2418,7 +2421,7 @@ def _render_trace_detail(trace: TraceRecord) -> None:
         step_table.add_column("Capability")
         step_table.add_column("Why")
         for step in trace.steps:
-            if step.step_type.value == "planning":
+            if isinstance(step, PlanningStep):
                 status = "planned"
                 capability = "-"
                 why = ", ".join(reason.summary for reason in step.selection_reasons) or "-"

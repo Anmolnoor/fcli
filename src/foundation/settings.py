@@ -145,6 +145,7 @@ class ApprovalMode(StrEnum):
 
     PROMPT = "prompt"
     AUTO = "auto"
+    AUTO_EXCEPT_COMMIT = "auto-except-commit"
     MANUAL = "manual"
 
 
@@ -308,6 +309,7 @@ class ShellSection(BaseModel):
     allow_pty: bool = True
     capture_limit_kb: PositiveInt = 256
     enforce_workspace_boundary: bool = True
+    pass_through_foundation_env: bool = False
 
     @model_validator(mode="after")
     def _validate_timeout_bounds(self) -> ShellSection:
@@ -363,6 +365,20 @@ class AppSettings(BaseSettings):
         validate_default=True,
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def _align_history_path_with_state_dir(self) -> AppSettings:
+        """Place history DB under ``app.state_dir`` unless explicitly overridden.
+
+        Why: operators should be able to relocate Foundation's per-user state
+        by setting a single `app.state_dir`; the history sqlite file must
+        follow automatically. An explicit `history.database_path` still wins.
+        """
+        if "database_path" not in self.history.model_fields_set:
+            self.history.database_path = (
+                self.app.state_dir / "history.sqlite3"
+            ).resolve()
+        return self
 
     _toml_file_path: ClassVar[Path | None] = None
     _dotenv_file_path: ClassVar[Path | None] = None

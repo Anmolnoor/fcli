@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -19,6 +20,8 @@ from foundation.models import (
     ExecutionArtifactType,
     ExecutionResult,
     ExecutionStatus,
+    GovernanceNotice,
+    GovernanceNoticeCode,
     IterationObservation,
     LoopStopReason,
     OrchestrationIteration,
@@ -36,6 +39,7 @@ from foundation.models import (
     VerificationNotice,
     VerificationOutcome,
 )
+from foundation.models.git import GitServiceError, GitStatusRequest
 from foundation.models.trace import TraceEdge, TraceEdgeKind
 from foundation.observability import (
     EVENT_EXCEPTION,
@@ -64,9 +68,9 @@ from foundation.settings import ApprovalMode
 
 logger = logging.getLogger("foundation.services.orchestrator")
 
-_MAX_PLAN_ACTIONS = 10
-_MAX_LOOP_ITERATIONS = 8
-_MAX_TOTAL_ACTIONS = 50
+_MAX_PLAN_ACTIONS = 40
+_MAX_LOOP_ITERATIONS = 32
+_MAX_TOTAL_ACTIONS = 200
 _OBSERVATION_MAX_BYTES = 8 * 1024
 _OBSERVATION_MAX_LINES = 200
 
@@ -77,6 +81,18 @@ _FATAL_ERROR_PATTERNS = frozenset({
     "invalid_capability",
     "no such file or directory",
 })
+
+# Heuristic intent markers used by the commit-approval runtime invariant.
+# When the user's message contains "commit" as a whole word, or names any of
+# these phrases, the runtime expects the final iteration to either plan a git
+# commit (requires_approval=True) or to explain why it couldn't. Missing both
+# triggers a governance notice.
+_COMMIT_INTENT_WORD_RE = re.compile(r"\bcommit(?:ing|ted|s)?\b", re.IGNORECASE)
+_COMMIT_INTENT_PHRASES = (
+    "stop for approval",
+    "approve the change",
+)
+_COMMIT_CAPABILITY_ID = "foundation.git.commit"
 
 # Errors that indicate the binary could not run at all (vs. tests failed).
 _VERIFICATION_UNAVAILABLE_PATTERNS = frozenset({
@@ -264,6 +280,7 @@ class RequestOrchestrator:
         )
         state_dir = self._workspace_root / ".foundation" / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
+        self._git_service = GitService(workspace_root=self._workspace_root)
         self._executor = ActionExecutor(
             workspace_root=self._workspace_root,
             shell_runtime=self._shell_runtime,
@@ -277,9 +294,7 @@ class RequestOrchestrator:
                 workspace_root=self._workspace_root,
                 state_dir=state_dir,
             ),
-            git_service=GitService(
-                workspace_root=self._workspace_root,
-            ),
+            git_service=self._git_service,
         )
 
     def orchestrate(self, request: UserRequest) -> OrchestrationResult:
@@ -332,7 +347,12 @@ class RequestOrchestrator:
                 payload={
                     "request_id": request_id,
                     "session_id": session_id,
-                    "status": self._session_status_for_summary(result.summary).value,
+                    "status": self._session_status_for_result(
+                        result.summary,
+                        result.stop_reason,
+                        result.iterations,
+                        result.governance_notice,
+                    ).value,
                     "executed_actions": result.summary.executed_actions,
                     "pending_approval_actions": result.summary.pending_approval_actions,
                     "blocked_actions": result.summary.blocked_actions,
@@ -356,7 +376,12 @@ class RequestOrchestrator:
                 )
                 self._history_store.finalize_session(
                     session_id,
-                    status=self._session_status_for_summary(result.summary),
+                    status=self._session_status_for_result(
+                        result.summary,
+                        result.stop_reason,
+                        result.iterations,
+                        result.governance_notice,
+                    ),
                 )
             return result
         except Exception as exc:
@@ -686,6 +711,11 @@ class RequestOrchestrator:
             stop_reason=stop_reason,
         )
 
+        governance_notice = self._check_commit_approval_invariant(
+            request=request,
+            final_iteration=iterations[-1],
+        )
+
         return OrchestrationResult(
             session_id=session_id,
             request=request,
@@ -700,6 +730,7 @@ class RequestOrchestrator:
             iterations=iterations,
             stop_reason=stop_reason,
             verification_notice=verification_notice,
+            governance_notice=governance_notice,
         )
 
     # ------------------------------------------------------------------
@@ -968,6 +999,59 @@ class RequestOrchestrator:
             return message + suffix
         return message
 
+    @staticmethod
+    def _has_commit_intent(message: str) -> bool:
+        if _COMMIT_INTENT_WORD_RE.search(message):
+            return True
+        lower = message.lower()
+        return any(phrase in lower for phrase in _COMMIT_INTENT_PHRASES)
+
+    def _check_commit_approval_invariant(
+        self,
+        *,
+        request: UserRequest,
+        final_iteration: OrchestrationIteration,
+    ) -> GovernanceNotice | None:
+        """Enforce: if the user asked to commit and the run left staged files
+        without planning an approval-gated commit, surface a governance
+        notice and (via the classifier) flip the session status to
+        PENDING_APPROVAL.
+
+        Returns ``None`` when the run satisfied the contract (or the user
+        never asked for a commit in the first place).
+        """
+        if not self._has_commit_intent(request.message):
+            return None
+
+        planned_commit = any(
+            action.tool_call is not None
+            and action.tool_call.capability_id == _COMMIT_CAPABILITY_ID
+            for action in final_iteration.plan.actions
+        )
+        if planned_commit:
+            return None
+
+        try:
+            status = self._git_service.status(GitStatusRequest())
+        except GitServiceError:
+            # Git status can't be read (not a repo, access error, etc.).
+            # Absence of evidence isn't evidence of staged files — stay silent.
+            return None
+
+        staged_paths = [change.path for change in status.staged]
+        if not staged_paths:
+            return None
+
+        return GovernanceNotice(
+            code=GovernanceNoticeCode.COMMIT_APPROVAL_MISSING,
+            message=(
+                "User request asked for a commit-approval stop; the final "
+                "iteration ended with staged files and no commit action. "
+                "No commit was performed."
+            ),
+            staged_paths=sorted(staged_paths),
+        )
+
     # ------------------------------------------------------------------
     # History and session helpers
     # ------------------------------------------------------------------
@@ -1052,11 +1136,55 @@ class RequestOrchestrator:
         )
 
     @staticmethod
-    def _session_status_for_summary(summary: OrchestrationSummary) -> SessionStatus:
-        if summary.failed_actions > 0:
-            return SessionStatus.FAILED
+    def _session_status_for_result(
+        summary: OrchestrationSummary,
+        stop_reason: LoopStopReason | None,
+        iterations: list[OrchestrationIteration],
+        governance_notice: GovernanceNotice | None = None,
+    ) -> SessionStatus:
+        """Classify a terminated orchestration run.
+
+        Precedence:
+
+        1. ``PENDING_APPROVAL`` if any action is still awaiting approval,
+           or if the runtime emitted a governance notice overriding the
+           status (e.g. the commit-approval invariant fired).
+        2. ``FAILED`` when the loop hit a fatal, unresolved stop.
+        3. ``COMPLETED`` when the planner returned zero actions as the final
+           step — even if earlier iterations had failures and the later ones
+           recovered.
+        4. ``COMPLETED_INCONCLUSIVE`` when the loop stopped because the
+           no-progress detector fired, or because the iteration/action budget
+           ran out with a clean final iteration. The run is not corrupt, but
+           didn't fully satisfy the request.
+        5. ``FAILED`` when the budget ran out mid-failure.
+        """
+        if governance_notice is not None:
+            return SessionStatus.PENDING_APPROVAL
         if summary.pending_approval_actions > 0:
             return SessionStatus.PENDING_APPROVAL
+        if stop_reason is LoopStopReason.PENDING_APPROVAL:
+            return SessionStatus.PENDING_APPROVAL
+        if stop_reason is LoopStopReason.FATAL_EXECUTION_FAILURE:
+            return SessionStatus.FAILED
+        if stop_reason is LoopStopReason.ZERO_ACTION_PLAN:
+            return SessionStatus.COMPLETED
+        if stop_reason is LoopStopReason.NO_PROGRESS:
+            return SessionStatus.COMPLETED_INCONCLUSIVE
+        if stop_reason in {LoopStopReason.MAX_ITERATIONS, LoopStopReason.MAX_ACTIONS}:
+            last_iter_failed = bool(iterations) and any(
+                r.status is ExecutionStatus.FAILED
+                for r in iterations[-1].execution_results
+            )
+            return (
+                SessionStatus.FAILED
+                if last_iter_failed
+                else SessionStatus.COMPLETED_INCONCLUSIVE
+            )
+        # Fallback: no stop reason (e.g. zero-action first plan). Treat as completed
+        # unless the aggregate shows unresolved failures, which is a legacy path.
+        if summary.failed_actions > 0:
+            return SessionStatus.FAILED
         return SessionStatus.COMPLETED
 
     def _resolve_request_cwd(self, value: Path | None) -> Path:

@@ -1131,7 +1131,7 @@ class HistoryStore:
         connection: sqlite3.Connection,
         session_id: str,
     ) -> sqlite3.Row | None:
-        return connection.execute(
+        row: sqlite3.Row | None = connection.execute(
             """
             SELECT
                 sessions.id,
@@ -1177,6 +1177,7 @@ class HistoryStore:
             """,
             (session_id,),
         ).fetchone()
+        return row
 
     def _load_trace_steps(
         self,
