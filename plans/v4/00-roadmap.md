@@ -10,7 +10,7 @@ v4 starts from the v3 runtime without touching the bounded replan loop, approval
 
 v4 starts from v3 (commit `34b2012` and later), which already has:
 - Typed file and git capabilities with approval boundaries.
-- Bounded replan loop (8 iterations × 10 actions × 50 total).
+- Bounded replan loop (32 iterations × 40 actions × 200 total).
 - Iteration-aware traces, `REPLANNED_FROM` edges, schema v5.
 - VerificationOutcome taxonomy; doctor surfaces approval boundaries.
 - Observation accumulation + "commands already executed" summary for the planner.
@@ -22,29 +22,32 @@ v4 should rebase on that runtime. Nothing in v3 gets rewritten; v4 adds a listen
 
 - **In-turn live UX: status line with expandable detail.** The default is one updating status line using Rich `Live`. Pressing `?` toggles an expanded panel showing completed steps + durations + the in-flight step. When the turn ends, the widget tears down and the existing concise result renders.
 - **Stage 01 ships the live UX only. Stage 02 adds the external event stream.** Groundwork for both lands in stage 01 (the `event_sink` hook on `ObserverService`), so stage 02 is purely a transport + schema decision.
-- **External monitoring transport: Unix socket / local HTTP.** Not a JSONL file. Live subscribe — monitors connect to a running `fcli` process.
+- **External event surface = persistent NDJSON log (default-on) + optional live transports (Unix socket / local HTTP).** Every session writes a redacted NDJSON event file under `${XDG_STATE_HOME:-~/.local/state}/foundation/events/<session_id>.ndjson`, plus an append-only `sessions.jsonl` index. Live Unix-socket / HTTP-SSE transports are opt-in (`--monitor-socket` / `--monitor-http`) for tools that want push instead of tail. The existing SQLite trace store is **untouched** — it remains the source of truth for trace inspection; the NDJSON log is the GUI-friendly surface.
 - **No full-screen TUI.** The live widget is inline; the session shell stays prompt-toolkit-driven.
-- **Auto-disable when stdout isn't a TTY** (e.g. `fcli "..." > out.txt`, CI). v3 behavior is preserved in those environments.
+- **Auto-disable when stdout isn't a TTY** (e.g. `fcli "..." > out.txt`, CI) applies to the **live UX only**. Persistence keeps writing in piped/CI runs so post-hoc tooling sees every session.
 - **Approval prompts pause the live widget.** The existing `EVENT_APPROVAL_REQUESTED` / `EVENT_APPROVAL_RESOLVED` events drive pause/resume around the existing prompt.
 
 ## Planning Artifacts
 
 - `plans/v4/00-roadmap.md`  ← this file
-- `plans/v4/01-live-turn-ux.md`  ← the first stage, implementation-ready
+- `plans/v4/01-live-turn-ux.md`  ← in-terminal live status line + `?`-toggle
+- `plans/v4/02-external-event-stream.md`  ← Unix-socket / local-HTTP subscriber
+- `plans/v4/03-loop-stop-fixes.md`  ← no-progress detector + observation fixes
 
-Stage 02 will be drafted after stage 01 ships and the external-monitor consumer (your GUI/terminal tool) has concrete requirements.
+Stages 01, 02, and 03 are independent of each other and may land in any order; the roadmap presents them in the order they were drafted.
 
 ## Stage Sequence
 
-| Stage | Outcome | Blocks Next Stage Until | Primary Artifact |
+| Stage | Outcome | Status | Primary Artifact |
 | --- | --- | --- | --- |
-| 01 | Pressing enter on a request shows a live status line and `?`-expandable detail; turn end returns to normal rendering. | Live widget renders reliably across interactive + one-shot modes, gracefully disables on non-TTY, and cleanly handles approvals and Ctrl-C. | `LiveTurnRenderer` + `ObserverService.event_sink` hook |
-| 02 | External monitors can subscribe to the running fcli's event stream via Unix socket / local HTTP. | Schema stability, authentication story, graceful start/stop. | `event_sink` transport implementation + client protocol doc |
+| 01 | Pressing enter on a request shows a live status line and `?`-expandable detail; turn end returns to normal rendering. | **shipped** | `LiveTurnRenderer` + `ObserverService.event_sink` hook |
+| 02 | Every session writes a redacted NDJSON event log to disk by default; optional live Unix-socket / HTTP-SSE transports let monitors subscribe to a running fcli. | **shipped** | `EventLogWriter` + sessions index + `MonitorServer` + Unix and HTTP/SSE transports + `docs/monitor-protocol.md` + README disclosure |
+| 03 | Successful turns are no longer misclassified as failed by the no-progress detector; idempotent re-plans count as completed work. | **shipped** | `NoProgressDetector(window=2)` + cumulative changes + soft-failure classifier + probe tagging + tool-call entries in observation + `_session_status_for_result` soft-completion mapping + history schema v6 migration |
 
 ## Cross-Stage Rules
 
 1. Stage 01's exit criteria are fully met before stage 02 starts.
-2. All new surfaces are opt-in (flag or env var). Default CLI behavior is preserved for scripts, CI, and piped stdout.
+2. The live UX and live transports are opt-in (flag or env var). The persistent NDJSON event log is **on by default**, including in piped/CI runs; users opt out with `--no-monitor` or `FOUNDATION_MONITOR=0`.
 3. Event payloads are redacted by the existing observability pipeline before they reach any new sink. No secrets leak to live UX or monitors.
 4. Live UX adds zero work on the orchestrator's hot path — it's a passive listener. Performance of a turn is unchanged with the UX on or off.
 5. Trace persistence continues unchanged. The live widget is a **presentation** layer; the source of truth remains the SQLite trace store.
@@ -62,5 +65,7 @@ Foundation CLI v4 is done when:
 - A user running `fcli` interactive or `fcli <request>` sees a live status line with `?`-expandable detail while the turn executes.
 - The widget auto-disables on non-TTY stdout and under approval prompts.
 - Ctrl-C mid-turn cancels cleanly without leaving the terminal in raw mode.
-- An external monitoring client (user's GUI or terminal tool) can connect to the running fcli via the documented transport and receive redacted events in near-real-time.
+- Every session writes a redacted NDJSON event log on disk (path discoverable via `fcli doctor`), so a third-party GUI or analyzer can open past sessions and build graphs/tables without being attached during the run.
+- An external monitoring client (user's GUI or terminal tool) can optionally connect to the running fcli via Unix socket or localhost HTTP/SSE and receive redacted events in near-real-time.
+- The bounded replan loop no longer misclassifies a turn as failed when the workspace already reflects the user's intent; idempotent re-plans surface as completed work, not as red "no progress" notices.
 - Existing v3 behaviors (plan table, execution panels, trace inspection, history, concise/verbose parity) remain unchanged.

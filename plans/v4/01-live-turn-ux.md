@@ -80,7 +80,7 @@ A short-lived background thread puts `sys.stdin.fileno()` into cbreak mode via `
 - **Ctrl-C mid-turn.** Main thread catches, sets a `threading.Event` the worker polls between actions (or accepts that the current action finishes and then stops). `LiveTurnRenderer.__exit__` restores TTY attrs before re-raise.
 - **Exception on the worker thread.** Propagated to the main thread after `join`; Live is torn down; a normal error panel renders.
 - **Approval prompt mid-turn.** Renderer pauses; existing prompt renders; resume. No dropped events — the queue keeps buffering while paused.
-- **Very long turns** (many iterations). State holds O(actions) entries but capped by the existing 50-action budget. Detail panel shows scrollable-tail (last N) if it exceeds terminal height. No unbounded growth.
+- **Very long turns** (many iterations). State holds O(actions) entries but capped by the existing 200-action budget. Detail panel shows scrollable-tail (last N) if it exceeds terminal height. No unbounded growth.
 - **Verbose render mode** stays exactly as today; live UX layers above and disappears when the turn ends, then verbose panels print.
 
 ## Deliverables

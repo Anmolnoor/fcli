@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import UTC, datetime
@@ -19,6 +20,8 @@ from foundation.models import (
     ExecutionArtifactType,
     ExecutionResult,
     ExecutionStatus,
+    GovernanceNotice,
+    GovernanceNoticeCode,
     IterationObservation,
     LoopStopReason,
     OrchestrationIteration,
@@ -36,6 +39,7 @@ from foundation.models import (
     VerificationNotice,
     VerificationOutcome,
 )
+from foundation.models.git import GitServiceError, GitStatusRequest
 from foundation.models.trace import TraceEdge, TraceEdgeKind
 from foundation.observability import (
     EVENT_EXCEPTION,
@@ -55,7 +59,7 @@ from foundation.services.file_service import FileService
 from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
-from foundation.services.observer import ObserverService
+from foundation.services.observer import EventSink, ObserverService
 from foundation.services.planner import PlannerService, PlanningError
 from foundation.services.provider import ProviderAdapter
 from foundation.services.shell import OutputCallback, ShellRuntime
@@ -64,9 +68,9 @@ from foundation.settings import ApprovalMode
 
 logger = logging.getLogger("foundation.services.orchestrator")
 
-_MAX_PLAN_ACTIONS = 10
-_MAX_LOOP_ITERATIONS = 8
-_MAX_TOTAL_ACTIONS = 50
+_MAX_PLAN_ACTIONS = 40
+_MAX_LOOP_ITERATIONS = 32
+_MAX_TOTAL_ACTIONS = 200
 _OBSERVATION_MAX_BYTES = 8 * 1024
 _OBSERVATION_MAX_LINES = 200
 
@@ -77,6 +81,18 @@ _FATAL_ERROR_PATTERNS = frozenset({
     "invalid_capability",
     "no such file or directory",
 })
+
+# Heuristic intent markers used by the commit-approval runtime invariant.
+# When the user's message contains "commit" as a whole word, or names any of
+# these phrases, the runtime expects the final iteration to either plan a git
+# commit (requires_approval=True) or to explain why it couldn't. Missing both
+# triggers a governance notice.
+_COMMIT_INTENT_WORD_RE = re.compile(r"\bcommit(?:ing|ted|s)?\b", re.IGNORECASE)
+_COMMIT_INTENT_PHRASES = (
+    "stop for approval",
+    "approve the change",
+)
+_COMMIT_CAPABILITY_ID = "foundation.git.commit"
 
 # Errors that indicate the binary could not run at all (vs. tests failed).
 _VERIFICATION_UNAVAILABLE_PATTERNS = frozenset({
@@ -149,15 +165,184 @@ _STOP_REASON_SUFFIXES = {
     ),
 }
 
+# v4 stage 03 — soft-completion notice when NO_PROGRESS fires *after* the
+# loop already produced cumulative changes (i.e. the planner kept retrying
+# already-finished work). Selected by the orchestrator at result-build time.
+_NO_PROGRESS_SOFT_SUFFIX = (
+    "\n\n[Run complete; planner re-issued already-finished actions.]"
+)
+
+# Capabilities whose successful execution should be surfaced in the
+# planner's "COMMANDS ALREADY EXECUTED" summary on the next iteration.
+_SIDE_EFFECTING_CAPABILITY_PREFIXES: tuple[str, ...] = (
+    "foundation.file.write",
+    "foundation.file.edit",
+    "foundation.file.apply_diff",
+    "foundation.git.stage",
+    "foundation.git.unstage",
+    "foundation.git.commit",
+)
+
+
+def _is_side_effecting_capability(capability_id: str | None) -> bool:
+    if not capability_id:
+        return False
+    return any(
+        capability_id == prefix or capability_id.startswith(prefix + ".")
+        for prefix in _SIDE_EFFECTING_CAPABILITY_PREFIXES
+    )
+
+
+_TOOL_CALL_LOG_KEYS: tuple[str, ...] = (
+    "path",
+    "paths",
+    "ref",
+    "message",
+    "summary",
+    "branch",
+)
+
+# v4 stage 03 — error fragments that mark "soft" idempotent failures the
+# detector should ignore when the action's target path was already
+# successfully written earlier in the same session.
+_SOFT_FAILURE_FRAGMENTS: tuple[str, ...] = (
+    "file already exists",
+    "nothing to commit",
+    "no changes added to commit",
+)
+
+
+def _is_soft_failure_for_path(
+    error: str | None, path: str | None, cumulative_changed_paths: set[str]
+) -> bool:
+    if not error or not path:
+        return False
+    lowered = error.lower()
+    if not any(fragment in lowered for fragment in _SOFT_FAILURE_FRAGMENTS):
+        return False
+    return path in cumulative_changed_paths
+
+
+def _action_target_path(action: PlannedAction) -> str | None:
+    if action.kind is not ActionKind.TOOL_CALL or action.tool_call is None:
+        return None
+    args = action.tool_call.arguments or {}
+    if not isinstance(args, dict):
+        return None
+    path = args.get("path")
+    if isinstance(path, str):
+        return path
+    return None
+
+
+def _filter_results_for_detector(
+    execution_results: list[ExecutionResult],
+    actions: list[PlannedAction],
+    *,
+    cumulative_changed_paths: set[str],
+) -> list[ExecutionResult]:
+    """Return ``execution_results`` with soft failures + probes marked OK.
+
+    The detector's failure fingerprint sees only "real" stuckness signals.
+    Soft failures (e.g. ``foundation.file.write`` returning FILE_EXISTS for
+    a path the session already wrote) and probe-style failures (a
+    ``foundation.file.read`` whose path is the target of a write action
+    in the same iteration) are converted to a synthetic NOT_EXECUTED so
+    they no longer count toward the failure set.
+    """
+    actions_by_id = {action.id: action for action in actions}
+
+    write_targets: set[str] = set()
+    for action in actions:
+        if (
+            action.kind is ActionKind.TOOL_CALL
+            and action.tool_call is not None
+            and action.tool_call.capability_id == "foundation.file.write"
+        ):
+            target = _action_target_path(action)
+            if target:
+                write_targets.add(target)
+
+    filtered: list[ExecutionResult] = []
+    for result in execution_results:
+        if result.status is not ExecutionStatus.FAILED:
+            filtered.append(result)
+            continue
+        action = actions_by_id.get(result.action_id)
+        if action is None:
+            filtered.append(result)
+            continue
+        target = _action_target_path(action)
+        # Probe: read whose path is also a write target this iteration.
+        if (
+            action.kind is ActionKind.TOOL_CALL
+            and action.tool_call is not None
+            and action.tool_call.capability_id == "foundation.file.read"
+            and target is not None
+            and target in write_targets
+        ):
+            filtered.append(_demote_to_soft(result))
+            continue
+        # Soft failure: idempotent error whose path is already in the
+        # cumulative changed-paths set.
+        if _is_soft_failure_for_path(
+            result.error, target, cumulative_changed_paths
+        ):
+            filtered.append(_demote_to_soft(result))
+            continue
+        filtered.append(result)
+    return filtered
+
+
+def _demote_to_soft(result: ExecutionResult) -> ExecutionResult:
+    return result.model_copy(
+        update={
+            "status": ExecutionStatus.NOT_EXECUTED,
+            "error": None,
+        }
+    )
+
+
+def _format_tool_call_log_entry(tool_call: object) -> str:
+    """Render a stable single-line summary of a tool call for the planner log."""
+    capability_id = getattr(tool_call, "capability_id", "")
+    arguments = getattr(tool_call, "arguments", {}) or {}
+    if not isinstance(arguments, dict):
+        return f"tool_call:{capability_id}"
+    parts: list[str] = []
+    for key in _TOOL_CALL_LOG_KEYS:
+        if key not in arguments:
+            continue
+        value = arguments[key]
+        if isinstance(value, list):
+            joined = ",".join(str(item) for item in value)[:200]
+            parts.append(f"{key}={joined}")
+        elif isinstance(value, str):
+            parts.append(f"{key}={value[:200]}")
+        else:
+            parts.append(f"{key}={value}")
+    if not parts:
+        return f"tool_call:{capability_id}"
+    return f"tool_call:{capability_id} " + " ".join(parts)
+
 
 def _utcnow() -> str:
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 class NoProgressDetector:
-    """Detect replanning loops that make no forward progress."""
+    """Detect replanning loops that make no forward progress.
 
-    def __init__(self) -> None:
+    The detector requires ``window`` consecutive identical failure (or
+    action) fingerprints before declaring stuck. v4 stage 03 sets the
+    default to ``2`` to tolerate a single idempotent re-issue. When the
+    caller passes ``cumulative_changed_paths`` and that set is non-empty,
+    the detector never declares stuck — earlier-iteration progress is
+    treated as proof the workspace already moved forward.
+    """
+
+    def __init__(self, *, window: int = 2) -> None:
+        self._window = max(2, int(window))
         self._failure_fingerprints: list[str] = []
         self._action_fingerprints: list[str] = []
 
@@ -166,6 +351,8 @@ class NoProgressDetector:
         execution_results: list[ExecutionResult],
         changed_paths: list[str],
         actions: list[PlannedAction],
+        *,
+        cumulative_changed_paths: list[str] | None = None,
     ) -> bool:
         failures = sorted(
             r.error or "" for r in execution_results if r.status is ExecutionStatus.FAILED
@@ -181,23 +368,28 @@ class NoProgressDetector:
         action_fp = hashlib.sha256("|".join(action_sigs).encode()).hexdigest()[:16]
 
         has_changes = len(changed_paths) > 0
+        cumulative_has_changes = bool(cumulative_changed_paths)
 
-        # Only detect no-progress when there are actual failures
-        if has_failures and not has_changes:
-            if (
-                self._failure_fingerprints
-                and failure_fp == self._failure_fingerprints[-1]
-            ):
-                return True
-
-            if (
-                self._action_fingerprints
-                and action_fp == self._action_fingerprints[-1]
-            ):
-                return True
-
+        # Append fingerprints for this iteration up front so window checks
+        # always see a consistent history regardless of the early-return.
         self._failure_fingerprints.append(failure_fp)
         self._action_fingerprints.append(action_fp)
+
+        # Only detect no-progress when this iteration has failures and no
+        # changes, AND the cumulative session hasn't already moved forward.
+        if not has_failures or has_changes or cumulative_has_changes:
+            return False
+
+        if len(self._failure_fingerprints) >= self._window and all(
+            fp == failure_fp
+            for fp in self._failure_fingerprints[-self._window :]
+        ):
+            return True
+        if len(self._action_fingerprints) >= self._window and all(
+            fp == action_fp
+            for fp in self._action_fingerprints[-self._window :]
+        ):
+            return True
         return False
 
 
@@ -227,6 +419,7 @@ class RequestOrchestrator:
         capability_registry: CapabilityRegistry | None = None,
         capability_store_root: Path | None = None,
         max_plan_attempts: int = 2,
+        event_sink: EventSink | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._approval_mode = approval_mode
@@ -253,6 +446,7 @@ class RequestOrchestrator:
         self._observer = ObserverService(
             history_store=self._history_store,
             capability_registry=self._capability_registry,
+            event_sink=event_sink,
         )
         self._planner = PlannerService(
             workspace_root=str(self._workspace_root),
@@ -264,6 +458,7 @@ class RequestOrchestrator:
         )
         state_dir = self._workspace_root / ".foundation" / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
+        self._git_service = GitService(workspace_root=self._workspace_root)
         self._executor = ActionExecutor(
             workspace_root=self._workspace_root,
             shell_runtime=self._shell_runtime,
@@ -277,10 +472,12 @@ class RequestOrchestrator:
                 workspace_root=self._workspace_root,
                 state_dir=state_dir,
             ),
-            git_service=GitService(
-                workspace_root=self._workspace_root,
-            ),
+            git_service=self._git_service,
         )
+
+    def set_event_sink(self, event_sink: EventSink | None) -> None:
+        """Replace (or clear) the observer's redacted event sink callback."""
+        self._observer.set_event_sink(event_sink)
 
     def orchestrate(self, request: UserRequest) -> OrchestrationResult:
         """Run the Stage 4 orchestration flow with bounded replan loop."""
@@ -332,7 +529,12 @@ class RequestOrchestrator:
                 payload={
                     "request_id": request_id,
                     "session_id": session_id,
-                    "status": self._session_status_for_summary(result.summary).value,
+                    "status": self._session_status_for_result(
+                        result.summary,
+                        result.stop_reason,
+                        result.iterations,
+                        result.governance_notice,
+                    ).value,
                     "executed_actions": result.summary.executed_actions,
                     "pending_approval_actions": result.summary.pending_approval_actions,
                     "blocked_actions": result.summary.blocked_actions,
@@ -356,7 +558,12 @@ class RequestOrchestrator:
                 )
                 self._history_store.finalize_session(
                     session_id,
-                    status=self._session_status_for_summary(result.summary),
+                    status=self._session_status_for_result(
+                        result.summary,
+                        result.stop_reason,
+                        result.iterations,
+                        result.governance_notice,
+                    ),
                 )
             return result
         except Exception as exc:
@@ -415,6 +622,10 @@ class RequestOrchestrator:
         had_code_changes = False
         verification_outcome: VerificationOutcome = VerificationOutcome.NOT_ATTEMPTED
         verification_commands: list[str] = []
+        # v4 stage 03 — cumulative changed-paths set drives both the
+        # detector's progress check and the soft-completion notice override.
+        cumulative_changed_paths: list[str] = []
+        cumulative_changed_paths_set: set[str] = set()
         progress_detector = NoProgressDetector()
         prev_last_step_id: str | None = None
 
@@ -457,6 +668,14 @@ class RequestOrchestrator:
                     remaining_actions=remaining_actions,
                 )
             except PlanningError as exc:
+                # On a *replan* (iter > 1), a PlanningError means the model
+                # is no longer producing a workable plan even though earlier
+                # iterations did real work. Bail gracefully and let the
+                # post-loop checks (governance / verification / status) fire
+                # against the iterations we already have. v4 stage 03.
+                if iteration_index > 1:
+                    stop_reason = LoopStopReason.NO_PROGRESS
+                    break
                 raise OrchestrationPlanError(str(exc)) from exc
             planning_completed_at = _utcnow()
             planning_duration = max(time.monotonic() - planning_started_monotonic, 0.0)
@@ -558,22 +777,35 @@ class RequestOrchestrator:
                 verification_outcome, iter_outcome,
             )
             verification_commands.extend(iter_verify_cmds)
+            for path in iter_changed:
+                if path not in cumulative_changed_paths_set:
+                    cumulative_changed_paths_set.add(path)
+                    cumulative_changed_paths.append(path)
 
             # Append every executed shell action to the running command log so
             # future iterations' observation prompts can surface the
-            # do-not-re-run history.
+            # do-not-re-run history. v4 stage 03 also records side-effecting
+            # tool calls (file writes, git mutations) so the planner sees
+            # them and won't re-issue.
             for action, result in zip(
                 actions_to_execute, execution_results, strict=True,
             ):
-                if (
-                    action.kind is ActionKind.SHELL
-                    and action.shell is not None
-                    and result.status is ExecutionStatus.EXECUTED
-                ):
+                if result.status is not ExecutionStatus.EXECUTED:
+                    continue
+                if action.kind is ActionKind.SHELL and action.shell is not None:
                     display = " ".join([action.shell.command, *action.shell.args])
                     entry = f"[iter {iteration_index}] $ {display}"
-                    if entry not in executed_command_log:
-                        executed_command_log.append(entry)
+                elif (
+                    action.kind is ActionKind.TOOL_CALL
+                    and action.tool_call is not None
+                    and _is_side_effecting_capability(action.tool_call.capability_id)
+                ):
+                    descriptor = _format_tool_call_log_entry(action.tool_call)
+                    entry = f"[iter {iteration_index}] {descriptor}"
+                else:
+                    continue
+                if entry not in executed_command_log:
+                    executed_command_log.append(entry)
 
             # 7. Check stop conditions
             has_pending = any(
@@ -627,8 +859,22 @@ class RequestOrchestrator:
             if stop_reason is not None:
                 break
 
-            # 9. No-progress detection
-            if progress_detector.is_stuck(execution_results, iter_changed, actions_to_execute):
+            # 9. No-progress detection (v4 stage 03):
+            #   - drop soft idempotent failures whose target path is already
+            #     in the cumulative changed-paths set,
+            #   - drop file.read probes whose path is the target of any
+            #     file.write action in this iteration.
+            detector_results = _filter_results_for_detector(
+                execution_results,
+                actions_to_execute,
+                cumulative_changed_paths=cumulative_changed_paths_set,
+            )
+            if progress_detector.is_stuck(
+                detector_results,
+                iter_changed,
+                actions_to_execute,
+                cumulative_changed_paths=cumulative_changed_paths,
+            ):
                 iterations[-1] = iterations[-1].model_copy(
                     update={"stop_reason": LoopStopReason.NO_PROGRESS},
                 )
@@ -671,8 +917,14 @@ class RequestOrchestrator:
         all_evaluations = [e for it in iterations for e in it.policy_evaluations]
         all_results = [r for it in iterations for r in it.execution_results]
 
+        had_fatal_failure = any(
+            self._is_fatal_result(r) for r in all_results
+        )
         msg_content = self._augment_message_with_stop_reason(
-            terminal_plan.assistant_message, stop_reason,
+            terminal_plan.assistant_message,
+            stop_reason,
+            cumulative_changed_paths=cumulative_changed_paths,
+            had_fatal=had_fatal_failure,
         )
         assistant_message = AssistantMessage(content=msg_content)
 
@@ -684,6 +936,11 @@ class RequestOrchestrator:
             iterations, all_results,
             plan_only=request.plan_only,
             stop_reason=stop_reason,
+        )
+
+        governance_notice = self._check_commit_approval_invariant(
+            request=request,
+            final_iteration=iterations[-1],
         )
 
         return OrchestrationResult(
@@ -700,6 +957,7 @@ class RequestOrchestrator:
             iterations=iterations,
             stop_reason=stop_reason,
             verification_notice=verification_notice,
+            governance_notice=governance_notice,
         )
 
     # ------------------------------------------------------------------
@@ -962,11 +1220,77 @@ class RequestOrchestrator:
     def _augment_message_with_stop_reason(
         message: str,
         stop_reason: LoopStopReason,
+        *,
+        cumulative_changed_paths: list[str] | None = None,
+        had_fatal: bool = False,
     ) -> str:
+        # v4 stage 03: when the loop bails with NO_PROGRESS *after* having
+        # already produced cumulative changes and no fatal failure, the
+        # workspace state actually reflects the user's intent. Swap the
+        # red "no progress" suffix for the soft-completion variant.
+        if (
+            stop_reason is LoopStopReason.NO_PROGRESS
+            and cumulative_changed_paths
+            and not had_fatal
+        ):
+            return message + _NO_PROGRESS_SOFT_SUFFIX
         suffix = _STOP_REASON_SUFFIXES.get(stop_reason)
         if suffix:
             return message + suffix
         return message
+
+    @staticmethod
+    def _has_commit_intent(message: str) -> bool:
+        if _COMMIT_INTENT_WORD_RE.search(message):
+            return True
+        lower = message.lower()
+        return any(phrase in lower for phrase in _COMMIT_INTENT_PHRASES)
+
+    def _check_commit_approval_invariant(
+        self,
+        *,
+        request: UserRequest,
+        final_iteration: OrchestrationIteration,
+    ) -> GovernanceNotice | None:
+        """Enforce: if the user asked to commit and the run left staged files
+        without planning an approval-gated commit, surface a governance
+        notice and (via the classifier) flip the session status to
+        PENDING_APPROVAL.
+
+        Returns ``None`` when the run satisfied the contract (or the user
+        never asked for a commit in the first place).
+        """
+        if not self._has_commit_intent(request.message):
+            return None
+
+        planned_commit = any(
+            action.tool_call is not None
+            and action.tool_call.capability_id == _COMMIT_CAPABILITY_ID
+            for action in final_iteration.plan.actions
+        )
+        if planned_commit:
+            return None
+
+        try:
+            status = self._git_service.status(GitStatusRequest())
+        except GitServiceError:
+            # Git status can't be read (not a repo, access error, etc.).
+            # Absence of evidence isn't evidence of staged files — stay silent.
+            return None
+
+        staged_paths = [change.path for change in status.staged]
+        if not staged_paths:
+            return None
+
+        return GovernanceNotice(
+            code=GovernanceNoticeCode.COMMIT_APPROVAL_MISSING,
+            message=(
+                "User request asked for a commit-approval stop; the final "
+                "iteration ended with staged files and no commit action. "
+                "No commit was performed."
+            ),
+            staged_paths=sorted(staged_paths),
+        )
 
     # ------------------------------------------------------------------
     # History and session helpers
@@ -1051,13 +1375,103 @@ class RequestOrchestrator:
             },
         )
 
-    @staticmethod
-    def _session_status_for_summary(summary: OrchestrationSummary) -> SessionStatus:
-        if summary.failed_actions > 0:
-            return SessionStatus.FAILED
+    @classmethod
+    def _session_status_for_result(
+        cls,
+        summary: OrchestrationSummary,
+        stop_reason: LoopStopReason | None,
+        iterations: list[OrchestrationIteration],
+        governance_notice: GovernanceNotice | None = None,
+        *,
+        cumulative_changed_paths: list[str] | None = None,
+        had_fatal: bool | None = None,
+    ) -> SessionStatus:
+        """Classify a terminated orchestration run.
+
+        Precedence:
+
+        1. ``PENDING_APPROVAL`` if any action is still awaiting approval,
+           or if the runtime emitted a governance notice overriding the
+           status (e.g. the commit-approval invariant fired).
+        2. ``FAILED`` when the loop hit a fatal, unresolved stop.
+        3. ``COMPLETED`` when the planner returned zero actions as the final
+           step — even if earlier iterations had failures and the later ones
+           recovered.
+        4. ``COMPLETED_INCONCLUSIVE`` when the loop stopped because the
+           no-progress detector fired, or because the iteration/action budget
+           ran out with a clean final iteration. The run is not corrupt, but
+           didn't fully satisfy the request.
+        5. ``FAILED`` when the budget ran out mid-failure.
+        """
+        if governance_notice is not None:
+            return SessionStatus.PENDING_APPROVAL
         if summary.pending_approval_actions > 0:
             return SessionStatus.PENDING_APPROVAL
+        if stop_reason is LoopStopReason.PENDING_APPROVAL:
+            return SessionStatus.PENDING_APPROVAL
+        if stop_reason is LoopStopReason.FATAL_EXECUTION_FAILURE:
+            return SessionStatus.FAILED
+        if stop_reason is LoopStopReason.ZERO_ACTION_PLAN:
+            return SessionStatus.COMPLETED
+        if stop_reason is LoopStopReason.NO_PROGRESS:
+            # v4 stage 03 — soft completion: cumulative changes already
+            # landed and nothing fatal happened, so the workspace
+            # already reflects the user's intent. Surface as COMPLETED.
+            cumulative = (
+                cumulative_changed_paths
+                if cumulative_changed_paths is not None
+                else cls._aggregate_changed_paths(iterations)
+            )
+            fatal = (
+                had_fatal
+                if had_fatal is not None
+                else cls._iterations_had_fatal(iterations)
+            )
+            if cumulative and not fatal:
+                return SessionStatus.COMPLETED
+            return SessionStatus.COMPLETED_INCONCLUSIVE
+        if stop_reason in {LoopStopReason.MAX_ITERATIONS, LoopStopReason.MAX_ACTIONS}:
+            last_iter_failed = bool(iterations) and any(
+                r.status is ExecutionStatus.FAILED
+                for r in iterations[-1].execution_results
+            )
+            return (
+                SessionStatus.FAILED
+                if last_iter_failed
+                else SessionStatus.COMPLETED_INCONCLUSIVE
+            )
+        # Fallback: no stop reason (e.g. zero-action first plan). Treat as completed
+        # unless the aggregate shows unresolved failures, which is a legacy path.
+        if summary.failed_actions > 0:
+            return SessionStatus.FAILED
         return SessionStatus.COMPLETED
+
+    @staticmethod
+    def _aggregate_changed_paths(
+        iterations: list[OrchestrationIteration],
+    ) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for it in iterations:
+            obs = it.observation
+            if obs is None:
+                continue
+            for path in obs.changed_paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                ordered.append(path)
+        return ordered
+
+    @classmethod
+    def _iterations_had_fatal(
+        cls, iterations: list[OrchestrationIteration]
+    ) -> bool:
+        for it in iterations:
+            for r in it.execution_results:
+                if cls._is_fatal_result(r):
+                    return True
+        return False
 
     def _resolve_request_cwd(self, value: Path | None) -> Path:
         if value is None:

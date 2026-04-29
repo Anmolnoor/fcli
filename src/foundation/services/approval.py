@@ -91,6 +91,38 @@ class ApprovalService:
                 requested_side_effects=list(request.requested_side_effects),
             )
 
+        if self._mode is ApprovalMode.AUTO_EXCEPT_COMMIT:
+            gated = _auto_except_commit_gated(request)
+            if not gated:
+                return request, CapabilityApprovalResolution(
+                    action_id=action.id,
+                    capability_id=request.capability_id,
+                    mode=self._mode.value,
+                    status=ApprovalDecisionStatus.APPROVED,
+                    reason="Auto-approved by approval.mode=auto-except-commit.",
+                    requested_at=requested_at,
+                    resolved_at=resolved_at,
+                    risk_categories=list(request.risk_categories),
+                    reason_codes=list(request.reason_codes),
+                    command_preview=request.command_preview,
+                    requested_side_effects=list(request.requested_side_effects),
+                )
+            return request, CapabilityApprovalResolution(
+                action_id=action.id,
+                capability_id=request.capability_id,
+                mode=self._mode.value,
+                status=ApprovalDecisionStatus.PENDING,
+                reason=(
+                    f"Approval required under approval.mode=auto-except-commit ({gated})."
+                ),
+                requested_at=requested_at,
+                resolved_at=resolved_at,
+                risk_categories=list(request.risk_categories),
+                reason_codes=list(request.reason_codes),
+                command_preview=request.command_preview,
+                requested_side_effects=list(request.requested_side_effects),
+            )
+
         if self._mode is ApprovalMode.MANUAL or self._prompt_callback is None:
             return request, CapabilityApprovalResolution(
                 action_id=action.id,
@@ -129,3 +161,26 @@ class ApprovalService:
         categories = set(evaluation.policy_input.requested_side_effects)
         categories.update(code.value for code in evaluation.verdict.reason_codes)
         return sorted(categories)
+
+
+_AUTO_EXCEPT_COMMIT_GATED_CAPABILITIES: frozenset[str] = frozenset(
+    {"foundation.git.commit"}
+)
+_AUTO_EXCEPT_COMMIT_GATED_SIDE_EFFECTS: frozenset[str] = frozenset(
+    {"network", "outside_workspace"}
+)
+
+
+def _auto_except_commit_gated(request: CapabilityApprovalRequest) -> str | None:
+    """Return a short reason string when the request must still be gated.
+
+    Under ``auto-except-commit`` mode everything is auto-approved except:
+    explicit git commit capabilities, or any request that declares network
+    or outside-workspace side effects.
+    """
+    if str(request.capability_id) in _AUTO_EXCEPT_COMMIT_GATED_CAPABILITIES:
+        return "commit capability requires explicit approval"
+    for side_effect in request.requested_side_effects:
+        if side_effect in _AUTO_EXCEPT_COMMIT_GATED_SIDE_EFFECTS:
+            return f"side effect '{side_effect}' requires explicit approval"
+    return None

@@ -10,9 +10,9 @@ Replace the current single planning pass with a bounded replan loop so one user 
 
 ## Locked Decisions
 - v3 replaces the one-pass orchestrator with a bounded loop:
-  - max 4 planning iterations per user turn,
-  - max 5 actions per iteration,
-  - max 20 actions total.
+  - max 32 planning iterations per user turn,
+  - max 40 actions per iteration,
+  - max 200 actions total.
 - Request context is regathered before each iteration so capability availability, file state, and git state reflect prior edits.
 - After each non-terminal iteration, the runtime appends one normalized observation block to the planner conversation containing:
   - executed capability ids,

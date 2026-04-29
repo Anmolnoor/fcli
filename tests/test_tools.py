@@ -304,3 +304,49 @@ def test_tool_scope_must_stay_within_workspace(
         service.search(SearchRequest(query="needle", scope=outside_path))
 
     assert exc_info.value.error.code is ToolErrorCode.INVALID_SCOPE
+
+
+def test_local_tool_service_scrubs_foundation_env_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", "/leak/state")
+    monkeypatch.setenv("FOUNDATION_HISTORY__DATABASE_PATH", "/leak/history.db")
+    monkeypatch.setenv("UNRELATED_VAR", "keep-me")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    service = LocalToolService(workspace_root=workspace_root)
+
+    env = service._environment
+    assert not any(key.startswith("FOUNDATION_") for key in env)
+    assert env.get("UNRELATED_VAR") == "keep-me"
+
+
+def test_local_tool_service_pass_through_restores_legacy_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", "/legacy/state")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    service = LocalToolService(
+        workspace_root=workspace_root,
+        pass_through_foundation_env=True,
+    )
+
+    assert service._environment.get("FOUNDATION_APP__STATE_DIR") == "/legacy/state"
+
+
+def test_local_tool_service_explicit_environment_overlay_still_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", "/ambient/state")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    service = LocalToolService(
+        workspace_root=workspace_root,
+        environment={"FOUNDATION_APP__STATE_DIR": "/explicit/state"},
+    )
+
+    assert service._environment.get("FOUNDATION_APP__STATE_DIR") == "/explicit/state"

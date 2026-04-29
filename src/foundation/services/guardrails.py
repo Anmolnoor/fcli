@@ -309,22 +309,31 @@ class CapabilityPolicyEngine:
             "builtin.file.read", "builtin.file.read_chunk",
         }:
             path = arguments.get("path")
-            if isinstance(path, str):
-                requested_paths.append(path)
+            normalized_path = self._normalize_workspace_tool_path(path)
+            if normalized_path is not None:
+                requested_paths.append(normalized_path)
             requested_side_effects.append("filesystem_read")
         elif endpoint in {
             "builtin.file.write", "builtin.file.edit", "builtin.file.apply_diff",
         }:
             path = arguments.get("path")
-            if isinstance(path, str):
-                requested_paths.append(path)
+            normalized_path = self._normalize_workspace_tool_path(path)
+            if normalized_path is not None:
+                requested_paths.append(normalized_path)
             requested_side_effects.append("workspace_write")
         elif endpoint in {
             "builtin.git.status", "builtin.git.diff",
             "builtin.git.show", "builtin.git.log",
         }:
+            if endpoint == "builtin.git.diff":
+                requested_paths.extend(
+                    self._normalize_workspace_tool_paths(arguments.get("paths"))
+                )
             requested_side_effects.append("filesystem_read")
         elif endpoint in {"builtin.git.stage", "builtin.git.unstage"}:
+            requested_paths.extend(
+                self._normalize_workspace_tool_paths(arguments.get("paths"))
+            )
             requested_side_effects.append("workspace_write")
         elif endpoint == "builtin.git.commit":
             requested_side_effects.append("workspace_write")
@@ -356,6 +365,24 @@ class CapabilityPolicyEngine:
             planner_requires_approval=action.requires_approval,
             planner_approval_reason=action.approval_reason,
         )
+
+    def _normalize_workspace_tool_path(self, raw_path: object) -> str | None:
+        if not isinstance(raw_path, str):
+            return None
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            return str(candidate.resolve())
+        return str((self._workspace_root / candidate).resolve())
+
+    def _normalize_workspace_tool_paths(self, raw_paths: object) -> list[str]:
+        if not isinstance(raw_paths, list):
+            return []
+        normalized: list[str] = []
+        for raw_path in raw_paths:
+            resolved = self._normalize_workspace_tool_path(raw_path)
+            if resolved is not None:
+                normalized.append(resolved)
+        return normalized
 
     def _requested_shell_invocation(
         self,

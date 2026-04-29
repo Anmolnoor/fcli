@@ -2,7 +2,11 @@
 
 ## Status
 
-**v3 definition-of-done met** — all six stages complete.
+**v3 definition-of-done met** — all six stages complete; release gates green.
+Merge gates (branch `v3-fixes`): pytest 271 passed, ruff clean, mypy clean;
+package metadata at `0.2.0`; spec/code/docs agree on bounded loop limits
+(32 iterations × 40 actions × 200 total); `history.database_path` defaults under
+`app.state_dir` when not explicitly overridden.
 See `CHANGELOG.md` for the v0.2.0 release notes.
 
 ## Purpose
@@ -42,9 +46,9 @@ Implementation should start at the roadmap, then move through the stage files in
 - `foundation.shell.command` remains the only generic shell capability in v3.
 - Code-changing behavior should prefer typed file and git capabilities over shell mutation commands whenever those capabilities are available.
 - The orchestrator becomes a bounded replan loop with these hard caps:
-  - maximum 4 planning iterations per user turn,
-  - maximum 5 planned actions per iteration,
-  - maximum 20 executed or attempted actions total.
+  - maximum 32 planning iterations per user turn,
+  - maximum 40 planned actions per iteration,
+  - maximum 200 executed or attempted actions total.
 - Concise mode remains the default for interactive and one-shot use.
 - Full internal detail remains available through verbose rendering and trace inspection.
 - Default approval posture for v3 is:

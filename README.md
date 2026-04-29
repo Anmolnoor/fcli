@@ -7,7 +7,7 @@ Foundation CLI is a local-first, shell-native coding agent that follows an expli
 - **Agent entrypoint.** `foundation` starts the interactive shell; `foundation <request>` runs a one-shot turn; admin subcommands (`run`, `tools`, `history`, `trace`, `config`, `doctor`) keep precedence. `foundation chat` remains a strict alias.
 - **Typed file capabilities.** `foundation.file.{read,read_chunk,write,edit,apply_diff}` — atomic writes with sha256 conflict detection, pure-Python unified-diff applier. Planner prefers these over `sed`/`echo`.
 - **Typed git capabilities.** `foundation.git.{status,diff,show,log,stage,unstage,commit}` — workspace-confined, porcelain v2 parsing. Stage / unstage are auto-allowed; `commit` requires approval and never stages implicitly.
-- **Bounded replan loop.** Max 8 planning iterations × 10 actions each × 50 total per user turn. Six stop reasons surface why a turn ended (`zero_action_plan`, `pending_approval`, `fatal_execution_failure`, `max_iterations`, `max_actions`, `no_progress`).
+- **Bounded replan loop.** Max 32 planning iterations × 40 actions each × 200 total per user turn. Six stop reasons surface why a turn ended (`zero_action_plan`, `pending_approval`, `fatal_execution_failure`, `max_iterations`, `max_actions`, `no_progress`).
 - **Iteration-aware trace.** Step ids are scoped `planning:{req}:{iter}` and `action:{req}:{iter}:{action_id}`; `REPLANNED_FROM` edges link iterations. Older v2 traces remain inspectable via schema v5 migration.
 - **Concise notices.** Multi-iteration turns summarize with changed-files, commands-run, verification outcome, and approval-required notices. Verification reports PASSED / FAILED / UNAVAILABLE / NOT_ATTEMPTED distinctly so missing binaries aren't misreported as success.
 - **Approval boundaries visible.** `foundation doctor` prints risk class, trust tier, and declared side effects for every capability.
@@ -201,7 +201,46 @@ foundation --provider ollama --model gpt-oss:20b chat inspect the workspace root
 foundation --provider ollama --model gpt-oss:120b-cloud --base-url https://ollama.com/api doctor
 ```
 
-`foundation config show` prints the effective configuration without exposing secret values, including the resolved provider base URL. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, history and log readiness, and capability registry health for the seeded built-ins.
+`foundation config show` prints the effective configuration without exposing secret values, including the resolved provider base URL. `foundation doctor` checks Python version, config readability, required directories, provider credential lookup health, history and log readiness, the events directory + retention configured for the v4 monitor surface, and capability registry health for the seeded built-ins.
+
+## Event Log & Monitoring (v4)
+
+By default Foundation CLI writes a **redacted NDJSON event log** for every
+session under `${XDG_STATE_HOME:-~/.local/state}/foundation/events/`:
+
+- `<session_id>.ndjson` — one envelope per line, mode `0600`.
+- `sessions.jsonl` — append-only index of all past sessions.
+
+The directory is created with mode `0700` (owner-only). Every payload that
+flows through the existing observability redaction pipeline is what lands
+on disk; secrets and credentials are stripped before write. The on-disk
+log is the GUI-friendly surface — a third-party tool can open
+`<session_id>.ndjson` after the fact and render graphs / tables /
+timelines without ever attaching during the run. The SQLite trace store
+is unchanged and remains the source of truth for trace inspection.
+
+Retention defaults to 200 sessions / 500 MB; oldest sessions are pruned
+automatically on session end. Configure under `[monitor]` in
+`config.toml`.
+
+**Opt-out:** pass `--no-monitor` for one invocation, set
+`FOUNDATION_MONITOR=0`, or `monitor.enabled = false` in `config.toml`.
+Override the directory with `--events-dir <path>`.
+
+**Optional live transports** (off by default):
+
+| Flag | What it does |
+|---|---|
+| `--monitor-socket[=<path>]` | Open a Unix domain socket subscribers can attach to (`AF_UNIX`, `0600`). |
+| `--monitor-http=<port>` | Open a localhost HTTP/SSE endpoint on `127.0.0.1:<port>`. fcli prints a per-process bearer token at startup; HTTP requests must include `Authorization: Bearer <token>`. |
+
+Both transports are read-only — subscribers observe; nothing they say
+steers the agent. The HTTP transport refuses to bind anywhere other than
+localhost.
+
+The wire format, file layout, retention semantics, and example client
+snippets (Python + Node) are documented in
+[`docs/monitor-protocol.md`](docs/monitor-protocol.md).
 
 ## Known Limitations
 - **Binary file editing** is out of scope — text capabilities only.

@@ -316,7 +316,7 @@ def test_cli_version_flag() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert "foundation 0.1.0" in result.stdout
+    assert "foundation 0.2.0" in result.stdout
 
 
 def test_config_show_redacts_secret_values(
@@ -704,6 +704,131 @@ def test_chat_one_shot_defaults_to_concise_rendering(
 
     assert result.exit_code == 0
     assert "I inspected the workspace context." in result.stdout
+
+def test_chat_one_shot_accepts_no_live_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The global --no-live flag is accepted and a one-shot turn still runs."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    class StubOrchestrator:
+        def set_event_sink(self, _sink):
+            pass
+
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            return _chat_result_with_details(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "--config", str(config_path),
+            "--no-live", "--no-monitor",
+            "chat", "look", "around",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "I inspected the workspace context." in result.stdout
+
+
+def test_chat_one_shot_writes_event_log_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-shot turn writes a redacted NDJSON file under events_dir."""
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    class StubOrchestrator:
+        def __init__(self) -> None:
+            self._sink = None
+
+        def set_event_sink(self, sink) -> None:
+            self._sink = sink
+
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            assert self._sink is not None
+            self._sink(
+                "user_request",
+                {"request_id": "r1", "request_text": request.message},
+            )
+            self._sink(
+                "session_start",
+                {"request_id": "r1", "session_id": "sess-cli"},
+            )
+            self._sink(
+                "tool_call_started",
+                {"request_id": "r1", "session_id": "sess-cli", "tool": "git"},
+            )
+            self._sink(
+                "session_end",
+                {
+                    "request_id": "r1",
+                    "session_id": "sess-cli",
+                    "status": "completed",
+                },
+            )
+            return _chat_result_with_details(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["--config", str(config_path), "--no-live", "chat", "do", "it"],
+    )
+
+    assert result.exit_code == 0
+    events_dir = tmp_path / "state" / "events"
+    log_path = events_dir / "sess-cli.ndjson"
+    assert log_path.exists()
+    contents = log_path.read_text(encoding="utf-8")
+    assert "session_start" in contents
+    assert "session_end" in contents
+    assert (events_dir / "sessions.jsonl").exists()
+
+
+def test_chat_one_shot_no_monitor_writes_no_event_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    class StubOrchestrator:
+        def set_event_sink(self, _sink) -> None:
+            pass
+
+        def orchestrate(self, request: UserRequest) -> OrchestrationResult:
+            return _chat_result_with_details(request.message)
+
+    monkeypatch.setattr(
+        "foundation.cli._build_orchestrator",
+        lambda _settings, **_kwargs: StubOrchestrator(),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "--config", str(config_path),
+            "--no-live", "--no-monitor",
+            "chat", "do", "it",
+        ],
+    )
+
+    assert result.exit_code == 0
+    events_dir = tmp_path / "state" / "events"
+    assert not events_dir.exists() or list(events_dir.glob("*.ndjson")) == []
+    assert not (events_dir / "sessions.jsonl").exists()
     assert "Executed 1 action and captured local workspace context." in result.stdout
     assert "Path preview:" in result.stdout
     assert "Planned Actions" not in result.stdout
@@ -1128,6 +1253,7 @@ def test_chat_interactive_model_command_updates_subsequent_request(
         plan_only: bool,
         approval_mode: ApprovalMode | None = None,
         shell_output_callback: object | None = None,
+        **_kwargs: Any,
     ) -> OrchestrationResult:
         captured_models.append(cast(Any, settings).provider.model)
         return _chat_result(message)
@@ -1166,6 +1292,7 @@ def test_chat_interactive_can_resume_specific_persistent_session(
         plan_only: bool,
         approval_mode: ApprovalMode | None = None,
         shell_output_callback: object | None = None,
+        **_kwargs: Any,
     ) -> OrchestrationResult:
         requests.append(
             UserRequest(
@@ -1647,7 +1774,7 @@ def test_version_flag_still_works() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert "foundation 0.1.0" in result.stdout
+    assert "foundation 0.2.0" in result.stdout
 
 
 def test_help_flag_still_works() -> None:

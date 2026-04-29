@@ -10,8 +10,11 @@ from typing import Any
 import pytest
 
 from foundation.models import (
+    ActionKind,
     ExecutionStatus,
+    ExecutionStep,
     LoopStopReason,
+    PlanningStep,
     ProviderPrompt,
     ProviderResponse,
     ProviderResponseMetadata,
@@ -274,6 +277,58 @@ def test_orchestrator_retries_invalid_plans_without_duplicate_shell_execution(
     assert result.execution_results[0].artifact["stdout"] == f"{workspace_root}\n"
 
 
+def test_orchestrator_retries_shell_cat_plan_without_executing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "I'll read the file with cat.",
+                    "actions": [
+                        {
+                            "id": "read_with_cat",
+                            "kind": "shell",
+                            "summary": "Read the note with cat",
+                            "shell": {
+                                "command": "cat",
+                                "args": ["note.txt"],
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "I'll use the typed file reader instead.",
+                    "actions": [
+                        {
+                            "id": "read_note",
+                            "kind": "tool_call",
+                            "summary": "Read the note with the file capability",
+                            "tool_call": {
+                                "capability_id": "foundation.file.read",
+                                "arguments": {"path": "note.txt"},
+                            },
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    orchestrator, runtime, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+    (workspace_root / "note.txt").write_text("hello\n", encoding="utf-8")
+
+    result = orchestrator.orchestrate(UserRequest(message="read note.txt"))
+
+    assert len(provider.calls) == 3
+    assert runtime.calls == 0
+    assert result.execution_results[0].status is ExecutionStatus.EXECUTED
+    assert result.execution_results[0].artifact is not None
+    assert Path(str(result.execution_results[0].artifact["path"])).name == "note.txt"
+
+
 def test_orchestrator_marks_risky_shell_commands_as_pending_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -324,7 +379,11 @@ def test_orchestrator_blocks_out_of_workspace_shell_reads(
                             "kind": "shell",
                             "summary": "Read a file outside the workspace",
                             "shell": {
-                                "command": "cat",
+                                # `head` keeps the test focused on the
+                                # workspace-confinement policy check; `cat`
+                                # is now planner-rejected as a typed-capability
+                                # equivalent.
+                                "command": "head",
                                 "args": [str(outside_path)],
                             },
                         }
@@ -588,8 +647,8 @@ def test_orchestrator_persists_sessions_commands_and_summaries(
     assert len(trace.steps) == 3
     planning_step = trace.steps[0]
     execution_step = trace.steps[1]
-    assert planning_step.step_type.value == "planning"
-    assert execution_step.step_type.value == "execution"
+    assert isinstance(planning_step, PlanningStep)
+    assert isinstance(execution_step, ExecutionStep)
     assert execution_step.capability_id == "foundation.shell.command"
     assert execution_step.manifest_fingerprint is not None
     assert execution_step.selection_reason.selected_capability_id == "foundation.shell.command"
@@ -658,9 +717,8 @@ def test_orchestrator_persists_pending_approval_session_status(
     assert trace is not None
     assert len(trace.steps) == 2
     execution_step = next(
-        s for s in trace.steps if s.step_type.value == "execution"
+        s for s in trace.steps if isinstance(s, ExecutionStep)
     )
-    assert execution_step.step_type.value == "execution"
     assert execution_step.status is ExecutionStatus.PENDING_APPROVAL
     assert execution_step.action_id == "create_file"
     assert execution_step.iteration_index == 1
@@ -723,14 +781,17 @@ def test_orchestrator_persists_failed_execution_trace_as_audit_complete(
     assert result.execution_results[0].status is ExecutionStatus.FAILED
     assert result.summary.failed_actions == 1
     sessions = history_store.list_sessions(limit=5)
-    assert sessions[0].status is SessionStatus.FAILED
+    # The loop recovered to a zero-action final plan, so the session is
+    # recorded as COMPLETED even though a mid-iteration action failed.
+    # The per-action failure is preserved in execution_results/summary.
+    assert sessions[0].status is SessionStatus.COMPLETED
 
     full_trace = history_store.get_trace(
         TraceQuery(session_id=result.session_id or "")
     )
     assert full_trace is not None
     execution_step = next(
-        s for s in full_trace.steps if s.step_type.value == "execution"
+        s for s in full_trace.steps if isinstance(s, ExecutionStep)
     )
     assert execution_step.status is ExecutionStatus.FAILED
     assert execution_step.action_id == "failing_command"
@@ -1311,7 +1372,7 @@ def test_no_progress_detector_unit() -> None:
     detector = NoProgressDetector()
 
     action = PlannedAction(
-        id="a1", kind="shell", summary="Run test",
+        id="a1", kind=ActionKind.SHELL, summary="Run test",
         shell=ShellAction(command="false"),
     )
     result = ExecutionResult(
@@ -1330,7 +1391,7 @@ def test_no_progress_detector_not_stuck_with_changes() -> None:
     detector = NoProgressDetector()
 
     action = PlannedAction(
-        id="a1", kind="shell", summary="Run test",
+        id="a1", kind=ActionKind.SHELL, summary="Run test",
         shell=ShellAction(command="false"),
     )
     result = ExecutionResult(
@@ -1340,6 +1401,337 @@ def test_no_progress_detector_not_stuck_with_changes() -> None:
 
     assert detector.is_stuck([result], [], [action]) is False
     assert detector.is_stuck([result], ["file.py"], [action]) is False
+
+
+# ------------------------------------------------------------------
+# v4 Stage 03: detector + observation + status mapping
+# ------------------------------------------------------------------
+
+
+def test_detector_window_two_requires_two_consecutive_repeats() -> None:
+    """A single repeat does not trip stuck; two in a row does."""
+    from foundation.models import ExecutionResult, PlannedAction, ShellAction
+
+    detector = NoProgressDetector()
+    action = PlannedAction(
+        id="a", kind=ActionKind.SHELL, summary="run",
+        shell=ShellAction(command="false"),
+    )
+    fail = ExecutionResult(
+        action_id="a", status=ExecutionStatus.FAILED,
+        summary="boom", error="Exit code 1",
+    )
+    # iter 1: first failure observed; window not yet full → not stuck.
+    assert detector.is_stuck([fail], [], [action]) is False
+    # iter 2: second identical failure → window=2 satisfied → stuck.
+    assert detector.is_stuck([fail], [], [action]) is True
+
+
+def test_detector_cumulative_changes_suppresses_stuck() -> None:
+    """Earlier-iteration progress should never declare the loop stuck."""
+    from foundation.models import ExecutionResult, PlannedAction, ShellAction
+
+    detector = NoProgressDetector()
+    action = PlannedAction(
+        id="a", kind=ActionKind.SHELL, summary="run",
+        shell=ShellAction(command="false"),
+    )
+    fail = ExecutionResult(
+        action_id="a", status=ExecutionStatus.FAILED,
+        summary="boom", error="Exit code 1",
+    )
+    detector.is_stuck([fail], [], [action])
+    # Even with the second identical failure, cumulative changes prevent stuck.
+    assert (
+        detector.is_stuck(
+            [fail], [], [action],
+            cumulative_changed_paths=["edited.py"],
+        )
+        is False
+    )
+
+
+def test_filter_results_for_detector_demotes_file_exists_after_prior_write() -> None:
+    """A FILE_EXISTS error on a path already in the cumulative set is soft."""
+    from foundation.models import ExecutionResult, PlannedAction, ToolCall
+    from foundation.services.orchestrator import _filter_results_for_detector
+
+    write = PlannedAction(
+        id="w1", kind=ActionKind.TOOL_CALL, summary="rewrite",
+        tool_call=ToolCall(
+            capability_id="foundation.file.write",
+            arguments={"path": "/abs/notes.md", "content": "x"},
+        ),
+    )
+    failed = ExecutionResult(
+        action_id="w1", status=ExecutionStatus.FAILED,
+        summary="exists",
+        error="File already exists. Set overwrite=true to replace it.",
+    )
+    filtered = _filter_results_for_detector(
+        [failed], [write],
+        cumulative_changed_paths={"/abs/notes.md"},
+    )
+    assert filtered[0].status is ExecutionStatus.NOT_EXECUTED
+
+
+def test_filter_results_for_detector_keeps_real_failures() -> None:
+    """An error on a path *not* yet in cumulative changes stays a failure."""
+    from foundation.models import ExecutionResult, PlannedAction, ToolCall
+    from foundation.services.orchestrator import _filter_results_for_detector
+
+    write = PlannedAction(
+        id="w1", kind=ActionKind.TOOL_CALL, summary="rewrite",
+        tool_call=ToolCall(
+            capability_id="foundation.file.write",
+            arguments={"path": "/abs/notes.md"},
+        ),
+    )
+    failed = ExecutionResult(
+        action_id="w1", status=ExecutionStatus.FAILED,
+        summary="exists",
+        error="File already exists. Set overwrite=true to replace it.",
+    )
+    filtered = _filter_results_for_detector(
+        [failed], [write], cumulative_changed_paths=set(),
+    )
+    assert filtered[0].status is ExecutionStatus.FAILED
+
+
+def test_filter_results_for_detector_demotes_probe_reads() -> None:
+    """A failed file.read whose target is also written this iteration → soft."""
+    from foundation.models import ExecutionResult, PlannedAction, ToolCall
+    from foundation.services.orchestrator import _filter_results_for_detector
+
+    probe = PlannedAction(
+        id="r1", kind=ActionKind.TOOL_CALL, summary="probe",
+        tool_call=ToolCall(
+            capability_id="foundation.file.read",
+            arguments={"path": "/abs/new.md"},
+        ),
+    )
+    write = PlannedAction(
+        id="w1", kind=ActionKind.TOOL_CALL, summary="write",
+        tool_call=ToolCall(
+            capability_id="foundation.file.write",
+            arguments={"path": "/abs/new.md", "content": "x"},
+        ),
+    )
+    probe_failed = ExecutionResult(
+        action_id="r1", status=ExecutionStatus.FAILED,
+        summary="missing", error="File not found.",
+    )
+    write_ok = ExecutionResult(
+        action_id="w1", status=ExecutionStatus.EXECUTED, summary="ok",
+    )
+    filtered = _filter_results_for_detector(
+        [probe_failed, write_ok], [probe, write],
+        cumulative_changed_paths=set(),
+    )
+    assert filtered[0].status is ExecutionStatus.NOT_EXECUTED
+    assert filtered[1].status is ExecutionStatus.EXECUTED
+
+
+def test_format_tool_call_log_entry_renders_path_and_message() -> None:
+    """The tool-call summary line is stable for the planner's history."""
+    from foundation.models import ToolCall
+    from foundation.services.orchestrator import _format_tool_call_log_entry
+
+    write_call = ToolCall(
+        capability_id="foundation.file.write",
+        arguments={"path": "/abs/notes.md", "content": "ignored"},
+    )
+    assert _format_tool_call_log_entry(write_call) == (
+        "tool_call:foundation.file.write path=/abs/notes.md"
+    )
+    commit_call = ToolCall(
+        capability_id="foundation.git.commit",
+        arguments={"message": "tighten greeting"},
+    )
+    assert _format_tool_call_log_entry(commit_call) == (
+        "tool_call:foundation.git.commit message=tighten greeting"
+    )
+
+
+def test_session_status_for_no_progress_with_cumulative_changes_is_completed() -> None:
+    """Soft completion: NO_PROGRESS + cumulative changes + no fatal → COMPLETED."""
+    from foundation.models import (
+        LoopStopReason,
+        OrchestrationSummary,
+        SessionStatus,
+    )
+
+    summary = OrchestrationSummary(
+        text="ran",
+        executed_actions=2,
+        pending_approval_actions=0,
+        blocked_actions=0,
+        failed_actions=0,
+        skipped_actions=0,
+        total_iterations=2,
+        total_actions_planned=2,
+    )
+    status = RequestOrchestrator._session_status_for_result(
+        summary,
+        LoopStopReason.NO_PROGRESS,
+        iterations=[],
+        cumulative_changed_paths=["/abs/notes.md"],
+        had_fatal=False,
+    )
+    assert status is SessionStatus.COMPLETED
+
+
+def test_session_status_for_no_progress_without_changes_is_inconclusive() -> None:
+    """NO_PROGRESS with no cumulative changes → COMPLETED_INCONCLUSIVE."""
+    from foundation.models import (
+        LoopStopReason,
+        OrchestrationSummary,
+        SessionStatus,
+    )
+
+    summary = OrchestrationSummary(
+        text="ran",
+        executed_actions=0,
+        pending_approval_actions=0,
+        blocked_actions=0,
+        failed_actions=2,
+        skipped_actions=0,
+        total_iterations=2,
+        total_actions_planned=2,
+    )
+    status = RequestOrchestrator._session_status_for_result(
+        summary,
+        LoopStopReason.NO_PROGRESS,
+        iterations=[],
+        cumulative_changed_paths=[],
+        had_fatal=False,
+    )
+    assert status is SessionStatus.COMPLETED_INCONCLUSIVE
+
+
+def test_orchestrator_soft_completion_replays_reference_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reference incident shape: write succeeds, idempotent re-write fails,
+    detector tolerates one repeat, second repeat → NO_PROGRESS but the
+    workspace already has the change, so status is COMPLETED."""
+    from foundation.models import (
+        LoopStopReason,
+        SessionStatus,
+    )
+
+    # Workspace is created by _orchestrator(); we just record the future
+    # target path so the stub responses can reference it.
+    target = tmp_path / "workspace" / "notes.md"
+
+    # iter 1: probe (read fails because file doesn't exist).
+    iter1_response = _provider_response({
+        "assistant_message": "Probing file.",
+        "actions": [
+            {
+                "id": "probe",
+                "kind": "tool_call",
+                "summary": "Read existing file",
+                "tool_call": {
+                    "capability_id": "foundation.file.read",
+                    "arguments": {"path": str(target)},
+                },
+            },
+        ],
+    })
+    # iter 2: write succeeds.
+    iter2_response = _provider_response({
+        "assistant_message": "Writing.",
+        "actions": [
+            {
+                "id": "write1",
+                "kind": "tool_call",
+                "summary": "Write file",
+                "tool_call": {
+                    "capability_id": "foundation.file.write",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "hello\n",
+                    },
+                },
+            },
+        ],
+    })
+    # iter 3: planner re-issues the write. FILE_EXISTS error.
+    iter3_response = _provider_response({
+        "assistant_message": "Writing again.",
+        "actions": [
+            {
+                "id": "write2",
+                "kind": "tool_call",
+                "summary": "Write file",
+                "tool_call": {
+                    "capability_id": "foundation.file.write",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "hello\n",
+                    },
+                },
+            },
+        ],
+    })
+    # iter 4+: same idempotent re-issue — detector trips (window=2).
+    iter4_response = _provider_response({
+        "assistant_message": "Writing again.",
+        "actions": [
+            {
+                "id": "write3",
+                "kind": "tool_call",
+                "summary": "Write file",
+                "tool_call": {
+                    "capability_id": "foundation.file.write",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "hello\n",
+                    },
+                },
+            },
+        ],
+    })
+    provider = StubProvider(
+        [iter1_response, iter2_response, iter3_response, iter4_response]
+    )
+    orchestrator, _runtime, ws = _orchestrator(
+        tmp_path, monkeypatch, provider,
+        approval_service=ApprovalService(mode=ApprovalMode.AUTO),
+    )
+    # _orchestrator created its own workspace; redirect the target into it.
+    target = ws / "notes.md"
+    for response in [iter1_response, iter2_response, iter3_response, iter4_response]:
+        for action in response.structured_output["actions"]:
+            action["tool_call"]["arguments"]["path"] = str(target)
+
+    result = orchestrator.orchestrate(UserRequest(message="rewrite the notes"))
+
+    # Workspace state reflects the user's intent.
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "hello\n"
+
+    # The loop stops cleanly. Either NO_PROGRESS (detector tripped) or
+    # ZERO_ACTION_PLAN (provider exhausted) is acceptable per stage 03.
+    assert result.stop_reason in (
+        LoopStopReason.NO_PROGRESS,
+        LoopStopReason.ZERO_ACTION_PLAN,
+    )
+
+    # Status is COMPLETED, not COMPLETED_INCONCLUSIVE.
+    summary_status = RequestOrchestrator._session_status_for_result(
+        result.summary,
+        result.stop_reason,
+        result.iterations,
+        result.governance_notice,
+    )
+    assert summary_status is SessionStatus.COMPLETED
+
+    # The soft-completion notice replaces the red "no progress" suffix.
+    if result.stop_reason is LoopStopReason.NO_PROGRESS:
+        assert "Run complete" in result.assistant_message.content
+        assert "no progress detected" not in result.assistant_message.content
 
 
 # ------------------------------------------------------------------
@@ -1458,3 +1850,512 @@ def test_single_iteration_emits_no_replanned_from_edge(
     assert len(replanned) <= 1
     for edge in replanned:
         assert edge.target_step_id.endswith(":2")
+
+
+# ---------------------------------------------------------------------------
+# Session-status classification (new in the v3-qa-tidy PR series)
+# ---------------------------------------------------------------------------
+
+
+def _status_for(
+    stop_reason: LoopStopReason | None,
+    *,
+    executed: int = 0,
+    pending: int = 0,
+    failed: int = 0,
+    blocked: int = 0,
+    skipped: int = 0,
+    iterations: list | None = None,
+) -> SessionStatus:
+    from foundation.models import OrchestrationSummary
+
+    summary = OrchestrationSummary(
+        executed_actions=executed,
+        pending_approval_actions=pending,
+        blocked_actions=blocked,
+        failed_actions=failed,
+        skipped_actions=skipped,
+        total_iterations=1,
+        total_actions_planned=executed + pending + failed + blocked + skipped,
+        text="test",
+    )
+    return RequestOrchestrator._session_status_for_result(
+        summary, stop_reason, iterations or [],
+    )
+
+
+def test_session_status_pending_approval_takes_precedence() -> None:
+    assert _status_for(
+        LoopStopReason.ZERO_ACTION_PLAN, executed=2, pending=1,
+    ) is SessionStatus.PENDING_APPROVAL
+
+
+def test_session_status_fatal_execution_failure_is_failed() -> None:
+    assert _status_for(
+        LoopStopReason.FATAL_EXECUTION_FAILURE, failed=1,
+    ) is SessionStatus.FAILED
+
+
+def test_session_status_zero_action_plan_with_intermediate_failure_is_completed() -> None:
+    # This is the recovery case: earlier iteration had a failure, the final
+    # iteration returned zero actions cleanly. The run is recorded as COMPLETED.
+    assert _status_for(
+        LoopStopReason.ZERO_ACTION_PLAN, executed=1, failed=1,
+    ) is SessionStatus.COMPLETED
+
+
+def test_session_status_zero_action_plan_clean_is_completed() -> None:
+    assert _status_for(
+        LoopStopReason.ZERO_ACTION_PLAN, executed=2,
+    ) is SessionStatus.COMPLETED
+
+
+def test_session_status_no_progress_is_inconclusive() -> None:
+    # Loop terminated because the planner kept making the same mistakes.
+    # The assistant delivered a final message; the run is not corrupt but
+    # also didn't satisfy the full request.
+    assert _status_for(
+        LoopStopReason.NO_PROGRESS, executed=1, failed=2,
+    ) is SessionStatus.COMPLETED_INCONCLUSIVE
+
+
+def test_session_status_max_iterations_with_clean_final_is_inconclusive() -> None:
+    from foundation.models import (
+        AssistantPlan,
+        ContextSnapshot,
+        OrchestrationIteration,
+        ProviderResponseMetadata,
+    )
+
+    context = ContextSnapshot(
+        workspace_root="/tmp/w", request_cwd="/tmp/w", approval_mode="prompt",
+    )
+    plan = AssistantPlan(assistant_message="ok", actions=[])
+    metadata = ProviderResponseMetadata(
+        provider="stub", model="stub", latency_seconds=0.0,
+    )
+    clean_iter = OrchestrationIteration(
+        iteration=1, context=context, plan=plan, planning_metadata=metadata,
+        execution_results=[],
+    )
+    assert _status_for(
+        LoopStopReason.MAX_ITERATIONS,
+        executed=3,
+        failed=2,  # earlier iterations failed
+        iterations=[clean_iter],
+    ) is SessionStatus.COMPLETED_INCONCLUSIVE
+
+
+def test_session_status_max_iterations_with_failed_final_is_failed() -> None:
+    from foundation.models import (
+        AssistantPlan,
+        ContextSnapshot,
+        ExecutionResult,
+        OrchestrationIteration,
+        ProviderResponseMetadata,
+    )
+
+    context = ContextSnapshot(
+        workspace_root="/tmp/w", request_cwd="/tmp/w", approval_mode="prompt",
+    )
+    plan = AssistantPlan(assistant_message="tried", actions=[])
+    metadata = ProviderResponseMetadata(
+        provider="stub", model="stub", latency_seconds=0.0,
+    )
+    failed_iter = OrchestrationIteration(
+        iteration=4, context=context, plan=plan, planning_metadata=metadata,
+        execution_results=[
+            ExecutionResult(
+                action_id="a1",
+                status=ExecutionStatus.FAILED,
+                summary="still failing",
+                error="boom",
+            )
+        ],
+    )
+    assert _status_for(
+        LoopStopReason.MAX_ITERATIONS,
+        failed=4,
+        iterations=[failed_iter],
+    ) is SessionStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Commit-approval runtime invariant
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("please commit the fix", True),
+        ("Fix and commit it", True),
+        ("stage and commit the change", True),
+        ("git commit", True),
+        ("committed the fix", True),
+        ("stop for approval", True),
+        ("approve the change", True),
+        ("show me the git status", False),
+        ("stage the required files", False),
+        ("just read the file", False),
+    ],
+)
+def test_has_commit_intent_heuristic(message: str, expected: bool) -> None:
+    assert RequestOrchestrator._has_commit_intent(message) is expected
+
+
+def test_session_status_governance_notice_forces_pending_approval() -> None:
+    from foundation.models import GovernanceNotice, GovernanceNoticeCode
+
+    notice = GovernanceNotice(
+        code=GovernanceNoticeCode.COMMIT_APPROVAL_MISSING,
+        message="no commit performed",
+        staged_paths=["src/pkg/__init__.py"],
+    )
+    assert RequestOrchestrator._session_status_for_result(
+        # A classification that would otherwise be COMPLETED:
+        summary=_build_summary_stub(executed=1),
+        stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
+        iterations=[],
+        governance_notice=notice,
+    ) is SessionStatus.PENDING_APPROVAL
+
+
+def _build_summary_stub(
+    *,
+    executed: int = 0,
+    pending: int = 0,
+    failed: int = 0,
+) -> Any:
+    from foundation.models import OrchestrationSummary
+
+    return OrchestrationSummary(
+        executed_actions=executed,
+        pending_approval_actions=pending,
+        blocked_actions=0,
+        failed_actions=failed,
+        skipped_actions=0,
+        total_iterations=1,
+        total_actions_planned=executed + pending + failed,
+        text="stub",
+    )
+
+
+def test_commit_approval_invariant_fires_when_staged_without_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: user asked to commit, model staged but forgot commit."""
+    import subprocess
+
+    from foundation.models import SessionStatus
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("hi\n", encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=workspace, check=True, capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "Tester")
+    git("add", ".")
+    git("commit", "-q", "-m", "seed")
+
+    target = workspace / "file.txt"
+    target.write_text("edited\n", encoding="utf-8")
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Staging the edit.",
+                    "actions": [
+                        {
+                            "id": "stage_it",
+                            "kind": "tool_call",
+                            "summary": "Stage the edit",
+                            "tool_call": {
+                                "capability_id": "foundation.git.stage",
+                                "arguments": {"paths": ["file.txt"]},
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
+    runtime = CountingShellRuntime(workspace_root=workspace)
+    tool_service = LocalToolService(
+        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+    )
+    orchestrator = RequestOrchestrator(
+        workspace_root=workspace,
+        approval_mode=ApprovalMode.AUTO,
+        provider=provider,
+        shell_runtime=runtime,
+        tool_service=tool_service,
+        history_store=history_store,
+    )
+
+    result = orchestrator.orchestrate(
+        UserRequest(message="please commit the edit"),
+    )
+
+    assert result.governance_notice is not None
+    assert result.governance_notice.code.value == "commit_approval_missing"
+    assert "file.txt" in result.governance_notice.staged_paths
+    sessions = history_store.list_sessions(limit=5)
+    assert sessions[0].status is SessionStatus.PENDING_APPROVAL
+
+
+def test_commit_approval_invariant_silent_without_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No commit intent → no governance notice, even with staged files."""
+    import subprocess
+
+    from foundation.models import SessionStatus
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("hi\n", encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=workspace, check=True, capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "Tester")
+    git("add", ".")
+    git("commit", "-q", "-m", "seed")
+
+    (workspace / "file.txt").write_text("edited\n", encoding="utf-8")
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Staging.",
+                    "actions": [
+                        {
+                            "id": "stage_it",
+                            "kind": "tool_call",
+                            "summary": "Stage the edit",
+                            "tool_call": {
+                                "capability_id": "foundation.git.stage",
+                                "arguments": {"paths": ["file.txt"]},
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
+    runtime = CountingShellRuntime(workspace_root=workspace)
+    tool_service = LocalToolService(
+        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+    )
+    orchestrator = RequestOrchestrator(
+        workspace_root=workspace,
+        approval_mode=ApprovalMode.AUTO,
+        provider=provider,
+        shell_runtime=runtime,
+        tool_service=tool_service,
+        history_store=history_store,
+    )
+
+    result = orchestrator.orchestrate(
+        UserRequest(message="just stage the edit for me"),
+    )
+
+    assert result.governance_notice is None
+    sessions = history_store.list_sessions(limit=5)
+    assert sessions[0].status is SessionStatus.COMPLETED
+
+
+def test_commit_approval_invariant_silent_when_commit_planned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commit intent present AND commit action planned → no notice."""
+    import subprocess
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("hi\n", encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=workspace, check=True, capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "Tester")
+    git("add", ".")
+    git("commit", "-q", "-m", "seed")
+
+    (workspace / "file.txt").write_text("edited\n", encoding="utf-8")
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Staging and committing.",
+                    "actions": [
+                        {
+                            "id": "stage_it",
+                            "kind": "tool_call",
+                            "summary": "Stage the edit",
+                            "tool_call": {
+                                "capability_id": "foundation.git.stage",
+                                "arguments": {"paths": ["file.txt"]},
+                            },
+                        },
+                        {
+                            "id": "commit_it",
+                            "kind": "tool_call",
+                            "summary": "Commit the edit",
+                            "requires_approval": True,
+                            "approval_reason": "commit requires approval",
+                            "tool_call": {
+                                "capability_id": "foundation.git.commit",
+                                "arguments": {"message": "edit file"},
+                            },
+                        },
+                    ],
+                }
+            )
+        ]
+    )
+    history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
+    runtime = CountingShellRuntime(workspace_root=workspace)
+    tool_service = LocalToolService(
+        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+    )
+    approval_service = ApprovalService(mode=ApprovalMode.AUTO_EXCEPT_COMMIT)
+    orchestrator = RequestOrchestrator(
+        workspace_root=workspace,
+        approval_mode=ApprovalMode.AUTO_EXCEPT_COMMIT,
+        provider=provider,
+        shell_runtime=runtime,
+        tool_service=tool_service,
+        approval_service=approval_service,
+        history_store=history_store,
+    )
+
+    result = orchestrator.orchestrate(
+        UserRequest(message="please commit the edit"),
+    )
+
+    # Commit was planned and is waiting on approval — no invariant intervention.
+    assert result.governance_notice is None
+    assert result.summary.pending_approval_actions == 1
+
+
+def test_commit_intent_zero_action_plan_is_repaired_to_commit_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When staged changes remain, zero-action completion is rejected and repaired."""
+    import subprocess
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("hi\n", encoding="utf-8")
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=workspace, check=True, capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "Tester")
+    git("add", ".")
+    git("commit", "-q", "-m", "seed")
+
+    (workspace / "file.txt").write_text("edited\n", encoding="utf-8")
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Staging the edit.",
+                    "actions": [
+                        {
+                            "id": "stage_it",
+                            "kind": "tool_call",
+                            "summary": "Stage the edit",
+                            "tool_call": {
+                                "capability_id": "foundation.git.stage",
+                                "arguments": {"paths": ["file.txt"]},
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "The fix is staged and ready for commit approval.",
+                    "actions": [],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "The fix is staged. I will pause for commit approval.",
+                    "actions": [
+                        {
+                            "id": "commit_it",
+                            "kind": "tool_call",
+                            "summary": "Commit the staged edit",
+                            "requires_approval": True,
+                            "approval_reason": "commit requires explicit approval",
+                            "tool_call": {
+                                "capability_id": "foundation.git.commit",
+                                "arguments": {"message": "edit file"},
+                            },
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
+    runtime = CountingShellRuntime(workspace_root=workspace)
+    tool_service = LocalToolService(
+        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+    )
+    orchestrator = RequestOrchestrator(
+        workspace_root=workspace,
+        approval_mode=ApprovalMode.AUTO_EXCEPT_COMMIT,
+        provider=provider,
+        shell_runtime=runtime,
+        tool_service=tool_service,
+        approval_service=ApprovalService(mode=ApprovalMode.AUTO_EXCEPT_COMMIT),
+        history_store=history_store,
+    )
+
+    result = orchestrator.orchestrate(
+        UserRequest(message="fix the file and stop for commit approval"),
+    )
+
+    assert len(provider.calls) == 3
+    assert result.stop_reason is LoopStopReason.PENDING_APPROVAL
+    assert result.governance_notice is None
+    assert result.summary.pending_approval_actions == 1
+    assert any(
+        action.tool_call is not None
+        and action.tool_call.capability_id == "foundation.git.commit"
+        and action.requires_approval
+        for action in result.iterations[-1].plan.actions
+    )

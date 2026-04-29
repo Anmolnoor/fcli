@@ -17,6 +17,8 @@ from pathlib import Path, PurePosixPath
 from pathspec import PathSpec
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator
 
+from foundation.services._env_scrub import scrub_ambient_env
+
 logger = logging.getLogger("foundation.services.tools")
 
 _DEFAULT_TIMEOUT_SECONDS = 30
@@ -379,11 +381,16 @@ class LocalToolService:
         default_timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
         capture_limit_kb: int = _DEFAULT_CAPTURE_LIMIT_KB,
         environment: Mapping[str, str] | None = None,
+        pass_through_foundation_env: bool = False,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._default_timeout_seconds = default_timeout_seconds
         self._capture_limit_bytes = capture_limit_kb * 1024
-        self._environment = os.environ.copy()
+        self._environment = (
+            os.environ.copy()
+            if pass_through_foundation_env
+            else scrub_ambient_env(os.environ)
+        )
         if environment is not None:
             self._environment.update(environment)
         self._binary_status = {spec.name: self._detect_binary(spec) for spec in _BINARY_SPECS}

@@ -259,6 +259,79 @@ def _log_path_check(settings: AppSettings) -> DoctorCheck:
     )
 
 
+def _events_log_check(settings: AppSettings) -> DoctorCheck:
+    if not settings.monitor.enabled:
+        return DoctorCheck(
+            name="Event log",
+            status=DoctorStatus.WARN,
+            summary="Persistent event log is disabled in settings.",
+            detail="Set monitor.enabled=true (or omit) to enable the NDJSON event log.",
+        )
+    events_dir = settings.monitor.events_dir
+    retention = settings.monitor.retention
+    detail_lines = [
+        f"events_dir: {events_dir}",
+        f"retention: max_sessions={retention.max_sessions} max_bytes={retention.max_bytes}",
+    ]
+    transports = settings.monitor.live_transports
+    if transports:
+        detail_lines.append(f"live transports configured: {','.join(transports)}")
+        if "unix" in transports and settings.monitor.socket_path is not None:
+            detail_lines.append(f"socket_path: {settings.monitor.socket_path}")
+        if "http" in transports and settings.monitor.http_port is not None:
+            detail_lines.append(f"http_port: {settings.monitor.http_port}")
+    else:
+        detail_lines.append(
+            "live transports: none (use --monitor-socket or --monitor-http to enable)"
+        )
+    session_count = 0
+    total_bytes = 0
+    if events_dir.exists():
+        if not events_dir.is_dir():
+            return DoctorCheck(
+                name="Event log",
+                status=DoctorStatus.FAIL,
+                summary="Configured events directory is not a directory.",
+                detail=f"{events_dir} exists but is not a directory.",
+            )
+        if not os.access(events_dir, os.W_OK):
+            return DoctorCheck(
+                name="Event log",
+                status=DoctorStatus.FAIL,
+                summary="Events directory is not writable.",
+                detail=f"Cannot write event logs under {events_dir}.",
+            )
+        for entry in events_dir.glob("*.ndjson"):
+            session_count += 1
+            try:
+                total_bytes += entry.stat().st_size
+            except OSError:
+                continue
+        detail_lines.append(
+            f"current usage: sessions={session_count} bytes={total_bytes}"
+        )
+        return DoctorCheck(
+            name="Event log",
+            status=DoctorStatus.PASS,
+            summary="Persistent event log directory is writable.",
+            detail="\n".join(detail_lines),
+        )
+    parent = _nearest_existing_parent(events_dir)
+    if os.access(parent, os.W_OK):
+        return DoctorCheck(
+            name="Event log",
+            status=DoctorStatus.WARN,
+            summary="Events directory is missing but creatable.",
+            detail="\n".join(detail_lines),
+        )
+    return DoctorCheck(
+        name="Event log",
+        status=DoctorStatus.FAIL,
+        summary="Events directory is blocked by filesystem permissions.",
+        detail=f"Cannot create events directory under {parent}.",
+    )
+
+
 def _secret_lookup_check(
     settings: AppSettings,
     *,
@@ -462,5 +535,6 @@ def run_doctor(
     checks.append(_secret_lookup_check(settings, environment=environment))
     checks.append(_database_health_check(settings))
     checks.append(_log_path_check(settings))
+    checks.append(_events_log_check(settings))
     checks.append(_capability_registry_check(settings, environment=environment))
     return DoctorReport(checks=checks)

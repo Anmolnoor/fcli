@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import NoReturn
 
 from foundation.models.git import (
     GitCommitRequest,
@@ -45,7 +46,7 @@ def _raise(
     detail: str | None = None,
     path: str | None = None,
     suggestion: str | None = None,
-) -> None:
+) -> NoReturn:
     raise GitServiceError(
         GitOperationError(
             code=code,

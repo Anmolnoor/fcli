@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -28,12 +28,14 @@ from foundation.models import (
     TraceEdgeKind,
 )
 from foundation.models.trace import ExecutionStep, PlanningStep
-from foundation.observability import emit_event, emit_exception
+from foundation.observability import emit_event, emit_exception, redact_payload
 from foundation.services.capabilities import SHELL_CAPABILITY_ID, CapabilityRegistry
 from foundation.services.guardrails import POLICY_SNAPSHOT_VERSION
 from foundation.services.history import HistoryStore
 
 logger = logging.getLogger("foundation.services.observer")
+
+EventSink = Callable[[str, Mapping[str, Any]], None]
 
 
 class ObserverService:
@@ -44,9 +46,25 @@ class ObserverService:
         *,
         history_store: HistoryStore | None,
         capability_registry: CapabilityRegistry,
+        event_sink: EventSink | None = None,
     ) -> None:
         self._history_store = history_store
         self._capability_registry = capability_registry
+        self._event_sink: EventSink | None = event_sink
+
+    def set_event_sink(self, event_sink: EventSink | None) -> None:
+        """Replace the event sink callback (or clear it with ``None``)."""
+        self._event_sink = event_sink
+
+    def _dispatch_to_sink(
+        self, event_name: str, payload: Mapping[str, Any]
+    ) -> None:
+        if self._event_sink is None:
+            return
+        try:
+            self._event_sink(event_name, payload)
+        except Exception:  # pragma: no cover - sink errors must not break runtime
+            logger.exception("event_sink raised; suppressing", extra={"event": event_name})
 
     def emit(
         self,
@@ -65,6 +83,11 @@ class ObserverService:
         )
         if self._history_store is not None and session_id is not None:
             self._history_store.record_event(session_id, event_name, dict(payload or {}))
+        if self._event_sink is not None:
+            redacted = redact_payload(payload)
+            if session_id is not None and "session_id" not in redacted:
+                redacted["session_id"] = session_id
+            self._dispatch_to_sink(event_name, redacted)
 
     def emit_exception(
         self,
@@ -83,11 +106,19 @@ class ObserverService:
             logger_name=logger_name,
             level=level,
         )
+        details: dict[str, object] = {
+            "error": str(exc),
+            "error_type": exc.__class__.__name__,
+        }
+        if payload:
+            details.update(payload)
         if self._history_store is not None and session_id is not None:
-            details = {"error": str(exc), "error_type": exc.__class__.__name__}
-            if payload:
-                details.update(payload)
             self._history_store.record_event(session_id, event_name, details)
+        if self._event_sink is not None:
+            redacted = redact_payload(details)
+            if session_id is not None and "session_id" not in redacted:
+                redacted["session_id"] = session_id
+            self._dispatch_to_sink(event_name, redacted)
 
     def record_planning_step(
         self,

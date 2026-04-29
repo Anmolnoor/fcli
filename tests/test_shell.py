@@ -296,3 +296,71 @@ def test_shell_args_preserve_mismatched_or_inner_quotes() -> None:
         "it's",
         "a'b",
     ]
+
+
+def test_foundation_env_vars_are_scrubbed_from_subprocess_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _workspace_root = _runtime(tmp_path)
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", "/leak/state")
+    monkeypatch.setenv("FOUNDATION_HISTORY__DATABASE_PATH", "/leak/history.db")
+    monkeypatch.setenv("UNRELATED_VAR", "keep-me")
+    request = _python_request(
+        """
+        import os
+        keys = sorted(k for k in os.environ if k.startswith("FOUNDATION_"))
+        print("foundation=" + ",".join(keys))
+        print("unrelated=" + os.environ.get("UNRELATED_VAR", ""))
+        """
+    )
+
+    result = runtime.execute(request)
+
+    assert result.exit_code == 0
+    assert "foundation=\n" in result.stdout
+    assert "unrelated=keep-me" in result.stdout
+
+
+def test_env_overlay_still_passes_through_foundation_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _workspace_root = _runtime(tmp_path)
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", "/leak/state")
+    request = _python_request(
+        """
+        import os
+        print(os.environ.get("FOUNDATION_APP__STATE_DIR", "<missing>"))
+        """,
+        env_overlay={"FOUNDATION_APP__STATE_DIR": "/explicit/state"},
+    )
+
+    result = runtime.execute(request)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "/explicit/state"
+
+
+def test_pass_through_foundation_env_restores_legacy_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    runtime = ShellRuntime(
+        workspace_root=workspace_root,
+        default_timeout_seconds=2,
+        max_timeout_seconds=10,
+        capture_limit_kb=64,
+        pass_through_foundation_env=True,
+    )
+    monkeypatch.setenv("FOUNDATION_APP__STATE_DIR", "/legacy/state")
+    request = _python_request(
+        """
+        import os
+        print(os.environ.get("FOUNDATION_APP__STATE_DIR", "<missing>"))
+        """
+    )
+
+    result = runtime.execute(request)
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "/legacy/state"

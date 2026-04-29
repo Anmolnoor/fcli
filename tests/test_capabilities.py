@@ -8,11 +8,13 @@ import pytest
 
 from foundation.models import (
     CapabilityHealth,
+    CapabilityId,
     CapabilityInstallSource,
     CapabilityKind,
     CapabilityManifest,
     CapabilityState,
     CapabilityTransport,
+    CapabilityVersion,
     RiskClass,
     TrustTier,
 )
@@ -132,8 +134,8 @@ def test_registry_supports_register_enable_disable_remove_and_version_resolution
     registry = _registry(tmp_path, monkeypatch)
 
     first = CapabilityManifest(
-        capability_id="user.echo",
-        version="1.0.0",
+        capability_id=CapabilityId(root="user.echo"),
+        version=CapabilityVersion(root="1.0.0"),
         kind=CapabilityKind.TOOL,
         name="User Echo",
         description="Execute one shell command through the shared shell runtime.",
@@ -152,8 +154,8 @@ def test_registry_supports_register_enable_disable_remove_and_version_resolution
         declared_side_effects=[],
     )
     second = CapabilityManifest(
-        capability_id="user.echo",
-        version="1.2.0",
+        capability_id=CapabilityId(root="user.echo"),
+        version=CapabilityVersion(root="1.2.0"),
         kind=CapabilityKind.TOOL,
         name="User Echo",
         description="Execute one shell command through the shared shell runtime.",

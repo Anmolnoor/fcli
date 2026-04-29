@@ -24,8 +24,8 @@ remain inspectable both in concise chat output and the full trace store.
 - **Typed git capabilities** — `foundation.git.{status,diff,show,log,stage,unstage,commit}`.
   Workspace-confined, porcelain v2 status parsing. Stage and unstage are
   auto-allowed; `commit` requires approval and never stages implicitly.
-- **Bounded replan loop.** Hard caps of 4 planning iterations × 5 actions per
-  iteration × 20 total actions per user turn, with six explicit stop reasons.
+- **Bounded replan loop.** Hard caps of 32 planning iterations × 40 actions per
+  iteration × 200 total actions per user turn, with six explicit stop reasons.
 - **Iteration-aware trace model.** `PlanningStep` and `ExecutionStep` carry
   `iteration_index`; step ids are scoped as `planning:{req}:{iter}` and
   `action:{req}:{iter}:{action_id}`; `TraceEdgeKind.REPLANNED_FROM` links the
