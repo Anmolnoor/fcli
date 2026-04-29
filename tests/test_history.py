@@ -145,7 +145,7 @@ def test_schema_v5_migration_rewrites_replan_edges_and_loads_old_steps(
     connection.row_factory = sqlite3.Row
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 5
+        assert version == 6
         edges = connection.execute(
             "SELECT edge_kind FROM trace_edges WHERE session_id = 'sess-legacy'"
         ).fetchall()
@@ -164,3 +164,87 @@ def test_schema_v5_migration_rewrites_replan_edges_and_loads_old_steps(
     legacy_step = trace.steps[0]
     assert legacy_step.step_type.value == "planning"
     assert legacy_step.iteration_index == 1
+
+
+def test_schema_v6_migration_keys_assistant_plans_per_iteration(
+    tmp_path: Path,
+) -> None:
+    """A v5 database with the legacy ``UNIQUE(session_id)`` shape rebuilds
+    cleanly under v6 with ``UNIQUE(session_id, iteration)`` and preserves
+    every per-iteration plan row.
+    """
+    database_path = tmp_path / "history.sqlite3"
+
+    # Build a v5-shaped DB by hand with the *old* unique constraint.
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                workspace_root TEXT NOT NULL,
+                request_cwd TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                plan_only INTEGER NOT NULL DEFAULT 0,
+                command_preview TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT
+            );
+            CREATE TABLE assistant_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                assistant_message TEXT NOT NULL,
+                context_json TEXT,
+                plan_json TEXT NOT NULL,
+                planning_metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id)
+            );
+            INSERT INTO sessions (id, kind, status, workspace_root, request_cwd,
+                                  approval_mode, started_at)
+            VALUES ('sess-legacy', 'chat', 'completed', '/ws', '/ws', 'prompt',
+                    '2026-01-01T00:00:00Z');
+            INSERT INTO assistant_plans (
+                session_id, iteration, assistant_message, plan_json,
+                planning_metadata_json, created_at
+            ) VALUES (
+                'sess-legacy', 1, 'iter-1', '{}', '{}', '2026-01-01T00:00:00Z'
+            );
+            """
+        )
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+    finally:
+        connection.close()
+
+    # Re-open: should run _migrate_to_v6 and rebuild the table.
+    HistoryStore(database_path=database_path)
+
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        # Existing row preserved.
+        rows = connection.execute(
+            "SELECT iteration, assistant_message FROM assistant_plans "
+            "WHERE session_id = 'sess-legacy' ORDER BY iteration"
+        ).fetchall()
+        assert [row["assistant_message"] for row in rows] == ["iter-1"]
+        # New per-iteration constraint accepts a second row.
+        connection.execute(
+            "INSERT INTO assistant_plans (session_id, iteration, "
+            "assistant_message, plan_json, planning_metadata_json, created_at) "
+            "VALUES ('sess-legacy', 2, 'iter-2', '{}', '{}', "
+            "'2026-01-01T00:00:01Z')"
+        )
+        connection.commit()
+        rows = connection.execute(
+            "SELECT iteration FROM assistant_plans "
+            "WHERE session_id = 'sess-legacy' ORDER BY iteration"
+        ).fetchall()
+        assert [row["iteration"] for row in rows] == [1, 2]
+    finally:
+        connection.close()

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import shlex
+import threading
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any
@@ -21,6 +24,7 @@ from typer.core import TyperGroup
 
 from foundation import __version__
 from foundation.doctor import DoctorReport, DoctorStatus, run_doctor
+from foundation.live_turn import LiveTurnRenderer, get_active_renderer, live_ux_disabled
 from foundation.logging import configure_logging
 from foundation.models import (
     ActionKind,
@@ -62,6 +66,14 @@ from foundation.models import (
     TraceSummary,
     UserRequest,
     VerificationOutcome,
+)
+from foundation.monitor import (
+    EventLogWriter,
+    LocalHttpSseTransport,
+    MonitorServer,
+    TransportStartError,
+    UnixSocketTransport,
+    compose_event_sink,
 )
 from foundation.services import (
     ApprovalService,
@@ -263,6 +275,10 @@ class CLIContext:
 
     config_path: Path | None = None
     overrides: dict[str, Any] = field(default_factory=dict)
+    disable_live_ux: bool = False
+    disable_monitor: bool = False
+    monitor_socket: str | None = None
+    monitor_http_port: int | None = None
 
 
 @dataclass(slots=True)
@@ -505,8 +521,15 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
         if budget_parts:
             lines.append(f"Constraints: [cyan]{escape(', '.join(budget_parts))}[/cyan]")
     panel_text = "\n".join(item for item in lines if item is not None)
-    console.print(Panel.fit(panel_text, title="Approval Required"))
-    return typer.confirm("Approve this action?", default=False)
+    renderer = get_active_renderer()
+    if renderer is not None:
+        renderer.pause()
+    try:
+        console.print(Panel.fit(panel_text, title="Approval Required"))
+        return typer.confirm("Approve this action?", default=False)
+    finally:
+        if renderer is not None:
+            renderer.resume()
 
 
 def _build_orchestrator(
@@ -1157,20 +1180,182 @@ def _execute_chat_request(
     plan_only: bool,
     approval_mode: ApprovalMode | None = None,
     shell_output_callback: Any | None = None,
+    disable_live_ux: bool = False,
+    disable_monitor: bool = False,
+    monitor_socket: str | None = None,
+    monitor_http_port: int | None = None,
 ) -> OrchestrationResult:
     orchestrator = _build_orchestrator(
         settings,
         approval_mode=approval_mode,
         shell_output_callback=shell_output_callback,
     )
-    return orchestrator.orchestrate(
-        UserRequest(
-            message=message,
-            conversation_history=list(conversation_history or []),
-            cwd=cwd,
-            plan_only=plan_only,
-        )
+    request = UserRequest(
+        message=message,
+        conversation_history=list(conversation_history or []),
+        cwd=cwd,
+        plan_only=plan_only,
     )
+    use_live_ux = not (disable_live_ux or live_ux_disabled())
+    use_monitor = settings.monitor.enabled and not disable_monitor
+    use_socket = monitor_socket is not None and use_monitor
+    use_http = monitor_http_port is not None and use_monitor
+    if not use_live_ux and not use_monitor:
+        return orchestrator.orchestrate(request)
+
+    monitor_server: MonitorServer | None = None
+    transports: list[Any] = []
+    if use_socket or use_http:
+        monitor_server = MonitorServer(
+            queue_size=settings.monitor.subscriber_queue_size
+        )
+        if use_socket:
+            socket_path = _resolve_monitor_socket_path(
+                settings, override=monitor_socket
+            )
+            try:
+                transports.append(
+                    UnixSocketTransport(path=socket_path, server=monitor_server)
+                )
+            except TransportStartError as exc:
+                console.print(f"[bold yellow]Monitor warning:[/bold yellow] {exc}")
+        if use_http:
+            token = _resolve_monitor_http_token(settings)
+            assert monitor_http_port is not None
+            try:
+                transports.append(
+                    LocalHttpSseTransport(
+                        port=monitor_http_port,
+                        token=token,
+                        server=monitor_server,
+                    )
+                )
+                console.print(
+                    f"[dim]Monitor HTTP transport listening on "
+                    f"127.0.0.1:{monitor_http_port}; bearer token: {token}[/dim]"
+                )
+            except TransportStartError as exc:
+                console.print(f"[bold yellow]Monitor warning:[/bold yellow] {exc}")
+    return _run_orchestrate_with_sinks(
+        orchestrator,
+        request,
+        use_live=use_live_ux,
+        writer=_build_event_log_writer(settings) if use_monitor else None,
+        monitor_server=monitor_server,
+        transports=transports,
+    )
+
+
+def _resolve_monitor_socket_path(
+    settings: AppSettings, *, override: str | None
+) -> Path:
+    if override:
+        return Path(override).expanduser()
+    if settings.monitor.socket_path is not None:
+        return settings.monitor.socket_path
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    return Path(runtime_dir).expanduser() / "foundation" / f"{os.getpid()}.sock"
+
+
+def _resolve_monitor_http_token(settings: AppSettings) -> str:
+    configured = settings.monitor.auth_token
+    if configured is not None:
+        token = configured.get_secret_value()
+        if token:
+            return token
+    import secrets
+
+    return secrets.token_urlsafe(24)
+
+
+def _build_event_log_writer(settings: AppSettings) -> EventLogWriter:
+    return EventLogWriter(
+        events_dir=settings.monitor.events_dir,
+        max_sessions=settings.monitor.retention.max_sessions,
+        max_bytes=settings.monitor.retention.max_bytes,
+    )
+
+
+def _run_orchestrate_with_sinks(
+    orchestrator: RequestOrchestrator,
+    request: UserRequest,
+    *,
+    use_live: bool,
+    writer: EventLogWriter | None,
+    monitor_server: MonitorServer | None = None,
+    transports: list[Any] | None = None,
+) -> OrchestrationResult:
+    set_sink = getattr(orchestrator, "set_event_sink", None)
+
+    def _attach_sink(sink: Any) -> None:
+        if callable(set_sink):
+            set_sink(sink)
+
+    transports = transports or []
+
+    def _build_sinks(extra: list[Any] | None = None) -> list[Any]:
+        sinks: list[Any] = list(extra or [])
+        if writer is not None:
+            sinks.append(writer.write_event)
+        if monitor_server is not None:
+            sinks.append(monitor_server.publish)
+        return sinks
+
+    writer_ctx: Any = writer if writer is not None else _NullContext()
+    server_ctx: Any = monitor_server if monitor_server is not None else _NullContext()
+    transport_stack: list[Any] = []
+    try:
+        for transport in transports:
+            transport.start()
+            transport_stack.append(transport)
+        with writer_ctx, server_ctx:
+            if not use_live:
+                _attach_sink(compose_event_sink(*_build_sinks()))
+                try:
+                    return orchestrator.orchestrate(request)
+                finally:
+                    _attach_sink(None)
+
+            result_box: dict[str, Any] = {}
+
+            def worker() -> None:
+                try:
+                    result_box["result"] = orchestrator.orchestrate(request)
+                except BaseException as exc:  # noqa: BLE001 - re-raised on main thread
+                    result_box["error"] = exc
+
+            with LiveTurnRenderer(console=console) as renderer:
+                _attach_sink(
+                    compose_event_sink(*_build_sinks([renderer.on_event]))
+                )
+                try:
+                    thread = threading.Thread(
+                        target=worker, name="fcli-orchestrate", daemon=True
+                    )
+                    thread.start()
+                    try:
+                        renderer.drain_until_finished(worker=thread)
+                    except KeyboardInterrupt:
+                        thread.join(timeout=5.0)
+                        raise
+                finally:
+                    _attach_sink(None)
+
+        if "error" in result_box:
+            raise result_box["error"]
+        return result_box["result"]
+    finally:
+        for transport in reversed(transport_stack):
+            with suppress(Exception):
+                transport.close()
+
+
+class _NullContext:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
 
 
 def _build_transcript_assistant_message(result: OrchestrationResult) -> str:
@@ -1206,6 +1391,10 @@ def _run_interactive_chat(
     plan_only: bool,
     render_mode: RenderMode,
     resume_target: ResumeTarget,
+    disable_live_ux: bool = False,
+    disable_monitor: bool = False,
+    monitor_socket: str | None = None,
+    monitor_http_port: int | None = None,
 ) -> None:
     try:
         prompt_session = _build_chat_prompt_session(settings)
@@ -1489,6 +1678,10 @@ def _run_interactive_chat(
                 plan_only=plan_only,
                 approval_mode=state.approval_mode,
                 shell_output_callback=_emit_output_event,
+                disable_live_ux=disable_live_ux,
+                disable_monitor=disable_monitor,
+                monitor_socket=monitor_socket,
+                monitor_http_port=monitor_http_port,
             )
         except ProviderError as exc:
             console.print(f"[bold red]Provider error:[/bold red] {exc}")
@@ -2598,6 +2791,49 @@ def callback(
             help="Force debug logging for this invocation.",
         ),
     ] = False,
+    no_live: Annotated[
+        bool,
+        typer.Option(
+            "--no-live",
+            help="Disable the in-turn live status widget.",
+        ),
+    ] = False,
+    no_monitor: Annotated[
+        bool,
+        typer.Option(
+            "--no-monitor",
+            help="Disable the persistent NDJSON event log for this invocation.",
+        ),
+    ] = False,
+    events_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--events-dir",
+            help="Override the events directory for the persistent NDJSON event log.",
+        ),
+    ] = None,
+    monitor_socket: Annotated[
+        str | None,
+        typer.Option(
+            "--monitor-socket",
+            help=(
+                "Enable the live Unix-socket monitor transport. Pass a path "
+                "to override the default ${TMPDIR}/foundation/<pid>.sock."
+            ),
+        ),
+    ] = None,
+    monitor_http: Annotated[
+        int | None,
+        typer.Option(
+            "--monitor-http",
+            min=1,
+            max=65535,
+            help=(
+                "Enable the live HTTP/SSE monitor transport on the given "
+                "localhost port. A bearer token is printed at startup."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Foundation CLI — local-first, shell-native coding agent.
 
@@ -2624,7 +2860,30 @@ def callback(
     if debug:
         _nested_override(overrides, "logging.level", LogLevel.DEBUG)
 
-    ctx.obj = CLIContext(config_path=config_path, overrides=overrides)
+    if events_dir is not None:
+        _nested_override(overrides, "monitor.events_dir", events_dir)
+    env_monitor = os.environ.get("FOUNDATION_MONITOR", "").strip().lower()
+    monitor_env_off = env_monitor in {"0", "false", "no", "off"}
+    env_socket = os.environ.get("FOUNDATION_MONITOR_SOCKET", "").strip()
+    env_http = os.environ.get("FOUNDATION_MONITOR_HTTP", "").strip()
+    resolved_socket = monitor_socket
+    if resolved_socket is None and env_socket:
+        # Empty/"1" → default-path; non-empty → explicit override.
+        resolved_socket = "" if env_socket in {"1", "true", "yes", "on"} else env_socket
+    resolved_http_port = monitor_http
+    if resolved_http_port is None and env_http:
+        try:
+            resolved_http_port = int(env_http)
+        except ValueError:
+            pass
+    ctx.obj = CLIContext(
+        config_path=config_path,
+        overrides=overrides,
+        disable_live_ux=no_live,
+        disable_monitor=no_monitor or monitor_env_off,
+        monitor_socket=resolved_socket,
+        monitor_http_port=resolved_http_port,
+    )
     configure_logging(LogLevel.DEBUG.value if debug else LogLevel.WARNING.value)
 
 
@@ -2903,12 +3162,17 @@ def chat(
                 console.print(f"[bold red]Chat error:[/bold red] {exc}")
                 raise typer.Exit(code=2) from exc
             resume_target = ResumeTarget.explicit(new_state.session_id)
+        cli_ctx = ctx.obj if isinstance(ctx.obj, CLIContext) else None
         _run_interactive_chat(
             settings,
             initial_cwd=initial_cwd,
             plan_only=plan_only,
             render_mode=render_mode,
             resume_target=resume_target,
+            disable_live_ux=bool(cli_ctx and cli_ctx.disable_live_ux),
+            disable_monitor=bool(cli_ctx and cli_ctx.disable_monitor),
+            monitor_socket=cli_ctx.monitor_socket if cli_ctx else None,
+            monitor_http_port=cli_ctx.monitor_http_port if cli_ctx else None,
         )
         return
 
@@ -2919,12 +3183,17 @@ def chat(
         )
         raise typer.Exit(code=2)
 
+    cli_ctx = ctx.obj if isinstance(ctx.obj, CLIContext) else None
     try:
         result = _execute_chat_request(
             settings,
             message=request_text,
             cwd=cwd,
             plan_only=plan_only,
+            disable_live_ux=bool(cli_ctx and cli_ctx.disable_live_ux),
+            disable_monitor=bool(cli_ctx and cli_ctx.disable_monitor),
+            monitor_socket=cli_ctx.monitor_socket if cli_ctx else None,
+            monitor_http_port=cli_ctx.monitor_http_port if cli_ctx else None,
         )
     except ProviderError as exc:
         console.print(f"[bold red]Provider error:[/bold red] {exc}")

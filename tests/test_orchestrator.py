@@ -379,7 +379,11 @@ def test_orchestrator_blocks_out_of_workspace_shell_reads(
                             "kind": "shell",
                             "summary": "Read a file outside the workspace",
                             "shell": {
-                                "command": "cat",
+                                # `head` keeps the test focused on the
+                                # workspace-confinement policy check; `cat`
+                                # is now planner-rejected as a typed-capability
+                                # equivalent.
+                                "command": "head",
                                 "args": [str(outside_path)],
                             },
                         }
@@ -1397,6 +1401,337 @@ def test_no_progress_detector_not_stuck_with_changes() -> None:
 
     assert detector.is_stuck([result], [], [action]) is False
     assert detector.is_stuck([result], ["file.py"], [action]) is False
+
+
+# ------------------------------------------------------------------
+# v4 Stage 03: detector + observation + status mapping
+# ------------------------------------------------------------------
+
+
+def test_detector_window_two_requires_two_consecutive_repeats() -> None:
+    """A single repeat does not trip stuck; two in a row does."""
+    from foundation.models import ExecutionResult, PlannedAction, ShellAction
+
+    detector = NoProgressDetector()
+    action = PlannedAction(
+        id="a", kind=ActionKind.SHELL, summary="run",
+        shell=ShellAction(command="false"),
+    )
+    fail = ExecutionResult(
+        action_id="a", status=ExecutionStatus.FAILED,
+        summary="boom", error="Exit code 1",
+    )
+    # iter 1: first failure observed; window not yet full → not stuck.
+    assert detector.is_stuck([fail], [], [action]) is False
+    # iter 2: second identical failure → window=2 satisfied → stuck.
+    assert detector.is_stuck([fail], [], [action]) is True
+
+
+def test_detector_cumulative_changes_suppresses_stuck() -> None:
+    """Earlier-iteration progress should never declare the loop stuck."""
+    from foundation.models import ExecutionResult, PlannedAction, ShellAction
+
+    detector = NoProgressDetector()
+    action = PlannedAction(
+        id="a", kind=ActionKind.SHELL, summary="run",
+        shell=ShellAction(command="false"),
+    )
+    fail = ExecutionResult(
+        action_id="a", status=ExecutionStatus.FAILED,
+        summary="boom", error="Exit code 1",
+    )
+    detector.is_stuck([fail], [], [action])
+    # Even with the second identical failure, cumulative changes prevent stuck.
+    assert (
+        detector.is_stuck(
+            [fail], [], [action],
+            cumulative_changed_paths=["edited.py"],
+        )
+        is False
+    )
+
+
+def test_filter_results_for_detector_demotes_file_exists_after_prior_write() -> None:
+    """A FILE_EXISTS error on a path already in the cumulative set is soft."""
+    from foundation.models import ExecutionResult, PlannedAction, ToolCall
+    from foundation.services.orchestrator import _filter_results_for_detector
+
+    write = PlannedAction(
+        id="w1", kind=ActionKind.TOOL_CALL, summary="rewrite",
+        tool_call=ToolCall(
+            capability_id="foundation.file.write",
+            arguments={"path": "/abs/notes.md", "content": "x"},
+        ),
+    )
+    failed = ExecutionResult(
+        action_id="w1", status=ExecutionStatus.FAILED,
+        summary="exists",
+        error="File already exists. Set overwrite=true to replace it.",
+    )
+    filtered = _filter_results_for_detector(
+        [failed], [write],
+        cumulative_changed_paths={"/abs/notes.md"},
+    )
+    assert filtered[0].status is ExecutionStatus.NOT_EXECUTED
+
+
+def test_filter_results_for_detector_keeps_real_failures() -> None:
+    """An error on a path *not* yet in cumulative changes stays a failure."""
+    from foundation.models import ExecutionResult, PlannedAction, ToolCall
+    from foundation.services.orchestrator import _filter_results_for_detector
+
+    write = PlannedAction(
+        id="w1", kind=ActionKind.TOOL_CALL, summary="rewrite",
+        tool_call=ToolCall(
+            capability_id="foundation.file.write",
+            arguments={"path": "/abs/notes.md"},
+        ),
+    )
+    failed = ExecutionResult(
+        action_id="w1", status=ExecutionStatus.FAILED,
+        summary="exists",
+        error="File already exists. Set overwrite=true to replace it.",
+    )
+    filtered = _filter_results_for_detector(
+        [failed], [write], cumulative_changed_paths=set(),
+    )
+    assert filtered[0].status is ExecutionStatus.FAILED
+
+
+def test_filter_results_for_detector_demotes_probe_reads() -> None:
+    """A failed file.read whose target is also written this iteration → soft."""
+    from foundation.models import ExecutionResult, PlannedAction, ToolCall
+    from foundation.services.orchestrator import _filter_results_for_detector
+
+    probe = PlannedAction(
+        id="r1", kind=ActionKind.TOOL_CALL, summary="probe",
+        tool_call=ToolCall(
+            capability_id="foundation.file.read",
+            arguments={"path": "/abs/new.md"},
+        ),
+    )
+    write = PlannedAction(
+        id="w1", kind=ActionKind.TOOL_CALL, summary="write",
+        tool_call=ToolCall(
+            capability_id="foundation.file.write",
+            arguments={"path": "/abs/new.md", "content": "x"},
+        ),
+    )
+    probe_failed = ExecutionResult(
+        action_id="r1", status=ExecutionStatus.FAILED,
+        summary="missing", error="File not found.",
+    )
+    write_ok = ExecutionResult(
+        action_id="w1", status=ExecutionStatus.EXECUTED, summary="ok",
+    )
+    filtered = _filter_results_for_detector(
+        [probe_failed, write_ok], [probe, write],
+        cumulative_changed_paths=set(),
+    )
+    assert filtered[0].status is ExecutionStatus.NOT_EXECUTED
+    assert filtered[1].status is ExecutionStatus.EXECUTED
+
+
+def test_format_tool_call_log_entry_renders_path_and_message() -> None:
+    """The tool-call summary line is stable for the planner's history."""
+    from foundation.models import ToolCall
+    from foundation.services.orchestrator import _format_tool_call_log_entry
+
+    write_call = ToolCall(
+        capability_id="foundation.file.write",
+        arguments={"path": "/abs/notes.md", "content": "ignored"},
+    )
+    assert _format_tool_call_log_entry(write_call) == (
+        "tool_call:foundation.file.write path=/abs/notes.md"
+    )
+    commit_call = ToolCall(
+        capability_id="foundation.git.commit",
+        arguments={"message": "tighten greeting"},
+    )
+    assert _format_tool_call_log_entry(commit_call) == (
+        "tool_call:foundation.git.commit message=tighten greeting"
+    )
+
+
+def test_session_status_for_no_progress_with_cumulative_changes_is_completed() -> None:
+    """Soft completion: NO_PROGRESS + cumulative changes + no fatal → COMPLETED."""
+    from foundation.models import (
+        LoopStopReason,
+        OrchestrationSummary,
+        SessionStatus,
+    )
+
+    summary = OrchestrationSummary(
+        text="ran",
+        executed_actions=2,
+        pending_approval_actions=0,
+        blocked_actions=0,
+        failed_actions=0,
+        skipped_actions=0,
+        total_iterations=2,
+        total_actions_planned=2,
+    )
+    status = RequestOrchestrator._session_status_for_result(
+        summary,
+        LoopStopReason.NO_PROGRESS,
+        iterations=[],
+        cumulative_changed_paths=["/abs/notes.md"],
+        had_fatal=False,
+    )
+    assert status is SessionStatus.COMPLETED
+
+
+def test_session_status_for_no_progress_without_changes_is_inconclusive() -> None:
+    """NO_PROGRESS with no cumulative changes → COMPLETED_INCONCLUSIVE."""
+    from foundation.models import (
+        LoopStopReason,
+        OrchestrationSummary,
+        SessionStatus,
+    )
+
+    summary = OrchestrationSummary(
+        text="ran",
+        executed_actions=0,
+        pending_approval_actions=0,
+        blocked_actions=0,
+        failed_actions=2,
+        skipped_actions=0,
+        total_iterations=2,
+        total_actions_planned=2,
+    )
+    status = RequestOrchestrator._session_status_for_result(
+        summary,
+        LoopStopReason.NO_PROGRESS,
+        iterations=[],
+        cumulative_changed_paths=[],
+        had_fatal=False,
+    )
+    assert status is SessionStatus.COMPLETED_INCONCLUSIVE
+
+
+def test_orchestrator_soft_completion_replays_reference_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reference incident shape: write succeeds, idempotent re-write fails,
+    detector tolerates one repeat, second repeat → NO_PROGRESS but the
+    workspace already has the change, so status is COMPLETED."""
+    from foundation.models import (
+        LoopStopReason,
+        SessionStatus,
+    )
+
+    # Workspace is created by _orchestrator(); we just record the future
+    # target path so the stub responses can reference it.
+    target = tmp_path / "workspace" / "notes.md"
+
+    # iter 1: probe (read fails because file doesn't exist).
+    iter1_response = _provider_response({
+        "assistant_message": "Probing file.",
+        "actions": [
+            {
+                "id": "probe",
+                "kind": "tool_call",
+                "summary": "Read existing file",
+                "tool_call": {
+                    "capability_id": "foundation.file.read",
+                    "arguments": {"path": str(target)},
+                },
+            },
+        ],
+    })
+    # iter 2: write succeeds.
+    iter2_response = _provider_response({
+        "assistant_message": "Writing.",
+        "actions": [
+            {
+                "id": "write1",
+                "kind": "tool_call",
+                "summary": "Write file",
+                "tool_call": {
+                    "capability_id": "foundation.file.write",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "hello\n",
+                    },
+                },
+            },
+        ],
+    })
+    # iter 3: planner re-issues the write. FILE_EXISTS error.
+    iter3_response = _provider_response({
+        "assistant_message": "Writing again.",
+        "actions": [
+            {
+                "id": "write2",
+                "kind": "tool_call",
+                "summary": "Write file",
+                "tool_call": {
+                    "capability_id": "foundation.file.write",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "hello\n",
+                    },
+                },
+            },
+        ],
+    })
+    # iter 4+: same idempotent re-issue — detector trips (window=2).
+    iter4_response = _provider_response({
+        "assistant_message": "Writing again.",
+        "actions": [
+            {
+                "id": "write3",
+                "kind": "tool_call",
+                "summary": "Write file",
+                "tool_call": {
+                    "capability_id": "foundation.file.write",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "hello\n",
+                    },
+                },
+            },
+        ],
+    })
+    provider = StubProvider(
+        [iter1_response, iter2_response, iter3_response, iter4_response]
+    )
+    orchestrator, _runtime, ws = _orchestrator(
+        tmp_path, monkeypatch, provider,
+        approval_service=ApprovalService(mode=ApprovalMode.AUTO),
+    )
+    # _orchestrator created its own workspace; redirect the target into it.
+    target = ws / "notes.md"
+    for response in [iter1_response, iter2_response, iter3_response, iter4_response]:
+        for action in response.structured_output["actions"]:
+            action["tool_call"]["arguments"]["path"] = str(target)
+
+    result = orchestrator.orchestrate(UserRequest(message="rewrite the notes"))
+
+    # Workspace state reflects the user's intent.
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "hello\n"
+
+    # The loop stops cleanly. Either NO_PROGRESS (detector tripped) or
+    # ZERO_ACTION_PLAN (provider exhausted) is acceptable per stage 03.
+    assert result.stop_reason in (
+        LoopStopReason.NO_PROGRESS,
+        LoopStopReason.ZERO_ACTION_PLAN,
+    )
+
+    # Status is COMPLETED, not COMPLETED_INCONCLUSIVE.
+    summary_status = RequestOrchestrator._session_status_for_result(
+        result.summary,
+        result.stop_reason,
+        result.iterations,
+        result.governance_notice,
+    )
+    assert summary_status is SessionStatus.COMPLETED
+
+    # The soft-completion notice replaces the red "no progress" suffix.
+    if result.stop_reason is LoopStopReason.NO_PROGRESS:
+        assert "Run complete" in result.assistant_message.content
+        assert "no progress detected" not in result.assistant_message.content
 
 
 # ------------------------------------------------------------------

@@ -131,6 +131,11 @@ def default_history_database_path() -> Path:
     return default_state_dir() / "history.sqlite3"
 
 
+def default_events_dir() -> Path:
+    """Return the default directory for the per-session NDJSON event log."""
+    return default_state_dir() / "events"
+
+
 class LogLevel(StrEnum):
     """Supported logging levels."""
 
@@ -347,6 +352,61 @@ class ApprovalSection(BaseModel):
     require_outside_workspace: bool = True
 
 
+class MonitorRetentionSection(BaseModel):
+    """Retention caps for the persistent NDJSON event log."""
+
+    max_sessions: int = Field(default=200, ge=1)
+    max_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
+
+
+class MonitorSection(BaseModel):
+    """v4 Stage 2 — persistent NDJSON event log + optional live transports."""
+
+    enabled: bool = True
+    events_dir: Path = Field(default_factory=default_events_dir)
+    retention: MonitorRetentionSection = Field(default_factory=MonitorRetentionSection)
+    flush_interval_ms: int = Field(default=200, ge=10)
+    subscriber_queue_size: int = Field(default=1024, ge=16)
+    live_transports: list[str] = Field(default_factory=list)
+    socket_path: Path | None = None
+    http_port: int | None = Field(default=None, ge=1, le=65535)
+    auth_token: SecretStr | None = None
+
+    @field_validator("events_dir", mode="before")
+    @classmethod
+    def _expand_events_dir(cls, value: Any) -> Any:
+        if isinstance(value, str | os.PathLike):
+            return Path(os.fspath(value)).expanduser()
+        return value
+
+    @field_validator("socket_path", mode="before")
+    @classmethod
+    def _expand_socket_path(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str | os.PathLike):
+            return Path(os.fspath(value)).expanduser()
+        return value
+
+    @field_validator("live_transports", mode="before")
+    @classmethod
+    def _normalize_live_transports(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        normalized: list[str] = []
+        for item in value:
+            text = str(item).strip().lower()
+            if text in {"unix", "http"} and text not in normalized:
+                normalized.append(text)
+            elif text and text not in {"unix", "http"}:
+                raise ValueError(
+                    f"Unsupported monitor live transport: {text!r}"
+                )
+        return normalized
+
+
 class AppSettings(BaseSettings):
     """Effective application settings for Foundation CLI."""
 
@@ -356,6 +416,7 @@ class AppSettings(BaseSettings):
     logging: LoggingSection = Field(default_factory=LoggingSection)
     history: HistorySection = Field(default_factory=HistorySection)
     approval: ApprovalSection = Field(default_factory=ApprovalSection)
+    monitor: MonitorSection = Field(default_factory=MonitorSection)
 
     model_config = SettingsConfigDict(
         env_prefix=ENV_PREFIX,
@@ -378,6 +439,8 @@ class AppSettings(BaseSettings):
             self.history.database_path = (
                 self.app.state_dir / "history.sqlite3"
             ).resolve()
+        if "events_dir" not in self.monitor.model_fields_set:
+            self.monitor.events_dir = (self.app.state_dir / "events").resolve()
         return self
 
     _toml_file_path: ClassVar[Path | None] = None
@@ -455,6 +518,7 @@ class AppSettings(BaseSettings):
             "state_dir": str(self.app.state_dir),
             "log_dir": str(self.app.log_dir),
             "history_database": str(self.history.database_path),
+            "events_dir": str(self.monitor.events_dir),
         }
 
     def metadata_dump(self) -> dict[str, Any]:

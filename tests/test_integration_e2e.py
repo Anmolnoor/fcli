@@ -184,6 +184,8 @@ def _full_workflow_plan(workspace: Path) -> dict[str, Any]:
                 "id": "commit_it",
                 "kind": "tool_call",
                 "summary": "Commit the staged edit",
+                "requires_approval": True,
+                "approval_reason": "Commits are gated by the v3 commit-approval invariant.",
                 "tool_call": {
                     "capability_id": "foundation.git.commit",
                     "arguments": {

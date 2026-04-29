@@ -38,11 +38,11 @@ Stages 01, 02, and 03 are independent of each other and may land in any order; t
 
 ## Stage Sequence
 
-| Stage | Outcome | Blocks Next Stage Until | Primary Artifact |
+| Stage | Outcome | Status | Primary Artifact |
 | --- | --- | --- | --- |
-| 01 | Pressing enter on a request shows a live status line and `?`-expandable detail; turn end returns to normal rendering. | Live widget renders reliably across interactive + one-shot modes, gracefully disables on non-TTY, and cleanly handles approvals and Ctrl-C. | `LiveTurnRenderer` + `ObserverService.event_sink` hook |
-| 02 | Every session writes a redacted NDJSON event log to disk by default; optional live Unix-socket / HTTP-SSE transports let monitors subscribe to a running fcli. | Schema stability, on-disk redaction guarantee, retention policy, authentication story for live transports, graceful start/stop. | `EventLogWriter` + sessions index + `MonitorServer` (optional live) + Unix and HTTP/SSE transports + `docs/monitor-protocol.md` |
-| 03 | Successful turns are no longer misclassified as failed by the no-progress detector; idempotent re-plans count as completed work. | Reference-incident session replays as `COMPLETED`; cumulative-change progress survives a full bounded loop; history schema v6 migration is clean. | Updated `NoProgressDetector` + tool-call observation + `_session_status_for_result` + history schema v6 |
+| 01 | Pressing enter on a request shows a live status line and `?`-expandable detail; turn end returns to normal rendering. | **shipped** | `LiveTurnRenderer` + `ObserverService.event_sink` hook |
+| 02 | Every session writes a redacted NDJSON event log to disk by default; optional live Unix-socket / HTTP-SSE transports let monitors subscribe to a running fcli. | **shipped** | `EventLogWriter` + sessions index + `MonitorServer` + Unix and HTTP/SSE transports + `docs/monitor-protocol.md` + README disclosure |
+| 03 | Successful turns are no longer misclassified as failed by the no-progress detector; idempotent re-plans count as completed work. | **shipped** | `NoProgressDetector(window=2)` + cumulative changes + soft-failure classifier + probe tagging + tool-call entries in observation + `_session_status_for_result` soft-completion mapping + history schema v6 migration |
 
 ## Cross-Stage Rules
 

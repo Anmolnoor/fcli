@@ -401,7 +401,13 @@ class PlannerService:
             if not isinstance(entry, dict):
                 continue
             index_status = entry.get("index_status")
-            if isinstance(index_status, str) and index_status.strip():
+            if not isinstance(index_status, str):
+                continue
+            stripped = index_status.strip()
+            # Treat untracked (`?`) and ignored (`!`) entries as not-staged.
+            # A clean index reports a single space; only real index ops
+            # (M / A / D / R / C / U) constitute "staged changes".
+            if stripped and stripped not in {"?", "!"}:
                 return True
         return False
 

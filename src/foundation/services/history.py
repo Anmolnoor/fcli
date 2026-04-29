@@ -36,7 +36,7 @@ from foundation.observability import redact_payload
 
 logger = logging.getLogger("foundation.services.history")
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _DEFAULT_MAX_BLOB_BYTES = 64 * 1024
 
 _SCHEMA_SQL = """
@@ -1351,6 +1351,8 @@ class HistoryStore:
                 self._migrate_to_v4(connection)
             if current_version < 5:
                 self._migrate_to_v5(connection)
+            if current_version < 6:
+                self._migrate_to_v6(connection)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @staticmethod
@@ -1380,6 +1382,72 @@ class HistoryStore:
         connection.execute(
             "UPDATE trace_edges SET edge_kind = 'replanned_from' "
             "WHERE edge_kind = 'replan'"
+        )
+
+    @staticmethod
+    def _migrate_to_v6(connection: sqlite3.Connection) -> None:
+        """Migrate v5 → v6: ensure ``assistant_plans`` is keyed per iteration.
+
+        Pre-v6 databases that were upgraded from v3 may carry the older
+        ``UNIQUE(session_id)`` constraint on ``assistant_plans`` even though
+        the v4 migration added an ``iteration`` column. That meant only the
+        latest iteration's plan was preserved per session. v6 rebuilds the
+        table with ``UNIQUE(session_id, iteration)`` so per-iteration plans
+        are inspectable for the first time.
+        """
+        # Cheapest probe: try to insert a duplicate sentinel pair under the
+        # same session_id with a different iteration. If the existing schema
+        # already enforces (session_id, iteration) the duplicate-row insert
+        # we simulate via DDL inspection is unnecessary — we always rebuild
+        # to guarantee the constraint shape.
+        existing_indices = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list('assistant_plans')"
+            ).fetchall()
+        }
+        # If a unique index over both columns is already in place, no
+        # rebuild is required.
+        already_correct = False
+        for index_name in existing_indices:
+            cols = [
+                row[2]
+                for row in connection.execute(
+                    f"PRAGMA index_info('{index_name}')"
+                ).fetchall()
+            ]
+            if cols == ["session_id", "iteration"]:
+                already_correct = True
+                break
+        if already_correct:
+            return
+
+        connection.executescript(
+            """
+            CREATE TABLE assistant_plans_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                assistant_message TEXT NOT NULL,
+                context_json TEXT,
+                plan_json TEXT NOT NULL,
+                planning_metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, iteration)
+            );
+
+            INSERT INTO assistant_plans_new (
+                id, session_id, iteration, assistant_message,
+                context_json, plan_json, planning_metadata_json, created_at
+            )
+            SELECT
+                id, session_id, iteration, assistant_message,
+                context_json, plan_json, planning_metadata_json, created_at
+            FROM assistant_plans;
+
+            DROP TABLE assistant_plans;
+            ALTER TABLE assistant_plans_new RENAME TO assistant_plans;
+            """
         )
 
     def _encode_json_blob(self, payload: object) -> str:
