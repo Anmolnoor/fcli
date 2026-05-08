@@ -30,3 +30,6 @@ htmlcov/
 # Local app state
 .foundation/
 logs/
+
+# Launch drafts (LinkedIn / X / blog) — not for commit
+launch/

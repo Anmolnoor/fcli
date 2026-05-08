@@ -1,5 +1,9 @@
 # Foundation CLI
 
+[![CI](https://github.com/Anmolnoor/fcli/actions/workflows/ci.yml/badge.svg)](https://github.com/Anmolnoor/fcli/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](pyproject.toml)
+
 > **Heads up — this is an experiment.** I'm using this project to learn how to build software *with* AI coding agents (Claude Code, mostly). The repo is public so the journey is visible, not because it's a polished product. Expect rough edges, breaking changes, and ideas that get rewritten as I learn.
 
 ## What this is
@@ -47,6 +51,14 @@ If you're curious about the *learning* side more than the code, the `plans/` dir
 
 I'm not blogging about this (yet). The repo is the journal.
 
+## Contributing
+
+Yes, contributions are welcome — but read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. To keep agent-generated noise out of the tracker, new issues and PRs from new contributors are **auto-closed by default**, and reopened by the maintainer when they meet the quality bar. The mechanic is borrowed from [`badlogic/pi-mono`](https://github.com/badlogic/pi-mono); credit to Mario Zechner for the pattern.
+
+If you're using an AI agent to help, also read [`AGENTS.md`](AGENTS.md). The one rule: **you must understand your code.**
+
+See also: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), [`SECURITY.md`](SECURITY.md).
+
 ## License
 
-[GPL-3.0](LICENSE) — see the `LICENSE` file for the full text.
+[GPL-3.0-or-later](LICENSE) — see the `LICENSE` file for the full text.
