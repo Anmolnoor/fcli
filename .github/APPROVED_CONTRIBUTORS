@@ -1,0 +1,5 @@
+# Format: <github-username> <capability>
+# capability is `issue` (allow future issues) or `pr` (allow future issues + PRs)
+# This file is updated automatically by .github/workflows/approve-contributor.yml
+# when a maintainer comments `lgtmi` or `lgtm` on an issue.
+# The repo owner has implicit write permission and is exempt from the gate.

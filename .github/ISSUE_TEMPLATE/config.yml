@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the contributor guide first
+    url: https://github.com/Anmolnoor/fcli/blob/main/CONTRIBUTING.md
+    about: New issues from new contributors are auto-closed by default. Read this so yours stays open.
+  - name: General questions
+    url: https://github.com/Anmolnoor/fcli/discussions
+    about: Use Discussions for questions, ideas, and "is this a bug?" threads.

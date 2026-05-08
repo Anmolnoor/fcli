@@ -1,0 +1,57 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) before opening. New issues from new contributors are auto-closed by default; thoughtful issues get reopened.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: One paragraph. Concrete, no speculation.
+      placeholder: "Running `foundation foo` raised TypeError on..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      placeholder: "I expected it to print the plan and exit 0."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro steps
+      description: Exact commands. Include input and output. "It doesn't work" is not enough.
+      render: shell
+      placeholder: |
+        $ ./scripts/uv run foundation "edit foo.py"
+        Traceback (most recent call last):
+          ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Foundation version / commit
+      placeholder: "v0.2.0 or commit sha"
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, provider (OpenAI/Ollama), model.
+      placeholder: "macOS 25.2, Python 3.12.5, OpenAI gpt-4o"
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this matters
+      description: One sentence on user-visible impact.
+    validations:
+      required: false
