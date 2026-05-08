@@ -348,9 +348,18 @@ class ActionExecutor:
             logger_name="foundation.services.orchestrator",
         )
         result: (
-            SearchResult | FileDiscoveryResult | GitContextResult | HelpLookupResult
-            | FileReadResult | FileReadChunkResult | FileMutationResult
-            | GitStatusResult | GitDiffResult | GitShowResult | GitLogResult | GitMutationResult
+            SearchResult
+            | FileDiscoveryResult
+            | GitContextResult
+            | HelpLookupResult
+            | FileReadResult
+            | FileReadChunkResult
+            | FileMutationResult
+            | GitStatusResult
+            | GitDiffResult
+            | GitShowResult
+            | GitLogResult
+            | GitMutationResult
         )
         try:
             manifest = self._capability_registry.resolve(
@@ -429,21 +438,15 @@ class ActionExecutor:
                 artifact_type = ExecutionArtifactType.GIT_STATUS
             elif manifest.runtime_endpoint == "builtin.git.diff":
                 assert self._git_service is not None
-                result = self._git_service.diff(
-                    GitDiffRequest.model_validate(tool_call.arguments)
-                )
+                result = self._git_service.diff(GitDiffRequest.model_validate(tool_call.arguments))
                 artifact_type = ExecutionArtifactType.GIT_DIFF
             elif manifest.runtime_endpoint == "builtin.git.show":
                 assert self._git_service is not None
-                result = self._git_service.show(
-                    GitShowRequest.model_validate(tool_call.arguments)
-                )
+                result = self._git_service.show(GitShowRequest.model_validate(tool_call.arguments))
                 artifact_type = ExecutionArtifactType.GIT_SHOW
             elif manifest.runtime_endpoint == "builtin.git.log":
                 assert self._git_service is not None
-                result = self._git_service.log(
-                    GitLogRequest.model_validate(tool_call.arguments)
-                )
+                result = self._git_service.log(GitLogRequest.model_validate(tool_call.arguments))
                 artifact_type = ExecutionArtifactType.GIT_LOG
             elif manifest.runtime_endpoint == "builtin.git.stage":
                 assert self._git_service is not None

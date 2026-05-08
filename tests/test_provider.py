@@ -392,9 +392,7 @@ def test_try_extract_json_no_json_returns_stripped() -> None:
 def test_ollama_adapter_handles_code_fenced_json() -> None:
     """Models that wrap JSON in code fences should still parse successfully."""
     fenced = '```json\n{"assistant_message":"hello","actions":[]}\n```'
-    transport = FakeTransport(
-        [{"message": {"role": "assistant", "content": fenced}}]
-    )
+    transport = FakeTransport([{"message": {"role": "assistant", "content": fenced}}])
     adapter = OllamaChatAdapter(
         model="glm-5.1:cloud",
         base_url="http://localhost:11434/api",
@@ -409,9 +407,7 @@ def test_ollama_adapter_handles_code_fenced_json() -> None:
 def test_ollama_adapter_handles_preamble_json() -> None:
     """Models that include preamble text before JSON should still parse."""
     preamble = 'Sure, here is the plan:\n{"assistant_message":"ok","actions":[]}'
-    transport = FakeTransport(
-        [{"message": {"role": "assistant", "content": preamble}}]
-    )
+    transport = FakeTransport([{"message": {"role": "assistant", "content": preamble}}])
     adapter = OllamaChatAdapter(
         model="glm-5.1:cloud",
         base_url="http://localhost:11434/api",
@@ -448,9 +444,7 @@ def test_openai_adapter_handles_code_fenced_json() -> None:
 def test_ollama_adapter_invalid_json_error_includes_raw() -> None:
     """Error message should include a preview of what the model actually returned."""
     garbage = "This is not JSON at all, just plain text."
-    transport = FakeTransport(
-        [{"message": {"role": "assistant", "content": garbage}}]
-    )
+    transport = FakeTransport([{"message": {"role": "assistant", "content": garbage}}])
     adapter = OllamaChatAdapter(
         model="glm-5.1:cloud",
         base_url="http://localhost:11434/api",

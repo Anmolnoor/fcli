@@ -135,9 +135,7 @@ class TurnLiveState:
                 self.final_status = str(status)
             return
 
-    def _close_current(
-        self, now: float, *, outcome: str, error: str | None = None
-    ) -> None:
+    def _close_current(self, now: float, *, outcome: str, error: str | None = None) -> None:
         if self.current_action_id is None:
             return
         started = self.current_action_started_at or now
@@ -431,9 +429,7 @@ class LiveTurnRenderer:
             self._restore_termios()
             return
         self._keypress_stop.clear()
-        thread = threading.Thread(
-            target=self._keypress_loop, name="fcli-live-keys", daemon=True
-        )
+        thread = threading.Thread(target=self._keypress_loop, name="fcli-live-keys", daemon=True)
         thread.start()
         self._keypress_thread = thread
 

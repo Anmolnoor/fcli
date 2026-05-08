@@ -227,9 +227,7 @@ class LocalHttpSseTransport:
         self._monitor = server
         self._host = host
         if host not in {"127.0.0.1", "::1", "localhost"}:
-            raise ValueError(
-                "LocalHttpSseTransport refuses to bind outside localhost"
-            )
+            raise ValueError("LocalHttpSseTransport refuses to bind outside localhost")
         self._http: ThreadingHTTPServer | None = None
         self._serve_thread: threading.Thread | None = None
 
@@ -247,13 +245,10 @@ class LocalHttpSseTransport:
     def start(self) -> None:
         handler_factory = _make_sse_handler(self._monitor, self._token)
         try:
-            self._http = ThreadingHTTPServer(
-                (self._host, self._port), handler_factory
-            )
+            self._http = ThreadingHTTPServer((self._host, self._port), handler_factory)
         except OSError as exc:
             raise TransportStartError(
-                f"Could not bind monitor HTTP transport on {self._host}:"
-                f"{self._port}: {exc}"
+                f"Could not bind monitor HTTP transport on {self._host}:{self._port}: {exc}"
             ) from exc
         # If port=0 the OS picks one; surface the bound port.
         self._port = self._http.server_address[1]

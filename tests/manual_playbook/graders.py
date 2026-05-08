@@ -66,10 +66,7 @@ def assert_no_invented_paths(path_roots: Iterable[Path]) -> Grader:
 
         missing: list[str] = []
         for candidate in sorted(candidates):
-            resolved_hits = [
-                (root / candidate.lstrip("./")).resolve()
-                for root in roots
-            ]
+            resolved_hits = [(root / candidate.lstrip("./")).resolve() for root in roots]
             if not any(hit.exists() for hit in resolved_hits):
                 # Try as an absolute path as well.
                 if Path(candidate).exists():
@@ -196,9 +193,7 @@ def assert_session_outcome(
                     reason=f"assistant_message missing '{needle}'",
                 )
         if not allow_zero_actions:
-            total_actions = sum(
-                len(it.plan.actions) for it in ctx.result.iterations
-            )
+            total_actions = sum(len(it.plan.actions) for it in ctx.result.iterations)
             if total_actions == 0:
                 return GradeOutcome(
                     name="session_outcome",

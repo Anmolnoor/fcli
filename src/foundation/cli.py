@@ -501,14 +501,11 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
         lines.append(f"Network: [cyan]{escape(', '.join(request.network_hosts))}[/cyan]")
     if request.requested_side_effects:
         lines.append(
-            "Side effects: "
-            f"[yellow]{escape(', '.join(request.requested_side_effects))}[/yellow]"
+            f"Side effects: [yellow]{escape(', '.join(request.requested_side_effects))}[/yellow]"
         )
     if request.reason_codes:
         reason_text = ", ".join(code.value for code in request.reason_codes)
-        lines.append(
-            f"Policy reasons: [magenta]{escape(reason_text)}[/magenta]"
-        )
+        lines.append(f"Policy reasons: [magenta]{escape(reason_text)}[/magenta]")
     if request.constraints is not None and request.constraints.invocation_budget is not None:
         budget = request.constraints.invocation_budget
         budget_parts: list[str] = []
@@ -806,7 +803,6 @@ def _parse_memory_source(argument: str) -> MemorySource:
     except KeyError as exc:
         choices = ", ".join(sorted(aliases))
         raise ValueError(f"Expected one of: {choices}.") from exc
-
 
 
 def _record_repl_shell_session(
@@ -1206,17 +1202,11 @@ def _execute_chat_request(
     monitor_server: MonitorServer | None = None
     transports: list[Any] = []
     if use_socket or use_http:
-        monitor_server = MonitorServer(
-            queue_size=settings.monitor.subscriber_queue_size
-        )
+        monitor_server = MonitorServer(queue_size=settings.monitor.subscriber_queue_size)
         if use_socket:
-            socket_path = _resolve_monitor_socket_path(
-                settings, override=monitor_socket
-            )
+            socket_path = _resolve_monitor_socket_path(settings, override=monitor_socket)
             try:
-                transports.append(
-                    UnixSocketTransport(path=socket_path, server=monitor_server)
-                )
+                transports.append(UnixSocketTransport(path=socket_path, server=monitor_server))
             except TransportStartError as exc:
                 console.print(f"[bold yellow]Monitor warning:[/bold yellow] {exc}")
         if use_http:
@@ -1246,9 +1236,7 @@ def _execute_chat_request(
     )
 
 
-def _resolve_monitor_socket_path(
-    settings: AppSettings, *, override: str | None
-) -> Path:
+def _resolve_monitor_socket_path(settings: AppSettings, *, override: str | None) -> Path:
     if override:
         return Path(override).expanduser()
     if settings.monitor.socket_path is not None:
@@ -1325,13 +1313,9 @@ def _run_orchestrate_with_sinks(
                     result_box["error"] = exc
 
             with LiveTurnRenderer(console=console) as renderer:
-                _attach_sink(
-                    compose_event_sink(*_build_sinks([renderer.on_event]))
-                )
+                _attach_sink(compose_event_sink(*_build_sinks([renderer.on_event])))
                 try:
-                    thread = threading.Thread(
-                        target=worker, name="fcli-orchestrate", daemon=True
-                    )
+                    thread = threading.Thread(target=worker, name="fcli-orchestrate", daemon=True)
                     thread.start()
                     try:
                         renderer.drain_until_finished(worker=thread)
@@ -2039,11 +2023,13 @@ def _artifact_preview_notice(result: ExecutionResult) -> ChatNotice | None:
     return None
 
 
-_CODE_CHANGING_ARTIFACT_TYPES = frozenset({
-    ExecutionArtifactType.FILE_WRITE,
-    ExecutionArtifactType.FILE_EDIT,
-    ExecutionArtifactType.FILE_APPLY_DIFF,
-})
+_CODE_CHANGING_ARTIFACT_TYPES = frozenset(
+    {
+        ExecutionArtifactType.FILE_WRITE,
+        ExecutionArtifactType.FILE_EDIT,
+        ExecutionArtifactType.FILE_APPLY_DIFF,
+    }
+)
 
 _CHANGED_FILES_DISPLAY_CAP = 6
 _COMMANDS_RUN_DISPLAY_CAP = 6
@@ -2056,10 +2042,7 @@ def _iteration_changed_files_notice(
     seen: list[str] = []
     seen_set: set[str] = set()
     for item in result.execution_results:
-        if (
-            item.artifact_type in _CODE_CHANGING_ARTIFACT_TYPES
-            and item.artifact is not None
-        ):
+        if item.artifact_type in _CODE_CHANGING_ARTIFACT_TYPES and item.artifact is not None:
             path = item.artifact.get("path")
             if isinstance(path, str) and path and path not in seen_set:
                 seen.append(path)
@@ -2084,7 +2067,9 @@ def _iteration_commands_notice(
     commands: list[str] = []
     for iteration in result.iterations:
         for action, exec_result in zip(
-            iteration.plan.actions, iteration.execution_results, strict=False,
+            iteration.plan.actions,
+            iteration.execution_results,
+            strict=False,
         ):
             if action.kind is not ActionKind.SHELL or action.shell is None:
                 continue

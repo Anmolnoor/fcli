@@ -251,9 +251,7 @@ def test_policy_engine_requires_approval_for_untrusted_capabilities(
                         kind=CapabilityScopeKind.NONE,
                     )
                 ],
-                side_effect_rules=[
-                    CapabilitySideEffectRule(side_effect="filesystem_read")
-                ],
+                side_effect_rules=[CapabilitySideEffectRule(side_effect="filesystem_read")],
                 invocation_budget=CapabilityInvocationBudget(
                     timeout_seconds=30,
                     output_limit_kb=64,
@@ -329,9 +327,7 @@ def test_policy_engine_enforces_invocation_budget(
                         kind=CapabilityScopeKind.NONE,
                     )
                 ],
-                side_effect_rules=[
-                    CapabilitySideEffectRule(side_effect="filesystem_read")
-                ],
+                side_effect_rules=[CapabilitySideEffectRule(side_effect="filesystem_read")],
                 invocation_budget=CapabilityInvocationBudget(
                     timeout_seconds=30,
                     output_limit_kb=64,
@@ -434,9 +430,9 @@ def test_auto_except_commit_approves_workspace_write(
     assert evaluation is not None
     assert evaluation.verdict.outcome is CapabilityPolicyOutcome.REQUIRE_APPROVAL
 
-    _request, resolution = ApprovalService(
-        mode=ApprovalMode.AUTO_EXCEPT_COMMIT
-    ).resolve(action, evaluation, request_cwd=workspace_root)
+    _request, resolution = ApprovalService(mode=ApprovalMode.AUTO_EXCEPT_COMMIT).resolve(
+        action, evaluation, request_cwd=workspace_root
+    )
 
     assert resolution.status is ApprovalDecisionStatus.APPROVED
     assert "auto-except-commit" in resolution.reason
@@ -472,9 +468,7 @@ def test_auto_except_commit_gated_helper_detects_commit_capability() -> None:
         capability_id="foundation.git.commit",
         side_effects=["workspace_write"],
     )
-    assert _auto_except_commit_gated(request) == (
-        "commit capability requires explicit approval"
-    )
+    assert _auto_except_commit_gated(request) == ("commit capability requires explicit approval")
 
 
 def test_auto_except_commit_gated_helper_detects_network_side_effect() -> None:

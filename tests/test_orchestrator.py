@@ -59,10 +59,12 @@ class StubProvider:
     def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
         self.calls.append(prompt)
         if not self._responses:
-            return _provider_response({
-                "assistant_message": "Done.",
-                "actions": [],
-            })
+            return _provider_response(
+                {
+                    "assistant_message": "Done.",
+                    "actions": [],
+                }
+            )
         return self._responses.pop(0)
 
 
@@ -711,14 +713,10 @@ def test_orchestrator_persists_pending_approval_session_status(
     assert detail.approvals[0].capability_id == "foundation.shell.command"
     assert "workspace_write" in detail.approvals[0].requested_side_effects
 
-    trace = history_store.get_trace(
-        TraceQuery(session_id=result.session_id or "")
-    )
+    trace = history_store.get_trace(TraceQuery(session_id=result.session_id or ""))
     assert trace is not None
     assert len(trace.steps) == 2
-    execution_step = next(
-        s for s in trace.steps if isinstance(s, ExecutionStep)
-    )
+    execution_step = next(s for s in trace.steps if isinstance(s, ExecutionStep))
     assert execution_step.status is ExecutionStatus.PENDING_APPROVAL
     assert execution_step.action_id == "create_file"
     assert execution_step.iteration_index == 1
@@ -786,13 +784,9 @@ def test_orchestrator_persists_failed_execution_trace_as_audit_complete(
     # The per-action failure is preserved in execution_results/summary.
     assert sessions[0].status is SessionStatus.COMPLETED
 
-    full_trace = history_store.get_trace(
-        TraceQuery(session_id=result.session_id or "")
-    )
+    full_trace = history_store.get_trace(TraceQuery(session_id=result.session_id or ""))
     assert full_trace is not None
-    execution_step = next(
-        s for s in full_trace.steps if isinstance(s, ExecutionStep)
-    )
+    execution_step = next(s for s in full_trace.steps if isinstance(s, ExecutionStep))
     assert execution_step.status is ExecutionStatus.FAILED
     assert execution_step.action_id == "failing_command"
     assert execution_step.iteration_index == 1
@@ -835,14 +829,18 @@ def test_zero_action_first_iteration_explanation_only(
     """Zero-action plan on first iteration for explanation-only requests."""
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "The answer is 42.",
-                "actions": [],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "The answer is 42.",
+                    "actions": [],
+                }
+            ),
         ]
     )
     orchestrator, runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(UserRequest(message="what is 42"))
@@ -863,21 +861,25 @@ def test_pending_approval_stops_loop(
     """Pending approval in first iteration stops the loop."""
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Need to delete that file.",
-                "actions": [
-                    {
-                        "id": "rm_file",
-                        "kind": "shell",
-                        "summary": "Remove a file",
-                        "shell": {"command": "rm", "args": ["x.txt"]},
-                    }
-                ],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "Need to delete that file.",
+                    "actions": [
+                        {
+                            "id": "rm_file",
+                            "kind": "shell",
+                            "summary": "Remove a file",
+                            "shell": {"command": "rm", "args": ["x.txt"]},
+                        }
+                    ],
+                }
+            ),
         ]
     )
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(
@@ -897,21 +899,25 @@ def test_fatal_failure_stops_loop(
     """A shell spawn failure (fatal) stops the loop immediately."""
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Running nonexistent.",
-                "actions": [
-                    {
-                        "id": "spawn_fail",
-                        "kind": "shell",
-                        "summary": "Run a nonexistent binary",
-                        "shell": {"command": "nonexistent_binary_xyz"},
-                    }
-                ],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "Running nonexistent.",
+                    "actions": [
+                        {
+                            "id": "spawn_fail",
+                            "kind": "shell",
+                            "summary": "Run a nonexistent binary",
+                            "shell": {"command": "nonexistent_binary_xyz"},
+                        }
+                    ],
+                }
+            ),
         ]
     )
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(
@@ -931,22 +937,26 @@ def test_max_iteration_cap(
     from foundation.services.orchestrator import _MAX_LOOP_ITERATIONS
 
     responses = [
-        _provider_response({
-            "assistant_message": f"Iteration {i} running ls.",
-            "actions": [
-                {
-                    "id": f"ls_{i}",
-                    "kind": "shell",
-                    "summary": "List files",
-                    "shell": {"command": "ls"},
-                }
-            ],
-        })
+        _provider_response(
+            {
+                "assistant_message": f"Iteration {i} running ls.",
+                "actions": [
+                    {
+                        "id": f"ls_{i}",
+                        "kind": "shell",
+                        "summary": "List files",
+                        "shell": {"command": "ls"},
+                    }
+                ],
+            }
+        )
         for i in range(1, _MAX_LOOP_ITERATIONS + 1)
     ]
     provider = StubProvider(responses)
     orchestrator, runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(
@@ -976,24 +986,26 @@ def test_max_action_cap(
     actions_per_iter = _MAX_PLAN_ACTIONS
     iterations_needed = (_MAX_TOTAL_ACTIONS + actions_per_iter - 1) // actions_per_iter
     responses = [
-        _provider_response({
-            "assistant_message": f"Iteration {i}.",
-            "actions": [
-                {
-                    "id": f"search_{i}_{j}",
-                    "kind": "tool_call",
-                    "summary": "Search workspace",
-                    "tool_call": {
-                        "capability_id": "foundation.search",
-                        "arguments": {
-                            "query": f"needle_{i}_{j}",
-                            "max_results": 1,
+        _provider_response(
+            {
+                "assistant_message": f"Iteration {i}.",
+                "actions": [
+                    {
+                        "id": f"search_{i}_{j}",
+                        "kind": "tool_call",
+                        "summary": "Search workspace",
+                        "tool_call": {
+                            "capability_id": "foundation.search",
+                            "arguments": {
+                                "query": f"needle_{i}_{j}",
+                                "max_results": 1,
+                            },
                         },
-                    },
-                }
-                for j in range(1, actions_per_iter + 1)
-            ],
-        })
+                    }
+                    for j in range(1, actions_per_iter + 1)
+                ],
+            }
+        )
         for i in range(1, iterations_needed + 1)
     ]
     provider = StubProvider(responses)
@@ -1030,20 +1042,24 @@ def test_no_progress_detection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Repeated identical failures with no changes triggers NO_PROGRESS."""
-    fail_response = _provider_response({
-        "assistant_message": "Running false.",
-        "actions": [
-            {
-                "id": "fail1",
-                "kind": "shell",
-                "summary": "Run failing command",
-                "shell": {"command": "false"},
-            }
-        ],
-    })
+    fail_response = _provider_response(
+        {
+            "assistant_message": "Running false.",
+            "actions": [
+                {
+                    "id": "fail1",
+                    "kind": "shell",
+                    "summary": "Run failing command",
+                    "shell": {"command": "false"},
+                }
+            ],
+        }
+    )
     provider = StubProvider([fail_response, fail_response])
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(
@@ -1062,25 +1078,31 @@ def test_observation_block_in_provider_messages(
     """Second iteration's provider call includes observation messages."""
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Listing files.",
-                "actions": [
-                    {
-                        "id": "ls_1",
-                        "kind": "shell",
-                        "summary": "List files",
-                        "shell": {"command": "ls"},
-                    }
-                ],
-            }),
-            _provider_response({
-                "assistant_message": "All done.",
-                "actions": [],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "Listing files.",
+                    "actions": [
+                        {
+                            "id": "ls_1",
+                            "kind": "shell",
+                            "summary": "List files",
+                            "shell": {"command": "ls"},
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "All done.",
+                    "actions": [],
+                }
+            ),
         ]
     )
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(
@@ -1092,9 +1114,9 @@ def test_observation_block_in_provider_messages(
     assert len(provider.calls) >= 2
     second_call = provider.calls[1]
     dev_messages = [
-        m for m in second_call.messages
-        if m.role.value == "developer"
-        and "EXECUTION OBSERVATION" in m.content
+        m
+        for m in second_call.messages
+        if m.role.value == "developer" and "EXECUTION OBSERVATION" in m.content
     ]
     assert len(dev_messages) == 1
     assert "iteration 1" in dev_messages[0].content
@@ -1108,36 +1130,44 @@ def test_observation_accumulates_across_iterations(
     plus a cumulative 'already executed' summary (prevents re-planning loops)."""
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "First listing.",
-                "actions": [
-                    {
-                        "id": "ls_a",
-                        "kind": "shell",
-                        "summary": "list once",
-                        "shell": {"command": "ls"},
-                    }
-                ],
-            }),
-            _provider_response({
-                "assistant_message": "Checking pwd.",
-                "actions": [
-                    {
-                        "id": "pwd_b",
-                        "kind": "shell",
-                        "summary": "pwd",
-                        "shell": {"command": "pwd"},
-                    }
-                ],
-            }),
-            _provider_response({
-                "assistant_message": "Done.",
-                "actions": [],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "First listing.",
+                    "actions": [
+                        {
+                            "id": "ls_a",
+                            "kind": "shell",
+                            "summary": "list once",
+                            "shell": {"command": "ls"},
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Checking pwd.",
+                    "actions": [
+                        {
+                            "id": "pwd_b",
+                            "kind": "shell",
+                            "summary": "pwd",
+                            "shell": {"command": "pwd"},
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Done.",
+                    "actions": [],
+                }
+            ),
         ]
     )
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(UserRequest(message="multi-step"))
@@ -1149,9 +1179,7 @@ def test_observation_accumulates_across_iterations(
     # - iteration 2's observation (pwd_b)
     # - a cumulative "COMMANDS ALREADY EXECUTED" summary naming both
     third_call = provider.calls[2]
-    dev_contents = "\n".join(
-        m.content for m in third_call.messages if m.role.value == "developer"
-    )
+    dev_contents = "\n".join(m.content for m in third_call.messages if m.role.value == "developer")
     assert "EXECUTION OBSERVATION (iteration 1)" in dev_contents
     assert "EXECUTION OBSERVATION (iteration 2)" in dev_contents
     assert "COMMANDS ALREADY EXECUTED" in dev_contents
@@ -1169,27 +1197,31 @@ def test_verification_notice_unverified(
     target_file = workspace_root / "test.txt"
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Writing file.",
-                "actions": [
-                    {
-                        "id": "write_file",
-                        "kind": "tool_call",
-                        "summary": "Write a file",
-                        "tool_call": {
-                            "capability_id": "foundation.file.write",
-                            "arguments": {
-                                "path": str(target_file),
-                                "content": "hello",
+            _provider_response(
+                {
+                    "assistant_message": "Writing file.",
+                    "actions": [
+                        {
+                            "id": "write_file",
+                            "kind": "tool_call",
+                            "summary": "Write a file",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": str(target_file),
+                                    "content": "hello",
+                                },
                             },
-                        },
-                    }
-                ],
-            }),
-            _provider_response({
-                "assistant_message": "Done writing.",
-                "actions": [],
-            }),
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Done writing.",
+                    "actions": [],
+                }
+            ),
         ]
     )
     runtime = CountingShellRuntime(workspace_root=workspace_root)
@@ -1219,41 +1251,43 @@ def test_verification_notice_unverified(
     from foundation.models import VerificationOutcome
 
     assert result.verification_notice.outcome is VerificationOutcome.NOT_ATTEMPTED
-    assert "no verification" in (
-        result.verification_notice.reason or ""
-    ).lower()
+    assert "no verification" in (result.verification_notice.reason or "").lower()
 
 
 def _verification_workflow_provider(
-    workspace_root: Path, *, verify_cmd: str = "pytest",
+    workspace_root: Path,
+    *,
+    verify_cmd: str = "pytest",
 ) -> StubProvider:
     """Build a provider that plans a file write followed by a verification cmd."""
     target_file = workspace_root / "created.txt"
     return StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Edit then verify.",
-                "actions": [
-                    {
-                        "id": "write_file",
-                        "kind": "tool_call",
-                        "summary": "Create file",
-                        "tool_call": {
-                            "capability_id": "foundation.file.write",
-                            "arguments": {
-                                "path": str(target_file),
-                                "content": "hi",
+            _provider_response(
+                {
+                    "assistant_message": "Edit then verify.",
+                    "actions": [
+                        {
+                            "id": "write_file",
+                            "kind": "tool_call",
+                            "summary": "Create file",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": str(target_file),
+                                    "content": "hi",
+                                },
                             },
                         },
-                    },
-                    {
-                        "id": "verify",
-                        "kind": "shell",
-                        "summary": "Run verification",
-                        "shell": {"command": verify_cmd, "args": ["--version"]},
-                    },
-                ],
-            }),
+                        {
+                            "id": "verify",
+                            "kind": "shell",
+                            "summary": "Run verification",
+                            "shell": {"command": verify_cmd, "args": ["--version"]},
+                        },
+                    ],
+                }
+            ),
             _provider_response({"assistant_message": "Done.", "actions": []}),
         ]
     )
@@ -1269,10 +1303,13 @@ def test_verification_notice_passed(
     workspace_root = tmp_path / "workspace"
     provider = _verification_workflow_provider(workspace_root)
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
         scripts={"pytest": "import sys\nsys.exit(0)\n"},
         approval_service=ApprovalService(
-            mode=ApprovalMode.PROMPT, prompt_callback=lambda _r: True,
+            mode=ApprovalMode.PROMPT,
+            prompt_callback=lambda _r: True,
         ),
     )
 
@@ -1293,10 +1330,13 @@ def test_verification_notice_failed(
     workspace_root = tmp_path / "workspace"
     provider = _verification_workflow_provider(workspace_root)
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
         scripts={"pytest": "import sys\nsys.exit(1)\n"},
         approval_service=ApprovalService(
-            mode=ApprovalMode.PROMPT, prompt_callback=lambda _r: True,
+            mode=ApprovalMode.PROMPT,
+            prompt_callback=lambda _r: True,
         ),
     )
 
@@ -1322,9 +1362,12 @@ def test_verification_notice_unavailable_when_binary_missing(
 
     provider = _verification_workflow_provider(workspace_root)
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
         approval_service=ApprovalService(
-            mode=ApprovalMode.PROMPT, prompt_callback=lambda _r: True,
+            mode=ApprovalMode.PROMPT,
+            prompt_callback=lambda _r: True,
         ),
     )
 
@@ -1342,14 +1385,18 @@ def test_backward_compat_single_iteration_result_fields(
     """Single-iteration result has correct plan/context/execution_results."""
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Zero actions.",
-                "actions": [],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "Zero actions.",
+                    "actions": [],
+                }
+            ),
         ]
     )
     orchestrator, _runtime, _workspace_root = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
     )
 
     result = orchestrator.orchestrate(
@@ -1372,12 +1419,16 @@ def test_no_progress_detector_unit() -> None:
     detector = NoProgressDetector()
 
     action = PlannedAction(
-        id="a1", kind=ActionKind.SHELL, summary="Run test",
+        id="a1",
+        kind=ActionKind.SHELL,
+        summary="Run test",
         shell=ShellAction(command="false"),
     )
     result = ExecutionResult(
-        action_id="a1", status=ExecutionStatus.FAILED,
-        summary="Failed.", error="Exit code 1",
+        action_id="a1",
+        status=ExecutionStatus.FAILED,
+        summary="Failed.",
+        error="Exit code 1",
     )
 
     assert detector.is_stuck([result], [], [action]) is False
@@ -1391,12 +1442,16 @@ def test_no_progress_detector_not_stuck_with_changes() -> None:
     detector = NoProgressDetector()
 
     action = PlannedAction(
-        id="a1", kind=ActionKind.SHELL, summary="Run test",
+        id="a1",
+        kind=ActionKind.SHELL,
+        summary="Run test",
         shell=ShellAction(command="false"),
     )
     result = ExecutionResult(
-        action_id="a1", status=ExecutionStatus.FAILED,
-        summary="Failed.", error="Exit code 1",
+        action_id="a1",
+        status=ExecutionStatus.FAILED,
+        summary="Failed.",
+        error="Exit code 1",
     )
 
     assert detector.is_stuck([result], [], [action]) is False
@@ -1414,12 +1469,16 @@ def test_detector_window_two_requires_two_consecutive_repeats() -> None:
 
     detector = NoProgressDetector()
     action = PlannedAction(
-        id="a", kind=ActionKind.SHELL, summary="run",
+        id="a",
+        kind=ActionKind.SHELL,
+        summary="run",
         shell=ShellAction(command="false"),
     )
     fail = ExecutionResult(
-        action_id="a", status=ExecutionStatus.FAILED,
-        summary="boom", error="Exit code 1",
+        action_id="a",
+        status=ExecutionStatus.FAILED,
+        summary="boom",
+        error="Exit code 1",
     )
     # iter 1: first failure observed; window not yet full → not stuck.
     assert detector.is_stuck([fail], [], [action]) is False
@@ -1433,18 +1492,24 @@ def test_detector_cumulative_changes_suppresses_stuck() -> None:
 
     detector = NoProgressDetector()
     action = PlannedAction(
-        id="a", kind=ActionKind.SHELL, summary="run",
+        id="a",
+        kind=ActionKind.SHELL,
+        summary="run",
         shell=ShellAction(command="false"),
     )
     fail = ExecutionResult(
-        action_id="a", status=ExecutionStatus.FAILED,
-        summary="boom", error="Exit code 1",
+        action_id="a",
+        status=ExecutionStatus.FAILED,
+        summary="boom",
+        error="Exit code 1",
     )
     detector.is_stuck([fail], [], [action])
     # Even with the second identical failure, cumulative changes prevent stuck.
     assert (
         detector.is_stuck(
-            [fail], [], [action],
+            [fail],
+            [],
+            [action],
             cumulative_changed_paths=["edited.py"],
         )
         is False
@@ -1457,19 +1522,23 @@ def test_filter_results_for_detector_demotes_file_exists_after_prior_write() -> 
     from foundation.services.orchestrator import _filter_results_for_detector
 
     write = PlannedAction(
-        id="w1", kind=ActionKind.TOOL_CALL, summary="rewrite",
+        id="w1",
+        kind=ActionKind.TOOL_CALL,
+        summary="rewrite",
         tool_call=ToolCall(
             capability_id="foundation.file.write",
             arguments={"path": "/abs/notes.md", "content": "x"},
         ),
     )
     failed = ExecutionResult(
-        action_id="w1", status=ExecutionStatus.FAILED,
+        action_id="w1",
+        status=ExecutionStatus.FAILED,
         summary="exists",
         error="File already exists. Set overwrite=true to replace it.",
     )
     filtered = _filter_results_for_detector(
-        [failed], [write],
+        [failed],
+        [write],
         cumulative_changed_paths={"/abs/notes.md"},
     )
     assert filtered[0].status is ExecutionStatus.NOT_EXECUTED
@@ -1481,19 +1550,24 @@ def test_filter_results_for_detector_keeps_real_failures() -> None:
     from foundation.services.orchestrator import _filter_results_for_detector
 
     write = PlannedAction(
-        id="w1", kind=ActionKind.TOOL_CALL, summary="rewrite",
+        id="w1",
+        kind=ActionKind.TOOL_CALL,
+        summary="rewrite",
         tool_call=ToolCall(
             capability_id="foundation.file.write",
             arguments={"path": "/abs/notes.md"},
         ),
     )
     failed = ExecutionResult(
-        action_id="w1", status=ExecutionStatus.FAILED,
+        action_id="w1",
+        status=ExecutionStatus.FAILED,
         summary="exists",
         error="File already exists. Set overwrite=true to replace it.",
     )
     filtered = _filter_results_for_detector(
-        [failed], [write], cumulative_changed_paths=set(),
+        [failed],
+        [write],
+        cumulative_changed_paths=set(),
     )
     assert filtered[0].status is ExecutionStatus.FAILED
 
@@ -1504,28 +1578,37 @@ def test_filter_results_for_detector_demotes_probe_reads() -> None:
     from foundation.services.orchestrator import _filter_results_for_detector
 
     probe = PlannedAction(
-        id="r1", kind=ActionKind.TOOL_CALL, summary="probe",
+        id="r1",
+        kind=ActionKind.TOOL_CALL,
+        summary="probe",
         tool_call=ToolCall(
             capability_id="foundation.file.read",
             arguments={"path": "/abs/new.md"},
         ),
     )
     write = PlannedAction(
-        id="w1", kind=ActionKind.TOOL_CALL, summary="write",
+        id="w1",
+        kind=ActionKind.TOOL_CALL,
+        summary="write",
         tool_call=ToolCall(
             capability_id="foundation.file.write",
             arguments={"path": "/abs/new.md", "content": "x"},
         ),
     )
     probe_failed = ExecutionResult(
-        action_id="r1", status=ExecutionStatus.FAILED,
-        summary="missing", error="File not found.",
+        action_id="r1",
+        status=ExecutionStatus.FAILED,
+        summary="missing",
+        error="File not found.",
     )
     write_ok = ExecutionResult(
-        action_id="w1", status=ExecutionStatus.EXECUTED, summary="ok",
+        action_id="w1",
+        status=ExecutionStatus.EXECUTED,
+        summary="ok",
     )
     filtered = _filter_results_for_detector(
-        [probe_failed, write_ok], [probe, write],
+        [probe_failed, write_ok],
+        [probe, write],
         cumulative_changed_paths=set(),
     )
     assert filtered[0].status is ExecutionStatus.NOT_EXECUTED
@@ -1610,7 +1693,8 @@ def test_session_status_for_no_progress_without_changes_is_inconclusive() -> Non
 
 
 def test_orchestrator_soft_completion_replays_reference_incident(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The reference incident shape: write succeeds, idempotent re-write fails,
     detector tolerates one repeat, second repeat → NO_PROGRESS but the
@@ -1625,79 +1709,87 @@ def test_orchestrator_soft_completion_replays_reference_incident(
     target = tmp_path / "workspace" / "notes.md"
 
     # iter 1: probe (read fails because file doesn't exist).
-    iter1_response = _provider_response({
-        "assistant_message": "Probing file.",
-        "actions": [
-            {
-                "id": "probe",
-                "kind": "tool_call",
-                "summary": "Read existing file",
-                "tool_call": {
-                    "capability_id": "foundation.file.read",
-                    "arguments": {"path": str(target)},
-                },
-            },
-        ],
-    })
-    # iter 2: write succeeds.
-    iter2_response = _provider_response({
-        "assistant_message": "Writing.",
-        "actions": [
-            {
-                "id": "write1",
-                "kind": "tool_call",
-                "summary": "Write file",
-                "tool_call": {
-                    "capability_id": "foundation.file.write",
-                    "arguments": {
-                        "path": str(target),
-                        "content": "hello\n",
+    iter1_response = _provider_response(
+        {
+            "assistant_message": "Probing file.",
+            "actions": [
+                {
+                    "id": "probe",
+                    "kind": "tool_call",
+                    "summary": "Read existing file",
+                    "tool_call": {
+                        "capability_id": "foundation.file.read",
+                        "arguments": {"path": str(target)},
                     },
                 },
-            },
-        ],
-    })
-    # iter 3: planner re-issues the write. FILE_EXISTS error.
-    iter3_response = _provider_response({
-        "assistant_message": "Writing again.",
-        "actions": [
-            {
-                "id": "write2",
-                "kind": "tool_call",
-                "summary": "Write file",
-                "tool_call": {
-                    "capability_id": "foundation.file.write",
-                    "arguments": {
-                        "path": str(target),
-                        "content": "hello\n",
-                    },
-                },
-            },
-        ],
-    })
-    # iter 4+: same idempotent re-issue — detector trips (window=2).
-    iter4_response = _provider_response({
-        "assistant_message": "Writing again.",
-        "actions": [
-            {
-                "id": "write3",
-                "kind": "tool_call",
-                "summary": "Write file",
-                "tool_call": {
-                    "capability_id": "foundation.file.write",
-                    "arguments": {
-                        "path": str(target),
-                        "content": "hello\n",
-                    },
-                },
-            },
-        ],
-    })
-    provider = StubProvider(
-        [iter1_response, iter2_response, iter3_response, iter4_response]
+            ],
+        }
     )
+    # iter 2: write succeeds.
+    iter2_response = _provider_response(
+        {
+            "assistant_message": "Writing.",
+            "actions": [
+                {
+                    "id": "write1",
+                    "kind": "tool_call",
+                    "summary": "Write file",
+                    "tool_call": {
+                        "capability_id": "foundation.file.write",
+                        "arguments": {
+                            "path": str(target),
+                            "content": "hello\n",
+                        },
+                    },
+                },
+            ],
+        }
+    )
+    # iter 3: planner re-issues the write. FILE_EXISTS error.
+    iter3_response = _provider_response(
+        {
+            "assistant_message": "Writing again.",
+            "actions": [
+                {
+                    "id": "write2",
+                    "kind": "tool_call",
+                    "summary": "Write file",
+                    "tool_call": {
+                        "capability_id": "foundation.file.write",
+                        "arguments": {
+                            "path": str(target),
+                            "content": "hello\n",
+                        },
+                    },
+                },
+            ],
+        }
+    )
+    # iter 4+: same idempotent re-issue — detector trips (window=2).
+    iter4_response = _provider_response(
+        {
+            "assistant_message": "Writing again.",
+            "actions": [
+                {
+                    "id": "write3",
+                    "kind": "tool_call",
+                    "summary": "Write file",
+                    "tool_call": {
+                        "capability_id": "foundation.file.write",
+                        "arguments": {
+                            "path": str(target),
+                            "content": "hello\n",
+                        },
+                    },
+                },
+            ],
+        }
+    )
+    provider = StubProvider([iter1_response, iter2_response, iter3_response, iter4_response])
     orchestrator, _runtime, ws = _orchestrator(
-        tmp_path, monkeypatch, provider,
+        tmp_path,
+        monkeypatch,
+        provider,
         approval_service=ApprovalService(mode=ApprovalMode.AUTO),
     )
     # _orchestrator created its own workspace; redirect the target into it.
@@ -1748,17 +1840,19 @@ def test_iteration_scoped_step_ids_and_replanned_from_edges(
     from foundation.services.orchestrator import _MAX_LOOP_ITERATIONS
 
     responses = [
-        _provider_response({
-            "assistant_message": f"Iteration {i}.",
-            "actions": [
-                {
-                    "id": f"ls_{i}",
-                    "kind": "shell",
-                    "summary": "List files",
-                    "shell": {"command": "ls"},
-                }
-            ],
-        })
+        _provider_response(
+            {
+                "assistant_message": f"Iteration {i}.",
+                "actions": [
+                    {
+                        "id": f"ls_{i}",
+                        "kind": "shell",
+                        "summary": "List files",
+                        "shell": {"command": "ls"},
+                    }
+                ],
+            }
+        )
         for i in range(1, _MAX_LOOP_ITERATIONS + 1)
     ]
     provider = StubProvider(responses)
@@ -1796,9 +1890,7 @@ def test_iteration_scoped_step_ids_and_replanned_from_edges(
 
     # One REPLANNED_FROM edge per iteration boundary:
     # iter 1→2, 2→3, ..., (N-1)→N — so (_MAX_LOOP_ITERATIONS - 1) edges total.
-    replanned_edges = [
-        e for e in trace.edges if e.edge_kind is TraceEdgeKind.REPLANNED_FROM
-    ]
+    replanned_edges = [e for e in trace.edges if e.edge_kind is TraceEdgeKind.REPLANNED_FROM]
     assert len(replanned_edges) == _MAX_LOOP_ITERATIONS - 1
     for edge in replanned_edges:
         assert edge.source_step_id.startswith("action:")
@@ -1814,17 +1906,19 @@ def test_single_iteration_emits_no_replanned_from_edge(
 
     provider = StubProvider(
         [
-            _provider_response({
-                "assistant_message": "Done.",
-                "actions": [
-                    {
-                        "id": "ls_once",
-                        "kind": "shell",
-                        "summary": "List files",
-                        "shell": {"command": "ls"},
-                    }
-                ],
-            }),
+            _provider_response(
+                {
+                    "assistant_message": "Done.",
+                    "actions": [
+                        {
+                            "id": "ls_once",
+                            "kind": "shell",
+                            "summary": "List files",
+                            "shell": {"command": "ls"},
+                        }
+                    ],
+                }
+            ),
             _provider_response({"assistant_message": "All good.", "actions": []}),
         ]
     )
@@ -1841,9 +1935,7 @@ def test_single_iteration_emits_no_replanned_from_edge(
 
     trace = history_store.get_trace(TraceQuery(session_id=result.session_id))
     assert trace is not None
-    replanned = [
-        e for e in trace.edges if e.edge_kind is TraceEdgeKind.REPLANNED_FROM
-    ]
+    replanned = [e for e in trace.edges if e.edge_kind is TraceEdgeKind.REPLANNED_FROM]
     # The successful first iteration produces one REPLANNED_FROM edge leading
     # into the second (zero-action) planning step.  No edge exists ahead of
     # iteration 1 itself.
@@ -1880,43 +1972,68 @@ def _status_for(
         text="test",
     )
     return RequestOrchestrator._session_status_for_result(
-        summary, stop_reason, iterations or [],
+        summary,
+        stop_reason,
+        iterations or [],
     )
 
 
 def test_session_status_pending_approval_takes_precedence() -> None:
-    assert _status_for(
-        LoopStopReason.ZERO_ACTION_PLAN, executed=2, pending=1,
-    ) is SessionStatus.PENDING_APPROVAL
+    assert (
+        _status_for(
+            LoopStopReason.ZERO_ACTION_PLAN,
+            executed=2,
+            pending=1,
+        )
+        is SessionStatus.PENDING_APPROVAL
+    )
 
 
 def test_session_status_fatal_execution_failure_is_failed() -> None:
-    assert _status_for(
-        LoopStopReason.FATAL_EXECUTION_FAILURE, failed=1,
-    ) is SessionStatus.FAILED
+    assert (
+        _status_for(
+            LoopStopReason.FATAL_EXECUTION_FAILURE,
+            failed=1,
+        )
+        is SessionStatus.FAILED
+    )
 
 
 def test_session_status_zero_action_plan_with_intermediate_failure_is_completed() -> None:
     # This is the recovery case: earlier iteration had a failure, the final
     # iteration returned zero actions cleanly. The run is recorded as COMPLETED.
-    assert _status_for(
-        LoopStopReason.ZERO_ACTION_PLAN, executed=1, failed=1,
-    ) is SessionStatus.COMPLETED
+    assert (
+        _status_for(
+            LoopStopReason.ZERO_ACTION_PLAN,
+            executed=1,
+            failed=1,
+        )
+        is SessionStatus.COMPLETED
+    )
 
 
 def test_session_status_zero_action_plan_clean_is_completed() -> None:
-    assert _status_for(
-        LoopStopReason.ZERO_ACTION_PLAN, executed=2,
-    ) is SessionStatus.COMPLETED
+    assert (
+        _status_for(
+            LoopStopReason.ZERO_ACTION_PLAN,
+            executed=2,
+        )
+        is SessionStatus.COMPLETED
+    )
 
 
 def test_session_status_no_progress_is_inconclusive() -> None:
     # Loop terminated because the planner kept making the same mistakes.
     # The assistant delivered a final message; the run is not corrupt but
     # also didn't satisfy the full request.
-    assert _status_for(
-        LoopStopReason.NO_PROGRESS, executed=1, failed=2,
-    ) is SessionStatus.COMPLETED_INCONCLUSIVE
+    assert (
+        _status_for(
+            LoopStopReason.NO_PROGRESS,
+            executed=1,
+            failed=2,
+        )
+        is SessionStatus.COMPLETED_INCONCLUSIVE
+    )
 
 
 def test_session_status_max_iterations_with_clean_final_is_inconclusive() -> None:
@@ -1928,22 +2045,32 @@ def test_session_status_max_iterations_with_clean_final_is_inconclusive() -> Non
     )
 
     context = ContextSnapshot(
-        workspace_root="/tmp/w", request_cwd="/tmp/w", approval_mode="prompt",
+        workspace_root="/tmp/w",
+        request_cwd="/tmp/w",
+        approval_mode="prompt",
     )
     plan = AssistantPlan(assistant_message="ok", actions=[])
     metadata = ProviderResponseMetadata(
-        provider="stub", model="stub", latency_seconds=0.0,
+        provider="stub",
+        model="stub",
+        latency_seconds=0.0,
     )
     clean_iter = OrchestrationIteration(
-        iteration=1, context=context, plan=plan, planning_metadata=metadata,
+        iteration=1,
+        context=context,
+        plan=plan,
+        planning_metadata=metadata,
         execution_results=[],
     )
-    assert _status_for(
-        LoopStopReason.MAX_ITERATIONS,
-        executed=3,
-        failed=2,  # earlier iterations failed
-        iterations=[clean_iter],
-    ) is SessionStatus.COMPLETED_INCONCLUSIVE
+    assert (
+        _status_for(
+            LoopStopReason.MAX_ITERATIONS,
+            executed=3,
+            failed=2,  # earlier iterations failed
+            iterations=[clean_iter],
+        )
+        is SessionStatus.COMPLETED_INCONCLUSIVE
+    )
 
 
 def test_session_status_max_iterations_with_failed_final_is_failed() -> None:
@@ -1956,14 +2083,21 @@ def test_session_status_max_iterations_with_failed_final_is_failed() -> None:
     )
 
     context = ContextSnapshot(
-        workspace_root="/tmp/w", request_cwd="/tmp/w", approval_mode="prompt",
+        workspace_root="/tmp/w",
+        request_cwd="/tmp/w",
+        approval_mode="prompt",
     )
     plan = AssistantPlan(assistant_message="tried", actions=[])
     metadata = ProviderResponseMetadata(
-        provider="stub", model="stub", latency_seconds=0.0,
+        provider="stub",
+        model="stub",
+        latency_seconds=0.0,
     )
     failed_iter = OrchestrationIteration(
-        iteration=4, context=context, plan=plan, planning_metadata=metadata,
+        iteration=4,
+        context=context,
+        plan=plan,
+        planning_metadata=metadata,
         execution_results=[
             ExecutionResult(
                 action_id="a1",
@@ -1973,11 +2107,14 @@ def test_session_status_max_iterations_with_failed_final_is_failed() -> None:
             )
         ],
     )
-    assert _status_for(
-        LoopStopReason.MAX_ITERATIONS,
-        failed=4,
-        iterations=[failed_iter],
-    ) is SessionStatus.FAILED
+    assert (
+        _status_for(
+            LoopStopReason.MAX_ITERATIONS,
+            failed=4,
+            iterations=[failed_iter],
+        )
+        is SessionStatus.FAILED
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2012,13 +2149,16 @@ def test_session_status_governance_notice_forces_pending_approval() -> None:
         message="no commit performed",
         staged_paths=["src/pkg/__init__.py"],
     )
-    assert RequestOrchestrator._session_status_for_result(
-        # A classification that would otherwise be COMPLETED:
-        summary=_build_summary_stub(executed=1),
-        stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
-        iterations=[],
-        governance_notice=notice,
-    ) is SessionStatus.PENDING_APPROVAL
+    assert (
+        RequestOrchestrator._session_status_for_result(
+            # A classification that would otherwise be COMPLETED:
+            summary=_build_summary_stub(executed=1),
+            stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
+            iterations=[],
+            governance_notice=notice,
+        )
+        is SessionStatus.PENDING_APPROVAL
+    )
 
 
 def _build_summary_stub(
@@ -2056,7 +2196,10 @@ def test_commit_approval_invariant_fires_when_staged_without_commit(
 
     def git(*args: str) -> None:
         subprocess.run(
-            ["git", *args], cwd=workspace, check=True, capture_output=True,
+            ["git", *args],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
         )
 
     git("init", "-q", "-b", "main")
@@ -2091,7 +2234,9 @@ def test_commit_approval_invariant_fires_when_staged_without_commit(
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     runtime = CountingShellRuntime(workspace_root=workspace)
     tool_service = LocalToolService(
-        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+        workspace_root=workspace,
+        default_timeout_seconds=5,
+        capture_limit_kb=64,
     )
     orchestrator = RequestOrchestrator(
         workspace_root=workspace,
@@ -2128,7 +2273,10 @@ def test_commit_approval_invariant_silent_without_intent(
 
     def git(*args: str) -> None:
         subprocess.run(
-            ["git", *args], cwd=workspace, check=True, capture_output=True,
+            ["git", *args],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
         )
 
     git("init", "-q", "-b", "main")
@@ -2162,7 +2310,9 @@ def test_commit_approval_invariant_silent_without_intent(
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     runtime = CountingShellRuntime(workspace_root=workspace)
     tool_service = LocalToolService(
-        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+        workspace_root=workspace,
+        default_timeout_seconds=5,
+        capture_limit_kb=64,
     )
     orchestrator = RequestOrchestrator(
         workspace_root=workspace,
@@ -2195,7 +2345,10 @@ def test_commit_approval_invariant_silent_when_commit_planned(
 
     def git(*args: str) -> None:
         subprocess.run(
-            ["git", *args], cwd=workspace, check=True, capture_output=True,
+            ["git", *args],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
         )
 
     git("init", "-q", "-b", "main")
@@ -2240,7 +2393,9 @@ def test_commit_approval_invariant_silent_when_commit_planned(
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     runtime = CountingShellRuntime(workspace_root=workspace)
     tool_service = LocalToolService(
-        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+        workspace_root=workspace,
+        default_timeout_seconds=5,
+        capture_limit_kb=64,
     )
     approval_service = ApprovalService(mode=ApprovalMode.AUTO_EXCEPT_COMMIT)
     orchestrator = RequestOrchestrator(
@@ -2275,7 +2430,10 @@ def test_commit_intent_zero_action_plan_is_repaired_to_commit_action(
 
     def git(*args: str) -> None:
         subprocess.run(
-            ["git", *args], cwd=workspace, check=True, capture_output=True,
+            ["git", *args],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
         )
 
     git("init", "-q", "-b", "main")
@@ -2333,7 +2491,9 @@ def test_commit_intent_zero_action_plan_is_repaired_to_commit_action(
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     runtime = CountingShellRuntime(workspace_root=workspace)
     tool_service = LocalToolService(
-        workspace_root=workspace, default_timeout_seconds=5, capture_limit_kb=64,
+        workspace_root=workspace,
+        default_timeout_seconds=5,
+        capture_limit_kb=64,
     )
     orchestrator = RequestOrchestrator(
         workspace_root=workspace,

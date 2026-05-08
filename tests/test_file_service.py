@@ -188,9 +188,13 @@ class TestFileReadChunkNormal:
         svc, ws = _make_service(tmp_path)
         self._write_numbered(ws, "big.txt", 500)
 
-        result = svc.read_chunk(FileReadChunkRequest(
-            path="big.txt", start_line=100, max_lines=50,
-        ))
+        result = svc.read_chunk(
+            FileReadChunkRequest(
+                path="big.txt",
+                start_line=100,
+                max_lines=50,
+            )
+        )
 
         assert result.start_line == 100
         assert result.end_line == 149
@@ -202,9 +206,12 @@ class TestFileReadChunkNormal:
         svc, ws = _make_service(tmp_path)
         self._write_numbered(ws, "small.txt", 10)
 
-        result = svc.read_chunk(FileReadChunkRequest(
-            path="small.txt", start_line=100,
-        ))
+        result = svc.read_chunk(
+            FileReadChunkRequest(
+                path="small.txt",
+                start_line=100,
+            )
+        )
 
         assert result.content == ""
         assert result.end_line == 0
@@ -214,9 +221,13 @@ class TestFileReadChunkNormal:
         svc, ws = _make_service(tmp_path)
         self._write_numbered(ws, "big.txt", 500)
 
-        result = svc.read_chunk(FileReadChunkRequest(
-            path="big.txt", start_line=490, max_lines=200,
-        ))
+        result = svc.read_chunk(
+            FileReadChunkRequest(
+                path="big.txt",
+                start_line=490,
+                max_lines=200,
+            )
+        )
 
         assert result.start_line == 490
         assert result.end_line == 500
@@ -293,9 +304,13 @@ class TestFileWriteNormal:
         svc, ws = _make_service(tmp_path)
         (ws / "existing.txt").write_text("old\n", encoding="utf-8")
 
-        result = svc.write(FileWriteRequest(
-            path="existing.txt", content="new\n", overwrite=True,
-        ))
+        result = svc.write(
+            FileWriteRequest(
+                path="existing.txt",
+                content="new\n",
+                overwrite=True,
+            )
+        )
 
         assert result.created is False
         assert (ws / "existing.txt").read_text(encoding="utf-8") == "new\n"
@@ -345,9 +360,13 @@ class TestFileEditNormal:
         (ws / "file.txt").write_text(old, encoding="utf-8")
         sha = _sha256(old)
 
-        result = svc.edit(FileEditRequest(
-            path="file.txt", content="updated\n", expected_sha256=sha,
-        ))
+        result = svc.edit(
+            FileEditRequest(
+                path="file.txt",
+                content="updated\n",
+                expected_sha256=sha,
+            )
+        )
 
         assert (ws / "file.txt").read_text(encoding="utf-8") == "updated\n"
         assert result.sha256 == _sha256("updated\n")
@@ -360,9 +379,13 @@ class TestFileEditNormal:
         f.chmod(0o755)
         sha = _sha256(f.read_text(encoding="utf-8"))
 
-        svc.edit(FileEditRequest(
-            path="script.sh", content="#!/bin/sh\necho new\n", expected_sha256=sha,
-        ))
+        svc.edit(
+            FileEditRequest(
+                path="script.sh",
+                content="#!/bin/sh\necho new\n",
+                expected_sha256=sha,
+            )
+        )
 
         assert f.stat().st_mode & 0o777 == 0o755
 
@@ -372,9 +395,13 @@ class TestFileEditNormal:
         (ws / "f.txt").write_text(old, encoding="utf-8")
         sha = _sha256(old)
 
-        result = svc.edit(FileEditRequest(
-            path="f.txt", content="a\nX\nc\n", expected_sha256=sha,
-        ))
+        result = svc.edit(
+            FileEditRequest(
+                path="f.txt",
+                content="a\nX\nc\n",
+                expected_sha256=sha,
+            )
+        )
 
         # Should show additions and removals
         assert result.diff_summary.startswith("+")
@@ -390,11 +417,13 @@ class TestFileEditErrors:
         svc, _ = _make_service(tmp_path)
 
         with pytest.raises(FileServiceError) as exc_info:
-            svc.edit(FileEditRequest(
-                path="missing.txt",
-                content="x",
-                expected_sha256="a" * 64,
-            ))
+            svc.edit(
+                FileEditRequest(
+                    path="missing.txt",
+                    content="x",
+                    expected_sha256="a" * 64,
+                )
+            )
         assert exc_info.value.error.code == FileErrorCode.FILE_NOT_FOUND
 
     def test_stale_sha256_raises_conflict(self, tmp_path: Path) -> None:
@@ -402,11 +431,13 @@ class TestFileEditErrors:
         (ws / "file.txt").write_text("content\n", encoding="utf-8")
 
         with pytest.raises(FileServiceError) as exc_info:
-            svc.edit(FileEditRequest(
-                path="file.txt",
-                content="new",
-                expected_sha256="b" * 64,
-            ))
+            svc.edit(
+                FileEditRequest(
+                    path="file.txt",
+                    content="new",
+                    expected_sha256="b" * 64,
+                )
+            )
         err = exc_info.value.error
         assert err.code == FileErrorCode.SHA256_CONFLICT
         assert err.detail is not None
@@ -416,11 +447,13 @@ class TestFileEditErrors:
         svc, _ = _make_service(tmp_path)
 
         with pytest.raises(FileServiceError) as exc_info:
-            svc.edit(FileEditRequest(
-                path="../escape.txt",
-                content="x",
-                expected_sha256="a" * 64,
-            ))
+            svc.edit(
+                FileEditRequest(
+                    path="../escape.txt",
+                    content="x",
+                    expected_sha256="a" * 64,
+                )
+            )
         assert exc_info.value.error.code == FileErrorCode.PATH_OUTSIDE_WORKSPACE
 
 
@@ -434,15 +467,7 @@ class TestFileApplyDiffNormal:
         svc, ws = _make_service(tmp_path)
         (ws / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
 
-        diff = (
-            "--- a/file.txt\n"
-            "+++ b/file.txt\n"
-            "@@ -1,3 +1,3 @@\n"
-            " a\n"
-            "-b\n"
-            "+B\n"
-            " c\n"
-        )
+        diff = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
         result = svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
 
         assert (ws / "file.txt").read_text(encoding="utf-8") == "a\nB\nc\n"
@@ -478,13 +503,7 @@ class TestFileApplyDiffNormal:
         svc, ws = _make_service(tmp_path)
         (ws / "file.txt").write_text("a\nb\n", encoding="utf-8")
 
-        diff = (
-            "@@ -1,2 +1,4 @@\n"
-            " a\n"
-            "+x\n"
-            "+y\n"
-            " b\n"
-        )
+        diff = "@@ -1,2 +1,4 @@\n a\n+x\n+y\n b\n"
         result = svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
 
         assert (ws / "file.txt").read_text(encoding="utf-8") == "a\nx\ny\nb\n"
@@ -501,13 +520,7 @@ class TestFileApplyDiffErrors:
         svc, ws = _make_service(tmp_path)
         (ws / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
 
-        diff = (
-            "@@ -1,3 +1,3 @@\n"
-            " a\n"
-            "-WRONG\n"
-            "+B\n"
-            " c\n"
-        )
+        diff = "@@ -1,3 +1,3 @@\n a\n-WRONG\n+B\n c\n"
         with pytest.raises(FileServiceError) as exc_info:
             svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
         assert exc_info.value.error.code == FileErrorCode.DIFF_APPLY_FAILED
@@ -518,16 +531,7 @@ class TestFileApplyDiffErrors:
         (ws / "file.txt").write_text(original, encoding="utf-8")
 
         # First hunk matches, second does not
-        diff = (
-            "@@ -1,2 +1,2 @@\n"
-            " a\n"
-            "-b\n"
-            "+B\n"
-            "@@ -4,2 +4,2 @@\n"
-            " d\n"
-            "-WRONG\n"
-            "+E\n"
-        )
+        diff = "@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -4,2 +4,2 @@\n d\n-WRONG\n+E\n"
         with pytest.raises(FileServiceError) as exc_info:
             svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
         assert exc_info.value.error.code == FileErrorCode.DIFF_APPLY_FAILED
@@ -539,12 +543,7 @@ class TestFileApplyDiffErrors:
         svc, ws = _make_service(tmp_path)
         (ws / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
 
-        diff = (
-            "@@ -1,3 +1,2 @@\n"
-            " a\n"
-            "-b\n"
-            " c\n"
-        )
+        diff = "@@ -1,3 +1,2 @@\n a\n-b\n c\n"
         with pytest.raises(FileServiceError) as exc_info:
             svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
         assert exc_info.value.error.code == FileErrorCode.DIFF_REJECTED
@@ -553,13 +552,7 @@ class TestFileApplyDiffErrors:
         svc, ws = _make_service(tmp_path)
         (ws / "old.txt").write_text("a\n", encoding="utf-8")
 
-        diff = (
-            "--- a/old.txt\n"
-            "+++ b/new.txt\n"
-            "@@ -1,1 +1,1 @@\n"
-            "-a\n"
-            "+A\n"
-        )
+        diff = "--- a/old.txt\n+++ b/new.txt\n@@ -1,1 +1,1 @@\n-a\n+A\n"
         with pytest.raises(FileServiceError) as exc_info:
             svc.apply_diff(FileApplyDiffRequest(path="old.txt", diff=diff))
         assert exc_info.value.error.code == FileErrorCode.DIFF_REJECTED

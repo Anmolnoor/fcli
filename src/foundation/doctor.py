@@ -307,9 +307,7 @@ def _events_log_check(settings: AppSettings) -> DoctorCheck:
                 total_bytes += entry.stat().st_size
             except OSError:
                 continue
-        detail_lines.append(
-            f"current usage: sessions={session_count} bytes={total_bytes}"
-        )
+        detail_lines.append(f"current usage: sessions={session_count} bytes={total_bytes}")
         return DoctorCheck(
             name="Event log",
             status=DoctorStatus.PASS,
@@ -438,9 +436,7 @@ def _capability_registry_check(
     for capability in capabilities:
         required = bool(capability.transport_config.get("required", False))
         status = capability.health.value
-        line = (
-            f"{capability.id}@{capability.version}: {capability.state.value}, {status}"
-        )
+        line = f"{capability.id}@{capability.version}: {capability.state.value}, {status}"
         boundary_parts = [
             f"risk={capability.risk_class.value}",
             f"trust={capability.trust_tier.value}",

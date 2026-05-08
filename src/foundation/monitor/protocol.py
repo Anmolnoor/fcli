@@ -22,12 +22,7 @@ _INTERNAL_KEYS = frozenset({"event_schema_version", "event_time", "level"})
 
 
 def _utcnow_iso() -> str:
-    return (
-        datetime.now(tz=UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def build_envelope(
@@ -43,8 +38,7 @@ def build_envelope(
     inner: dict[str, Any] = {
         key: value
         for key, value in payload.items()
-        if key not in _INTERNAL_KEYS
-        and key not in {"request_id", "session_id"}
+        if key not in _INTERNAL_KEYS and key not in {"request_id", "session_id"}
     }
     return {
         "event_schema_version": EVENT_SCHEMA_VERSION,
@@ -59,6 +53,5 @@ def build_envelope(
 def encode_envelope(envelope: Mapping[str, Any]) -> bytes:
     """Encode one envelope as a single NDJSON line (UTF-8, ``\\n`` terminated)."""
     return (
-        json.dumps(envelope, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        + "\n"
+        json.dumps(envelope, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")

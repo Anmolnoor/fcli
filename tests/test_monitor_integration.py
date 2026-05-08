@@ -102,9 +102,7 @@ def test_file_writer_and_unix_subscriber_receive_same_turn(
 
     file_lines = [
         line
-        for line in (events_dir / "sess-int.ndjson")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        for line in (events_dir / "sess-int.ndjson").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     socket_lines = [line.decode("utf-8") for line in received_lines if line]
@@ -123,9 +121,7 @@ def test_file_writer_and_unix_subscriber_receive_same_turn(
     assert socket_events == file_events
 
 
-def test_file_and_unix_subscriber_byte_parity(
-    short_socket_dir: Path, tmp_path: Path
-) -> None:
+def test_file_and_unix_subscriber_byte_parity(short_socket_dir: Path, tmp_path: Path) -> None:
     """The on-disk NDJSON bytes match what the live socket subscriber sees.
 
     The plan calls for byte-level identity between the persistent log and
@@ -171,16 +167,29 @@ def test_file_and_unix_subscriber_byte_parity(
         events = [
             ("user_request", {"request_id": "r-2", "request_text": "fix bug"}),
             ("session_start", {"request_id": "r-2", "session_id": "sess-byte"}),
-            ("iteration_started",
-             {"request_id": "r-2", "session_id": "sess-byte", "iteration": 1}),
-            ("tool_call_started",
-             {"request_id": "r-2", "session_id": "sess-byte",
-              "action_id": "a1", "tool": "foundation.file.read"}),
-            ("tool_call_finished",
-             {"request_id": "r-2", "session_id": "sess-byte",
-              "action_id": "a1", "tool": "foundation.file.read"}),
-            ("session_end",
-             {"request_id": "r-2", "session_id": "sess-byte", "status": "completed"}),
+            ("iteration_started", {"request_id": "r-2", "session_id": "sess-byte", "iteration": 1}),
+            (
+                "tool_call_started",
+                {
+                    "request_id": "r-2",
+                    "session_id": "sess-byte",
+                    "action_id": "a1",
+                    "tool": "foundation.file.read",
+                },
+            ),
+            (
+                "tool_call_finished",
+                {
+                    "request_id": "r-2",
+                    "session_id": "sess-byte",
+                    "action_id": "a1",
+                    "tool": "foundation.file.read",
+                },
+            ),
+            (
+                "session_end",
+                {"request_id": "r-2", "session_id": "sess-byte", "status": "completed"},
+            ),
         ]
         for name, payload in events:
             sink(name, payload)
@@ -204,20 +213,14 @@ def test_file_and_unix_subscriber_byte_parity(
     # The first event (user_request) precedes session_start; the writer
     # back-fills session_id on flush so its bytes legitimately differ from
     # what the live publish saw. Compare in-session events only.
-    file_in_session = [
-        line for line in norm_file if b'"event":"user_request"' not in line
-    ]
-    socket_in_session = [
-        line for line in norm_socket if b'"event":"user_request"' not in line
-    ]
+    file_in_session = [line for line in norm_file if b'"event":"user_request"' not in line]
+    socket_in_session = [line for line in norm_socket if b'"event":"user_request"' not in line]
     assert file_in_session == socket_in_session
     # Sanity: the in-session bytes are non-trivial.
     assert len(file_in_session) >= 5
 
 
-def test_compose_event_sink_isolates_failing_sink(
-    short_socket_dir: Path, tmp_path: Path
-) -> None:
+def test_compose_event_sink_isolates_failing_sink(short_socket_dir: Path, tmp_path: Path) -> None:
     """A throwing sink must not break the file writer or the live subscriber."""
     socket_path = short_socket_dir / "m.sock"
     events_dir = tmp_path / "events"

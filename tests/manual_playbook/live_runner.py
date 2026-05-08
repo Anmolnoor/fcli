@@ -109,16 +109,20 @@ def _render_report(
             f" ({result.governance_notice.message})"
         )
 
-    lines.extend([
-        "",
-        "## Graders",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Graders",
+        ]
+    )
     lines.extend(f"- {outcome.render()}" for outcome in run.outcomes)
-    lines.extend([
-        "",
-        "## Assistant Message",
-        result.assistant_message.content,
-    ])
+    lines.extend(
+        [
+            "",
+            "## Assistant Message",
+            result.assistant_message.content,
+        ]
+    )
     return "\n".join(lines)
 
 

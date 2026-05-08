@@ -217,18 +217,18 @@ class GitService:
 
         for line in proc.stdout.splitlines():
             if line.startswith("# branch.oid "):
-                oid = line[len("# branch.oid "):]
+                oid = line[len("# branch.oid ") :]
                 commit_hash = None if oid == "(initial)" else oid
             elif line.startswith("# branch.head "):
-                head = line[len("# branch.head "):]
+                head = line[len("# branch.head ") :]
                 if head == "(detached)":
                     detached_head = True
                 else:
                     branch = head
             elif line.startswith("# branch.upstream "):
-                upstream = line[len("# branch.upstream "):]
+                upstream = line[len("# branch.upstream ") :]
             elif line.startswith("# branch.ab "):
-                parts = line[len("# branch.ab "):].split()
+                parts = line[len("# branch.ab ") :].split()
                 if len(parts) >= 2:
                     ahead = int(parts[0].lstrip("+"))
                     behind = abs(int(parts[1]))
@@ -256,17 +256,21 @@ class GitService:
                     new_path = path_part
                     orig_path = None
                 if xy[0] != ".":
-                    staged.append(GitFileChange(
-                        path=new_path,
-                        status=_status_name(xy[0]),
-                        original_path=orig_path,
-                    ))
+                    staged.append(
+                        GitFileChange(
+                            path=new_path,
+                            status=_status_name(xy[0]),
+                            original_path=orig_path,
+                        )
+                    )
                 if xy[1] != ".":
-                    unstaged.append(GitFileChange(
-                        path=new_path,
-                        status=_status_name(xy[1]),
-                        original_path=orig_path,
-                    ))
+                    unstaged.append(
+                        GitFileChange(
+                            path=new_path,
+                            status=_status_name(xy[1]),
+                            original_path=orig_path,
+                        )
+                    )
             elif line.startswith("u "):
                 # Unmerged: u XY sub m1 m2 m3 mW h1 h2 h3 <path>
                 parts = line.split(maxsplit=10)
@@ -280,10 +284,9 @@ class GitService:
         rebase_in_progress = False
         if self._git_dir is not None:
             merge_in_progress = (self._git_dir / "MERGE_HEAD").exists()
-            rebase_in_progress = (
-                (self._git_dir / "rebase-merge").is_dir()
-                or (self._git_dir / "rebase-apply").is_dir()
-            )
+            rebase_in_progress = (self._git_dir / "rebase-merge").is_dir() or (
+                self._git_dir / "rebase-apply"
+            ).is_dir()
 
         return GitStatusResult(
             branch=branch,
@@ -385,14 +388,16 @@ class GitService:
             parts = line.split(sep, 5)
             if len(parts) != 6:
                 continue
-            entries.append(GitLogEntry(
-                hash=parts[0],
-                short_hash=parts[1],
-                author_name=parts[2],
-                author_email=parts[3],
-                date=parts[4],
-                message=parts[5],
-            ))
+            entries.append(
+                GitLogEntry(
+                    hash=parts[0],
+                    short_hash=parts[1],
+                    author_name=parts[2],
+                    author_email=parts[3],
+                    date=parts[4],
+                    message=parts[5],
+                )
+            )
 
         truncated = len(entries) > request.max_count
         if truncated:
@@ -444,7 +449,11 @@ class GitService:
 
         # Get changed paths from the new commit
         tree_proc = self._run_git(
-            "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD",
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "HEAD",
         )
         paths = [p for p in tree_proc.stdout.strip().splitlines() if p]
 

@@ -112,9 +112,7 @@ class ApprovalService:
                 capability_id=request.capability_id,
                 mode=self._mode.value,
                 status=ApprovalDecisionStatus.PENDING,
-                reason=(
-                    f"Approval required under approval.mode=auto-except-commit ({gated})."
-                ),
+                reason=(f"Approval required under approval.mode=auto-except-commit ({gated})."),
                 requested_at=requested_at,
                 resolved_at=resolved_at,
                 risk_categories=list(request.risk_categories),
@@ -163,12 +161,8 @@ class ApprovalService:
         return sorted(categories)
 
 
-_AUTO_EXCEPT_COMMIT_GATED_CAPABILITIES: frozenset[str] = frozenset(
-    {"foundation.git.commit"}
-)
-_AUTO_EXCEPT_COMMIT_GATED_SIDE_EFFECTS: frozenset[str] = frozenset(
-    {"network", "outside_workspace"}
-)
+_AUTO_EXCEPT_COMMIT_GATED_CAPABILITIES: frozenset[str] = frozenset({"foundation.git.commit"})
+_AUTO_EXCEPT_COMMIT_GATED_SIDE_EFFECTS: frozenset[str] = frozenset({"network", "outside_workspace"})
 
 
 def _auto_except_commit_gated(request: CapabilityApprovalRequest) -> str | None:

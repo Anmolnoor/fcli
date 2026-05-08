@@ -26,9 +26,7 @@ def _build_settings(
         monitor=MonitorSection(
             enabled=enabled,
             events_dir=events_dir,
-            retention=MonitorRetentionSection(
-                max_sessions=10, max_bytes=1024 * 1024
-            ),
+            retention=MonitorRetentionSection(max_sessions=10, max_bytes=1024 * 1024),
             live_transports=transports or [],
             socket_path=socket_path,
             http_port=http_port,
@@ -70,9 +68,7 @@ def test_events_log_check_warns_when_dir_missing_but_creatable(
 
 def test_events_log_check_warns_when_disabled(tmp_path: Path) -> None:
     events_dir = tmp_path / "events"
-    check = _events_log_check(
-        _build_settings(events_dir=events_dir, enabled=False)
-    )
+    check = _events_log_check(_build_settings(events_dir=events_dir, enabled=False))
     assert check.status is DoctorStatus.WARN
     assert "disabled" in check.summary.lower()
 

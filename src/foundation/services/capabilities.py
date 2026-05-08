@@ -309,8 +309,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
             network_rules=[_no_network_rule()],
             side_effect_rules=[_side_effect_rule("filesystem_read")],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=20, rate_limit_count=30,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=20,
+                rate_limit_count=30,
             ),
         ),
     ),
@@ -318,8 +320,7 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
         capability_id=FILE_READ_CHUNK_CAPABILITY_ID,
         name="File Read Chunk",
         description=(
-            "Read a line-based chunk from a workspace text file,"
-            " default 200 lines, maximum 400."
+            "Read a line-based chunk from a workspace text file, default 200 lines, maximum 400."
         ),
         transport=CapabilityTransport.BUILTIN_TOOL,
         runtime_endpoint="builtin.file.read_chunk",
@@ -332,8 +333,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
             network_rules=[_no_network_rule()],
             side_effect_rules=[_side_effect_rule("filesystem_read")],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=20, rate_limit_count=30,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=20,
+                rate_limit_count=30,
             ),
         ),
     ),
@@ -341,8 +344,7 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
         capability_id=FILE_WRITE_CAPABILITY_ID,
         name="File Write",
         description=(
-            "Create a new workspace text file or overwrite"
-            " an existing one when overwrite=true."
+            "Create a new workspace text file or overwrite an existing one when overwrite=true."
         ),
         transport=CapabilityTransport.BUILTIN_TOOL,
         runtime_endpoint="builtin.file.write",
@@ -358,8 +360,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("workspace_write"),
             ],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=10, rate_limit_count=20,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=10,
+                rate_limit_count=20,
             ),
         ),
     ),
@@ -367,8 +371,7 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
         capability_id=FILE_EDIT_CAPABILITY_ID,
         name="File Edit",
         description=(
-            "Rewrite an existing workspace text file"
-            " with conflict detection via expected_sha256."
+            "Rewrite an existing workspace text file with conflict detection via expected_sha256."
         ),
         transport=CapabilityTransport.BUILTIN_TOOL,
         runtime_endpoint="builtin.file.edit",
@@ -384,8 +387,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("workspace_write"),
             ],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=10, rate_limit_count=20,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=10,
+                rate_limit_count=20,
             ),
         ),
     ),
@@ -410,8 +415,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("workspace_write"),
             ],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=10, rate_limit_count=20,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=10,
+                rate_limit_count=20,
             ),
         ),
     ),
@@ -420,8 +427,7 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
         capability_id=GIT_STATUS_CAPABILITY_ID,
         name="Git Status",
         description=(
-            "Inspect repository branch, staged state,"
-            " unstaged changes, and conflict indicators."
+            "Inspect repository branch, staged state, unstaged changes, and conflict indicators."
         ),
         transport=CapabilityTransport.BUILTIN_TOOL,
         runtime_endpoint="builtin.git.status",
@@ -434,8 +440,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
             network_rules=[_no_network_rule()],
             side_effect_rules=[_side_effect_rule("filesystem_read")],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=128,
-                max_invocations=20, rate_limit_count=30,
+                timeout_seconds=30,
+                output_limit_kb=128,
+                max_invocations=20,
+                rate_limit_count=30,
             ),
         ),
         binary="git",
@@ -455,8 +463,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
             network_rules=[_no_network_rule()],
             side_effect_rules=[_side_effect_rule("filesystem_read")],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=20, rate_limit_count=30,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=20,
+                rate_limit_count=30,
             ),
         ),
         binary="git",
@@ -476,8 +486,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
             network_rules=[_no_network_rule()],
             side_effect_rules=[_side_effect_rule("filesystem_read")],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=256,
-                max_invocations=20, rate_limit_count=30,
+                timeout_seconds=30,
+                output_limit_kb=256,
+                max_invocations=20,
+                rate_limit_count=30,
             ),
         ),
         binary="git",
@@ -497,8 +509,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
             network_rules=[_no_network_rule()],
             side_effect_rules=[_side_effect_rule("filesystem_read")],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=128,
-                max_invocations=20, rate_limit_count=30,
+                timeout_seconds=30,
+                output_limit_kb=128,
+                max_invocations=20,
+                rate_limit_count=30,
             ),
         ),
         binary="git",
@@ -521,8 +535,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("workspace_write"),
             ],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=128,
-                max_invocations=10, rate_limit_count=20,
+                timeout_seconds=30,
+                output_limit_kb=128,
+                max_invocations=10,
+                rate_limit_count=20,
             ),
         ),
         binary="git",
@@ -545,8 +561,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("workspace_write"),
             ],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=128,
-                max_invocations=10, rate_limit_count=20,
+                timeout_seconds=30,
+                output_limit_kb=128,
+                max_invocations=10,
+                rate_limit_count=20,
             ),
         ),
         binary="git",
@@ -572,8 +590,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("workspace_write", CapabilitySideEffectMode.REQUIRE_APPROVAL),
             ],
             invocation_budget=_budget(
-                timeout_seconds=30, output_limit_kb=128,
-                max_invocations=5, rate_limit_count=10,
+                timeout_seconds=30,
+                output_limit_kb=128,
+                max_invocations=5,
+                rate_limit_count=10,
             ),
         ),
         binary="git",
@@ -613,8 +633,10 @@ _BUILTIN_CAPABILITIES: tuple[_BuiltinCapabilitySpec, ...] = (
                 _side_effect_rule("unknown", CapabilitySideEffectMode.REQUIRE_APPROVAL),
             ],
             invocation_budget=_budget(
-                timeout_seconds=300, output_limit_kb=256,
-                max_invocations=15, rate_limit_count=20,
+                timeout_seconds=300,
+                output_limit_kb=256,
+                max_invocations=15,
+                rate_limit_count=20,
             ),
         ),
     ),
@@ -710,9 +732,7 @@ class CapabilityStore:
     def list_manifests(self) -> list[CapabilityManifest]:
         """Return all manifest versions that validated successfully."""
         return [
-            document.manifest
-            for document in self.list_documents()
-            if document.manifest is not None
+            document.manifest for document in self.list_documents() if document.manifest is not None
         ]
 
 
@@ -729,9 +749,7 @@ class CapabilityResolver:
     ) -> CapabilityManifest | None:
         """Resolve one capability by id and optional semantic version."""
         matches = [
-            manifest
-            for manifest in self._store.list_manifests()
-            if manifest.id == capability_id
+            manifest for manifest in self._store.list_manifests() if manifest.id == capability_id
         ]
         if not matches:
             return None
@@ -805,11 +823,7 @@ class CapabilityRegistry:
 
     def invalid_manifests(self) -> list[CapabilityDocument]:
         """Return store entries that failed manifest validation."""
-        return [
-            document
-            for document in self._store.list_documents()
-            if document.manifest is None
-        ]
+        return [document for document in self._store.list_documents() if document.manifest is None]
 
     def resolve(
         self,
@@ -821,9 +835,7 @@ class CapabilityRegistry:
     ) -> CapabilityManifest:
         """Resolve one installed capability and enforce lifecycle state."""
         matches = [
-            manifest
-            for manifest in self._manifest_inventory()
-            if manifest.id == capability_id
+            manifest for manifest in self._manifest_inventory() if manifest.id == capability_id
         ]
         manifest = None
         if matches:
@@ -930,9 +942,7 @@ class CapabilityRegistry:
 
     def _manifest_inventory(self) -> list[CapabilityManifest]:
         manifests = self._store.list_manifests()
-        manifest_by_key = {
-            (manifest.id, str(manifest.version)): manifest for manifest in manifests
-        }
+        manifest_by_key = {(manifest.id, str(manifest.version)): manifest for manifest in manifests}
         builtin_keys: set[tuple[str, str]] = set()
         inventory: list[CapabilityManifest] = []
 
@@ -960,9 +970,7 @@ class CapabilityRegistry:
                 return CapabilityHealth.HEALTHY, "Built-in tool requires no external binary."
             if not isinstance(binary_name, str) or not binary_name:
                 return CapabilityHealth.UNHEALTHY, "Built-in tool manifests must declare a binary."
-            availability = {
-                item.name: item for item in self._tool_service.availability_report()
-            }
+            availability = {item.name: item for item in self._tool_service.availability_report()}
             item = availability.get(binary_name)
             if item is None:
                 return CapabilityHealth.UNHEALTHY, f"Binary {binary_name!r} is not tracked."

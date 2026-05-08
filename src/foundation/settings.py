@@ -401,9 +401,7 @@ class MonitorSection(BaseModel):
             if text in {"unix", "http"} and text not in normalized:
                 normalized.append(text)
             elif text and text not in {"unix", "http"}:
-                raise ValueError(
-                    f"Unsupported monitor live transport: {text!r}"
-                )
+                raise ValueError(f"Unsupported monitor live transport: {text!r}")
         return normalized
 
 
@@ -436,9 +434,7 @@ class AppSettings(BaseSettings):
         follow automatically. An explicit `history.database_path` still wins.
         """
         if "database_path" not in self.history.model_fields_set:
-            self.history.database_path = (
-                self.app.state_dir / "history.sqlite3"
-            ).resolve()
+            self.history.database_path = (self.app.state_dir / "history.sqlite3").resolve()
         if "events_dir" not in self.monitor.model_fields_set:
             self.monitor.events_dir = (self.app.state_dir / "events").resolve()
         return self
@@ -591,10 +587,7 @@ def _read_env_file(
             stripped = stripped.removeprefix("export ").strip()
         if "=" not in stripped:
             raise SettingsLoadError(
-                (
-                    f"Invalid env assignment in {env_file_path} at line {line_number}: "
-                    f"{line!r}"
-                ),
+                (f"Invalid env assignment in {env_file_path} at line {line_number}: {line!r}"),
                 config_path=config_path,
             )
 
@@ -602,10 +595,7 @@ def _read_env_file(
         key = key.strip()
         if not key:
             raise SettingsLoadError(
-                (
-                    f"Invalid env assignment in {env_file_path} at line {line_number}: "
-                    f"{line!r}"
-                ),
+                (f"Invalid env assignment in {env_file_path} at line {line_number}: {line!r}"),
                 config_path=config_path,
             )
 

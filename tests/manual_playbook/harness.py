@@ -141,9 +141,7 @@ def _resolve_graders(scenario: Scenario, workspace: Path) -> list:
     """Rebind graders whose parameters depend on the scenario workspace."""
     resolved = []
     for grader in scenario.graders:
-        if getattr(grader, "__qualname__", "").startswith(
-            "assert_no_invented_paths"
-        ):
+        if getattr(grader, "__qualname__", "").startswith("assert_no_invented_paths"):
             resolved.append(assert_no_invented_paths(path_roots=[workspace]))
         else:
             resolved.append(grader)

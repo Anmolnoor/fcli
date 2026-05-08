@@ -35,9 +35,7 @@ def test_publish_delivers_to_all_subscribers() -> None:
 def test_unregister_removes_subscriber() -> None:
     received: list[bytes] = []
     with MonitorServer() as server:
-        sub_id = server.register(
-            lambda line: bool(received.append(line)) or True, label="x"
-        )
+        sub_id = server.register(lambda line: bool(received.append(line)) or True, label="x")
         server.publish("a", {})
         assert _wait_until(lambda: len(received) == 1)
         server.unregister(sub_id)
@@ -72,9 +70,7 @@ def test_overflow_drops_slow_subscriber_only() -> None:
             server.publish("evt", {"i": i})
 
         # Wait for the slow subscriber to be evicted.
-        assert _wait_until(
-            lambda: server.subscriber_count == 1, timeout=2.0
-        )
+        assert _wait_until(lambda: server.subscriber_count == 1, timeout=2.0)
         # Suppress unused warning while still asserting we kept the slow id.
         assert slow_id > 0
         block_release.set()

@@ -54,9 +54,7 @@ def _emit_session(
 
 def _read_lines(path: Path) -> list[dict]:
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -266,13 +264,9 @@ def test_compose_event_sink_skips_none_sinks() -> None:
 def test_writer_no_op_when_session_start_missing_session_id(tmp_path: Path) -> None:
     events_dir = tmp_path / "events"
     with EventLogWriter(events_dir=events_dir) as writer:
-        writer.write_event(
-            EVENT_USER_REQUEST, {"request_id": "r", "request_text": "x"}
-        )
+        writer.write_event(EVENT_USER_REQUEST, {"request_id": "r", "request_text": "x"})
         # No session_id → no file is opened, no index row appended on end.
-        writer.write_event(
-            EVENT_SESSION_END, {"request_id": "r", "status": "completed"}
-        )
+        writer.write_event(EVENT_SESSION_END, {"request_id": "r", "status": "completed"})
     assert not (events_dir / "sessions.jsonl").exists()
     assert list(events_dir.glob("*.ndjson")) == []
 
@@ -359,12 +353,8 @@ def test_writer_disk_full_marks_session_truncated(
     monkeypatch.setattr(os, "open", fake_open)
 
     with writer:
-        writer.write_event(
-            EVENT_USER_REQUEST, {"request_id": "r", "request_text": "x"}
-        )
-        writer.write_event(
-            EVENT_SESSION_START, {"request_id": "r", "session_id": "sess-1"}
-        )
+        writer.write_event(EVENT_USER_REQUEST, {"request_id": "r", "request_text": "x"})
+        writer.write_event(EVENT_SESSION_START, {"request_id": "r", "session_id": "sess-1"})
 
         class _BoomHandle:
             def write(self, _data):  # noqa: ANN001

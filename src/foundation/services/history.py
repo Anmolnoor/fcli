@@ -1255,11 +1255,7 @@ class HistoryStore:
         steps = trace_steps or self._load_trace_steps(connection, session_id=session_id)
         execution_steps = [step for step in steps if isinstance(step, ExecutionStep)]
         capability_ids = sorted(
-            {
-                step.capability_id
-                for step in execution_steps
-                if step.capability_id is not None
-            }
+            {step.capability_id for step in execution_steps if step.capability_id is not None}
         )
         return TraceSummary(
             trace_id=session_id,
@@ -1359,8 +1355,7 @@ class HistoryStore:
     def _migrate_to_v4(connection: sqlite3.Connection) -> None:
         """Migrate from schema v3 to v4: add iteration columns."""
         columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(assistant_plans)").fetchall()
+            row[1] for row in connection.execute("PRAGMA table_info(assistant_plans)").fetchall()
         }
         if "iteration" not in columns:
             connection.execute(
@@ -1380,8 +1375,7 @@ class HistoryStore:
     def _migrate_to_v5(connection: sqlite3.Connection) -> None:
         """Migrate from schema v4 to v5: rename REPLAN edges to REPLANNED_FROM."""
         connection.execute(
-            "UPDATE trace_edges SET edge_kind = 'replanned_from' "
-            "WHERE edge_kind = 'replan'"
+            "UPDATE trace_edges SET edge_kind = 'replanned_from' WHERE edge_kind = 'replan'"
         )
 
     @staticmethod
@@ -1401,10 +1395,7 @@ class HistoryStore:
         # we simulate via DDL inspection is unnecessary — we always rebuild
         # to guarantee the constraint shape.
         existing_indices = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA index_list('assistant_plans')"
-            ).fetchall()
+            row[1] for row in connection.execute("PRAGMA index_list('assistant_plans')").fetchall()
         }
         # If a unique index over both columns is already in place, no
         # rebuild is required.
@@ -1412,9 +1403,7 @@ class HistoryStore:
         for index_name in existing_indices:
             cols = [
                 row[2]
-                for row in connection.execute(
-                    f"PRAGMA index_info('{index_name}')"
-                ).fetchall()
+                for row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
             ]
             if cols == ["session_id", "iteration"]:
                 already_correct = True

@@ -180,7 +180,9 @@ class TestGitStatusNormal:
         # Merge to create conflict
         subprocess.run(
             ["git", "merge", "feature"],
-            cwd=ws, capture_output=True, text=True,
+            cwd=ws,
+            capture_output=True,
+            text=True,
         )
 
         result = svc.status(GitStatusRequest())
@@ -762,8 +764,7 @@ class TestGitCapabilityRegistration:
 
         # Check that workspace_write has REQUIRE_APPROVAL
         ws_write_rules = [
-            r for r in manifest.constraints.side_effect_rules
-            if r.side_effect == "workspace_write"
+            r for r in manifest.constraints.side_effect_rules if r.side_effect == "workspace_write"
         ]
         assert len(ws_write_rules) == 1
         assert ws_write_rules[0].mode == CapabilitySideEffectMode.REQUIRE_APPROVAL

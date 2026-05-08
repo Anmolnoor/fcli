@@ -56,9 +56,7 @@ class ObserverService:
         """Replace the event sink callback (or clear it with ``None``)."""
         self._event_sink = event_sink
 
-    def _dispatch_to_sink(
-        self, event_name: str, payload: Mapping[str, Any]
-    ) -> None:
+    def _dispatch_to_sink(self, event_name: str, payload: Mapping[str, Any]) -> None:
         if self._event_sink is None:
             return
         try:
@@ -203,9 +201,7 @@ class ObserverService:
         duration_seconds: float,
         iteration: int = 1,
     ) -> str:
-        step_id = self.execution_step_id(
-            request_id, iteration=iteration, action_id=action.id
-        )
+        step_id = self.execution_step_id(request_id, iteration=iteration, action_id=action.id)
         if self._history_store is None or session_id is None:
             return step_id
         capability_id, capability_version, capability_name, manifest_fingerprint = (
@@ -280,9 +276,7 @@ class ObserverService:
         return f"planning:{request_id}:{iteration}"
 
     @staticmethod
-    def execution_step_id(
-        request_id: str, *, iteration: int, action_id: str
-    ) -> str:
+    def execution_step_id(request_id: str, *, iteration: int, action_id: str) -> str:
         """Return the canonical execution step id for one planned action."""
         return f"action:{request_id}:{iteration}:{action_id}"
 
