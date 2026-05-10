@@ -81,9 +81,7 @@ class PlannerService:
     def gather_context(self, *, request_cwd: str) -> ContextSnapshot:
         capability_snapshots = self._capability_registry.planner_snapshot()
         available_tools = [
-            str(item.capability_id)
-            for item in capability_snapshots
-            if item.kind.value == "tool"
+            str(item.capability_id) for item in capability_snapshots if item.kind.value == "tool"
         ]
         notes: list[str] = []
         git_context: dict[str, object] | None = None
@@ -130,7 +128,8 @@ class PlannerService:
         if observation_messages:
             observation_text = "\n\n".join(m.content for m in observation_messages)
         base_messages = self._base_plan_messages(
-            request, context,
+            request,
+            context,
             iteration=iteration,
             remaining_actions=remaining_actions,
             observation_text=observation_text,
@@ -272,7 +271,7 @@ class PlannerService:
             "quotes, do NOT expect glob expansion or variable substitution, "
             "and pass each argument as a separate string. For example, for "
             "`gh api users/x --jq '.name'` use "
-            "`command=\"gh\", args=[\"api\", \"users/x\", \"--jq\", \".name\"]` — "
+            '`command="gh", args=["api", "users/x", "--jq", ".name"]` — '
             "no surrounding quotes on the jq expression. "
             "Do not assume command or tool output before execution. "
             "If verification (tests, type checks, linters) fails, diagnose the error and issue "
@@ -289,16 +288,17 @@ class PlannerService:
             "Action shape guide:\n"
             f"{json.dumps(schema_outline, indent=2)}\n"
             "Context JSON:\n"
-            f"{json.dumps(
-                context.model_dump(mode='json', exclude={'available_capabilities'}),
-                indent=2,
-            )}"
+            f"{
+                json.dumps(
+                    context.model_dump(mode='json', exclude={'available_capabilities'}),
+                    indent=2,
+                )
+            }"
         )
         if observation_text:
             instructions += f"\n\n{observation_text}"
         user_content = (
-            f"{request.message}\n\n"
-            "Respond with a JSON object only. No markdown, no commentary."
+            f"{request.message}\n\nRespond with a JSON object only. No markdown, no commentary."
         )
         return [
             ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=instructions),
@@ -435,16 +435,12 @@ class PlannerService:
         if endpoint == "builtin.man":
             from foundation.services.tools import HelpLookupRequest, HelpLookupSource
 
-            HelpLookupRequest.model_validate(
-                {**arguments, "source": HelpLookupSource.MAN}
-            )
+            HelpLookupRequest.model_validate({**arguments, "source": HelpLookupSource.MAN})
             return
         if endpoint == "builtin.tldr":
             from foundation.services.tools import HelpLookupRequest, HelpLookupSource
 
-            HelpLookupRequest.model_validate(
-                {**arguments, "source": HelpLookupSource.TLDR}
-            )
+            HelpLookupRequest.model_validate({**arguments, "source": HelpLookupSource.TLDR})
             return
         if endpoint == "builtin.shell":
             from foundation.models import ShellAction

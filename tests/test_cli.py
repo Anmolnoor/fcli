@@ -705,6 +705,7 @@ def test_chat_one_shot_defaults_to_concise_rendering(
     assert result.exit_code == 0
     assert "I inspected the workspace context." in result.stdout
 
+
 def test_chat_one_shot_accepts_no_live_flag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -728,9 +729,13 @@ def test_chat_one_shot_accepts_no_live_flag(
     result = runner.invoke(
         app,
         [
-            "--config", str(config_path),
-            "--no-live", "--no-monitor",
-            "chat", "look", "around",
+            "--config",
+            str(config_path),
+            "--no-live",
+            "--no-monitor",
+            "chat",
+            "look",
+            "around",
         ],
     )
 
@@ -819,9 +824,13 @@ def test_chat_one_shot_no_monitor_writes_no_event_log(
     result = runner.invoke(
         app,
         [
-            "--config", str(config_path),
-            "--no-live", "--no-monitor",
-            "chat", "do", "it",
+            "--config",
+            str(config_path),
+            "--no-live",
+            "--no-monitor",
+            "chat",
+            "do",
+            "it",
         ],
     )
 
@@ -1225,10 +1234,9 @@ def test_chat_interactive_memory_command_updates_project_memory(
 
     assert result.exit_code == 0
     assert "Always run tests before merge." in result.stdout
-    assert (
-        (tmp_path / "workspace" / "FOUNDATION.md").read_text(encoding="utf-8")
-        == "Always run tests before merge.\n"
-    )
+    assert (tmp_path / "workspace" / "FOUNDATION.md").read_text(
+        encoding="utf-8"
+    ) == "Always run tests before merge.\n"
 
 
 def test_chat_interactive_model_command_updates_subsequent_request(
@@ -1904,7 +1912,9 @@ def _iteration_result_for_notices(
         approval_mode="prompt",
     )
     planning_metadata = ProviderResponseMetadata(
-        provider="stub", model="stub-model", latency_seconds=0.01,
+        provider="stub",
+        model="stub-model",
+        latency_seconds=0.01,
     )
 
     iteration = OrchestrationIteration(

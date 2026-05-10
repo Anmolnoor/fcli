@@ -87,9 +87,7 @@ def init_git_repo(workspace: Path) -> None:
             capture_output=True,
         )
 
-    has_user_content = any(
-        entry.name != ".git" for entry in workspace.iterdir()
-    )
+    has_user_content = any(entry.name != ".git" for entry in workspace.iterdir())
     git("init", "-q", "-b", "main")
     git("config", "user.email", "playbook@example.com")
     git("config", "user.name", "Playbook Runner")

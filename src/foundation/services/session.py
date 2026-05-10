@@ -145,9 +145,7 @@ class ConversationCompactor:
     def _render_summary_block(self, messages: list[ProviderMessage]) -> str:
         lines: list[str] = []
         for message in messages:
-            lines.append(
-                f"- {message.role.value.title()}: {self._preview_text(message.content)}"
-            )
+            lines.append(f"- {message.role.value.title()}: {self._preview_text(message.content)}")
         if not lines:
             return ""
         return "Compacted conversation context:\n" + "\n".join(lines)
@@ -653,9 +651,7 @@ class SessionManager:
     def _snapshot_from_row(self, row: sqlite3.Row) -> SessionSnapshot:
         interrupted_payload = self._load_json_dict(row["interrupted_turn_json"])
         turn_count = (
-            row["turn_count"]
-            if "turn_count" in row.keys()
-            else self._turn_count(row["id"])
+            row["turn_count"] if "turn_count" in row.keys() else self._turn_count(row["id"])
         )
         return SessionSnapshot(
             session_id=row["id"],
@@ -781,10 +777,7 @@ class SessionManager:
             return ""
 
     def _render_recent_turns(self, recent_turns: list[ProviderMessage]) -> str:
-        lines = [
-            f"{message.role.value.title()}: {message.content}"
-            for message in recent_turns
-        ]
+        lines = [f"{message.role.value.title()}: {message.content}" for message in recent_turns]
         return "\n\n".join(lines)
 
     def _load_json_dict(self, raw: str | None) -> dict[str, object] | None:

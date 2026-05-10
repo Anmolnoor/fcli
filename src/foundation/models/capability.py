@@ -26,9 +26,7 @@ class CapabilityId(RootModel[str]):
     def _validate_id(cls, value: str) -> str:
         normalized = value.strip().lower()
         if not _CAPABILITY_ID_RE.fullmatch(normalized):
-            raise ValueError(
-                "Capability ids must match ^[a-z0-9][a-z0-9._-]{0,63}$."
-            )
+            raise ValueError("Capability ids must match ^[a-z0-9][a-z0-9._-]{0,63}$.")
         return normalized
 
     def __str__(self) -> str:

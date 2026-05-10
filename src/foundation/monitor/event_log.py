@@ -255,9 +255,7 @@ class EventLogWriter:
         }
         try:
             with open(self._index_path, "a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n"
-                )
+                handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
             with suppress(OSError):
                 os.chmod(self._index_path, 0o600)
         except OSError as exc:
@@ -290,14 +288,10 @@ class EventLogWriter:
                 with suppress(OSError):
                     Path(file_path).unlink()
         try:
-            tmp_path = self._index_path.with_suffix(
-                self._index_path.suffix + _INDEX_TMP_SUFFIX
-            )
+            tmp_path = self._index_path.with_suffix(self._index_path.suffix + _INDEX_TMP_SUFFIX)
             with open(tmp_path, "w", encoding="utf-8") as handle:
                 for row in keep:
-                    handle.write(
-                        json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n"
-                    )
+                    handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
             os.replace(tmp_path, self._index_path)
             with suppress(OSError):
                 os.chmod(self._index_path, 0o600)

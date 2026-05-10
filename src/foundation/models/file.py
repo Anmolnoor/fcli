@@ -18,6 +18,7 @@ class StrictModel(BaseModel):
 # Error types
 # ---------------------------------------------------------------------------
 
+
 class FileErrorCode(StrEnum):
     """Machine-readable error codes for file capability failures."""
 
@@ -106,6 +107,7 @@ class FileApplyDiffRequest(StrictModel):
 # ---------------------------------------------------------------------------
 # Result models
 # ---------------------------------------------------------------------------
+
 
 class FileReadResult(StrictModel):
     """Result of reading a full workspace text file."""

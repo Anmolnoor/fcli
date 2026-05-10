@@ -49,7 +49,8 @@ def setup(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     # Repo layout: minimal Python package with a failing test.
     (workspace / "src" / "pkg").mkdir(parents=True)
     (workspace / "src" / "pkg" / "__init__.py").write_text(
-        'def hello() -> str:\n    return "world"\n', encoding="utf-8",
+        'def hello() -> str:\n    return "world"\n',
+        encoding="utf-8",
     )
     (workspace / "tests").mkdir()
     (workspace / "tests" / "test_hello.py").write_text(
@@ -65,7 +66,8 @@ def setup(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         encoding="utf-8",
     )
     (workspace / "pyproject.toml").write_text(
-        "[project]\nname = 'pkg'\nversion = '0.0.1'\n", encoding="utf-8",
+        "[project]\nname = 'pkg'\nversion = '0.0.1'\n",
+        encoding="utf-8",
     )
 
     init_git_repo(workspace)

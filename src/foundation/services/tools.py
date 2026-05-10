@@ -387,9 +387,7 @@ class LocalToolService:
         self._default_timeout_seconds = default_timeout_seconds
         self._capture_limit_bytes = capture_limit_kb * 1024
         self._environment = (
-            os.environ.copy()
-            if pass_through_foundation_env
-            else scrub_ambient_env(os.environ)
+            os.environ.copy() if pass_through_foundation_env else scrub_ambient_env(os.environ)
         )
         if environment is not None:
             self._environment.update(environment)

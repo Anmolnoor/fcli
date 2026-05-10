@@ -639,10 +639,7 @@ class OllamaChatAdapter:
             msg_content = message.get("content")
             msg_thinking = message.get("thinking")
             thinking_seen = isinstance(msg_thinking, str) and bool(msg_thinking.strip())
-            msg_detail = (
-                f" message.content={msg_content!r}"
-                f" message.thinking={msg_thinking!r}"
-            )
+            msg_detail = f" message.content={msg_content!r} message.thinking={msg_thinking!r}"
         eval_count = payload.get("eval_count")
         prompt_eval_count = payload.get("prompt_eval_count")
         if json_requested and thinking_seen:

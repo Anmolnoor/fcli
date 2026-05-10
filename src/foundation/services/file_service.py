@@ -65,9 +65,7 @@ def _diff_summary(old_content: str | None, new_content: str) -> str:
     removed = 0
     import difflib
 
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
-        None, old_lines, new_lines
-    ).get_opcodes():
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines).get_opcodes():
         if tag == "insert":
             added += j2 - j1
         elif tag == "delete":
@@ -447,7 +445,9 @@ class FileService:
             _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
         old_content, _ = self._read_raw(resolved)
         new_content = _parse_and_apply_diff(
-            old_content, request.diff, file_path=request.path,
+            old_content,
+            request.diff,
+            file_path=request.path,
         )
         self._atomic_write(resolved, new_content)
         return FileMutationResult(

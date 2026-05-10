@@ -278,13 +278,13 @@ def test_shell_args_preserve_mismatched_or_inner_quotes() -> None:
     request = ShellCommandRequest(
         command="echo",
         args=[
-            "hello",          # plain
-            "",               # empty
-            "'",              # single char, no wrapping possible
-            "'unclosed",      # opens but doesn't close
-            'closed"',        # opposite
-            "it's",           # inner quote, no wrapping
-            "'a'b'",          # matches outer, strips leaving a'b
+            "hello",  # plain
+            "",  # empty
+            "'",  # single char, no wrapping possible
+            "'unclosed",  # opens but doesn't close
+            'closed"',  # opposite
+            "it's",  # inner quote, no wrapping
+            "'a'b'",  # matches outer, strips leaving a'b
         ],
     )
     assert request.args == [

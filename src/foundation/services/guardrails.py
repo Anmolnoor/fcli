@@ -306,7 +306,8 @@ class CapabilityPolicyEngine:
         elif endpoint in {"builtin.man", "builtin.tldr"}:
             requested_side_effects.append("local_help_read")
         elif endpoint in {
-            "builtin.file.read", "builtin.file.read_chunk",
+            "builtin.file.read",
+            "builtin.file.read_chunk",
         }:
             path = arguments.get("path")
             normalized_path = self._normalize_workspace_tool_path(path)
@@ -314,7 +315,9 @@ class CapabilityPolicyEngine:
                 requested_paths.append(normalized_path)
             requested_side_effects.append("filesystem_read")
         elif endpoint in {
-            "builtin.file.write", "builtin.file.edit", "builtin.file.apply_diff",
+            "builtin.file.write",
+            "builtin.file.edit",
+            "builtin.file.apply_diff",
         }:
             path = arguments.get("path")
             normalized_path = self._normalize_workspace_tool_path(path)
@@ -322,25 +325,21 @@ class CapabilityPolicyEngine:
                 requested_paths.append(normalized_path)
             requested_side_effects.append("workspace_write")
         elif endpoint in {
-            "builtin.git.status", "builtin.git.diff",
-            "builtin.git.show", "builtin.git.log",
+            "builtin.git.status",
+            "builtin.git.diff",
+            "builtin.git.show",
+            "builtin.git.log",
         }:
             if endpoint == "builtin.git.diff":
-                requested_paths.extend(
-                    self._normalize_workspace_tool_paths(arguments.get("paths"))
-                )
+                requested_paths.extend(self._normalize_workspace_tool_paths(arguments.get("paths")))
             requested_side_effects.append("filesystem_read")
         elif endpoint in {"builtin.git.stage", "builtin.git.unstage"}:
-            requested_paths.extend(
-                self._normalize_workspace_tool_paths(arguments.get("paths"))
-            )
+            requested_paths.extend(self._normalize_workspace_tool_paths(arguments.get("paths")))
             requested_side_effects.append("workspace_write")
         elif endpoint == "builtin.git.commit":
             requested_side_effects.append("workspace_write")
         else:
-            invalid_summary = (
-                f"Unsupported capability runtime endpoint: {endpoint}"
-            )
+            invalid_summary = f"Unsupported capability runtime endpoint: {endpoint}"
 
         budget = manifest.constraints.invocation_budget
         requested_output_limit_kb = None if budget is None else budget.output_limit_kb
@@ -847,9 +846,7 @@ class CapabilityPolicyEngine:
 
     def _candidate_paths(self, shell: ShellAction) -> list[str]:
         args = shell.args
-        path_commands = (
-            _READ_ONLY_PATH_COMMANDS | _WORKSPACE_WRITE_COMMANDS | _DESTRUCTIVE_COMMANDS
-        )
+        path_commands = _READ_ONLY_PATH_COMMANDS | _WORKSPACE_WRITE_COMMANDS | _DESTRUCTIVE_COMMANDS
         if shell.command in path_commands:
             return [argument for argument in args if argument and not argument.startswith("-")]
         if shell.command in _PERMISSION_COMMANDS:

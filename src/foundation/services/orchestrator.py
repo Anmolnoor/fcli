@@ -74,13 +74,15 @@ _MAX_TOTAL_ACTIONS = 200
 _OBSERVATION_MAX_BYTES = 8 * 1024
 _OBSERVATION_MAX_LINES = 200
 
-_FATAL_ERROR_PATTERNS = frozenset({
-    "failed to start",
-    "could not start command",
-    "unsupported capability",
-    "invalid_capability",
-    "no such file or directory",
-})
+_FATAL_ERROR_PATTERNS = frozenset(
+    {
+        "failed to start",
+        "could not start command",
+        "unsupported capability",
+        "invalid_capability",
+        "no such file or directory",
+    }
+)
 
 # Heuristic intent markers used by the commit-approval runtime invariant.
 # When the user's message contains "commit" as a whole word, or names any of
@@ -95,12 +97,14 @@ _COMMIT_INTENT_PHRASES = (
 _COMMIT_CAPABILITY_ID = "foundation.git.commit"
 
 # Errors that indicate the binary could not run at all (vs. tests failed).
-_VERIFICATION_UNAVAILABLE_PATTERNS = frozenset({
-    "failed to start",
-    "could not start command",
-    "no such file or directory",
-    "command not found",
-})
+_VERIFICATION_UNAVAILABLE_PATTERNS = frozenset(
+    {
+        "failed to start",
+        "could not start command",
+        "no such file or directory",
+        "command not found",
+    }
+)
 
 
 def _verification_outcome_for_result(
@@ -126,26 +130,39 @@ _VERIFICATION_OUTCOME_SEVERITY = {
 
 
 def _worst_verification_outcome(
-    a: VerificationOutcome, b: VerificationOutcome,
+    a: VerificationOutcome,
+    b: VerificationOutcome,
 ) -> VerificationOutcome:
     """Return whichever outcome reflects the more severe state (worst-wins)."""
-    if (
-        _VERIFICATION_OUTCOME_SEVERITY[b]
-        > _VERIFICATION_OUTCOME_SEVERITY[a]
-    ):
+    if _VERIFICATION_OUTCOME_SEVERITY[b] > _VERIFICATION_OUTCOME_SEVERITY[a]:
         return b
     return a
 
-_CODE_CHANGING_ARTIFACT_TYPES = frozenset({
-    ExecutionArtifactType.FILE_WRITE,
-    ExecutionArtifactType.FILE_EDIT,
-    ExecutionArtifactType.FILE_APPLY_DIFF,
-})
 
-_VERIFICATION_COMMANDS = frozenset({
-    "pytest", "python", "npm", "yarn", "make", "cargo", "go",
-    "mypy", "ruff", "flake8", "eslint", "tsc",
-})
+_CODE_CHANGING_ARTIFACT_TYPES = frozenset(
+    {
+        ExecutionArtifactType.FILE_WRITE,
+        ExecutionArtifactType.FILE_EDIT,
+        ExecutionArtifactType.FILE_APPLY_DIFF,
+    }
+)
+
+_VERIFICATION_COMMANDS = frozenset(
+    {
+        "pytest",
+        "python",
+        "npm",
+        "yarn",
+        "make",
+        "cargo",
+        "go",
+        "mypy",
+        "ruff",
+        "flake8",
+        "eslint",
+        "tsc",
+    }
+)
 
 _STOP_REASON_SUFFIXES = {
     LoopStopReason.MAX_ITERATIONS: (
@@ -160,17 +177,13 @@ _STOP_REASON_SUFFIXES = {
     LoopStopReason.FATAL_EXECUTION_FAILURE: (
         "\n\n[Loop stopped: a fatal execution failure occurred.]"
     ),
-    LoopStopReason.NO_PROGRESS: (
-        "\n\n[Loop stopped: no progress detected across iterations.]"
-    ),
+    LoopStopReason.NO_PROGRESS: ("\n\n[Loop stopped: no progress detected across iterations.]"),
 }
 
 # v4 stage 03 — soft-completion notice when NO_PROGRESS fires *after* the
 # loop already produced cumulative changes (i.e. the planner kept retrying
 # already-finished work). Selected by the orchestrator at result-build time.
-_NO_PROGRESS_SOFT_SUFFIX = (
-    "\n\n[Run complete; planner re-issued already-finished actions.]"
-)
+_NO_PROGRESS_SOFT_SUFFIX = "\n\n[Run complete; planner re-issued already-finished actions.]"
 
 # Capabilities whose successful execution should be surfaced in the
 # planner's "COMMANDS ALREADY EXECUTED" summary on the next iteration.
@@ -285,9 +298,7 @@ def _filter_results_for_detector(
             continue
         # Soft failure: idempotent error whose path is already in the
         # cumulative changed-paths set.
-        if _is_soft_failure_for_path(
-            result.error, target, cumulative_changed_paths
-        ):
+        if _is_soft_failure_for_path(result.error, target, cumulative_changed_paths):
             filtered.append(_demote_to_soft(result))
             continue
         filtered.append(result)
@@ -381,13 +392,11 @@ class NoProgressDetector:
             return False
 
         if len(self._failure_fingerprints) >= self._window and all(
-            fp == failure_fp
-            for fp in self._failure_fingerprints[-self._window :]
+            fp == failure_fp for fp in self._failure_fingerprints[-self._window :]
         ):
             return True
         if len(self._action_fingerprints) >= self._window and all(
-            fp == action_fp
-            for fp in self._action_fingerprints[-self._window :]
+            fp == action_fp for fp in self._action_fingerprints[-self._window :]
         ):
             return True
         return False
@@ -739,13 +748,15 @@ class RequestOrchestrator:
             # 3. Zero-action plan → stop
             if not plan.actions:
                 stop_reason = LoopStopReason.ZERO_ACTION_PLAN
-                iterations.append(OrchestrationIteration(
-                    iteration=iteration_index,
-                    context=context,
-                    plan=plan,
-                    planning_metadata=planning_metadata,
-                    stop_reason=stop_reason,
-                ))
+                iterations.append(
+                    OrchestrationIteration(
+                        iteration=iteration_index,
+                        context=context,
+                        plan=plan,
+                        planning_metadata=planning_metadata,
+                        stop_reason=stop_reason,
+                    )
+                )
                 break
 
             # 4. Enforce action budget
@@ -769,12 +780,13 @@ class RequestOrchestrator:
             prev_last_step_id = last_step_id
 
             # 6. Track mutations and verification
-            iter_changed, iter_code_change, iter_outcome, iter_verify_cmds = (
-                self._classify_results(execution_results, actions_to_execute)
+            iter_changed, iter_code_change, iter_outcome, iter_verify_cmds = self._classify_results(
+                execution_results, actions_to_execute
             )
             had_code_changes = had_code_changes or iter_code_change
             verification_outcome = _worst_verification_outcome(
-                verification_outcome, iter_outcome,
+                verification_outcome,
+                iter_outcome,
             )
             verification_commands.extend(iter_verify_cmds)
             for path in iter_changed:
@@ -788,7 +800,9 @@ class RequestOrchestrator:
             # tool calls (file writes, git mutations) so the planner sees
             # them and won't re-issue.
             for action, result in zip(
-                actions_to_execute, execution_results, strict=True,
+                actions_to_execute,
+                execution_results,
+                strict=True,
             ):
                 if result.status is not ExecutionStatus.EXECUTED:
                     continue
@@ -832,17 +846,19 @@ class RequestOrchestrator:
                 remaining_actions=_MAX_TOTAL_ACTIONS - total_actions_executed,
             )
 
-            iterations.append(OrchestrationIteration(
-                iteration=iteration_index,
-                context=context,
-                plan=plan,
-                planning_metadata=planning_metadata,
-                policy_decisions=decisions,
-                policy_evaluations=[e for e in evaluations if e is not None],
-                execution_results=execution_results,
-                observation=observation if stop_reason is None else None,
-                stop_reason=stop_reason,
-            ))
+            iterations.append(
+                OrchestrationIteration(
+                    iteration=iteration_index,
+                    context=context,
+                    plan=plan,
+                    planning_metadata=planning_metadata,
+                    policy_decisions=decisions,
+                    policy_evaluations=[e for e in evaluations if e is not None],
+                    execution_results=execution_results,
+                    observation=observation if stop_reason is None else None,
+                    stop_reason=stop_reason,
+                )
+            )
 
             self._observer.emit(
                 EVENT_ITERATION_COMPLETED,
@@ -887,9 +903,7 @@ class RequestOrchestrator:
             # rebuild observation_messages for the next iteration as:
             # [all prior observations] + [one cumulative "already executed"
             # summary], so the model can't re-plan commands it has run.
-            observation_message_history.extend(
-                self._observation_to_messages(plan, observation)
-            )
+            observation_message_history.extend(self._observation_to_messages(plan, observation))
             observation_messages = list(observation_message_history)
             if executed_command_log:
                 summary_content = (
@@ -917,9 +931,7 @@ class RequestOrchestrator:
         all_evaluations = [e for it in iterations for e in it.policy_evaluations]
         all_results = [r for it in iterations for r in it.execution_results]
 
-        had_fatal_failure = any(
-            self._is_fatal_result(r) for r in all_results
-        )
+        had_fatal_failure = any(self._is_fatal_result(r) for r in all_results)
         msg_content = self._augment_message_with_stop_reason(
             terminal_plan.assistant_message,
             stop_reason,
@@ -929,11 +941,14 @@ class RequestOrchestrator:
         assistant_message = AssistantMessage(content=msg_content)
 
         verification_notice = self._build_verification_notice(
-            had_code_changes, verification_outcome, verification_commands,
+            had_code_changes,
+            verification_outcome,
+            verification_commands,
         )
 
         summary = self._build_summary(
-            iterations, all_results,
+            iterations,
+            all_results,
             plan_only=request.plan_only,
             stop_reason=stop_reason,
         )
@@ -1000,14 +1015,15 @@ class RequestOrchestrator:
             for action, evaluation in zip(actions, evaluations, strict=True)
         ]
         execution_results: list[ExecutionResult] = []
-        candidate_capability_ids = [
-            str(s.capability_id) for s in context.available_capabilities
-        ]
+        candidate_capability_ids = [str(s.capability_id) for s in context.available_capabilities]
         prior_step_id: str | None = None
         last_step_id: str | None = None
 
         for action, decision, evaluation in zip(
-            actions, decisions, evaluations, strict=True,
+            actions,
+            decisions,
+            evaluations,
+            strict=True,
         ):
             if (
                 self._history_store is not None
@@ -1102,16 +1118,18 @@ class RequestOrchestrator:
             if result.status is ExecutionStatus.PENDING_APPROVAL:
                 approval_outcomes.append(f"{action.id}: pending approval")
 
-            action_outcomes.append(ActionOutcome(
-                action_id=action.id,
-                capability_id=capability_id,
-                status=result.status,
-                exit_code=exit_code,
-                changed_paths=action_changed,
-                stdout_preview=stdout_preview,
-                stderr_preview=stderr_preview,
-                error=result.error,
-            ))
+            action_outcomes.append(
+                ActionOutcome(
+                    action_id=action.id,
+                    capability_id=capability_id,
+                    status=result.status,
+                    exit_code=exit_code,
+                    changed_paths=action_changed,
+                    stdout_preview=stdout_preview,
+                    stderr_preview=stderr_preview,
+                    error=result.error,
+                )
+            )
 
         return IterationObservation(
             iteration=iteration,
@@ -1174,9 +1192,7 @@ class RequestOrchestrator:
                     display = " ".join([action.shell.command, *action.shell.args])
                     verify_cmds.append(display)
                     cmd_outcome = _verification_outcome_for_result(result)
-                    iter_outcome = _worst_verification_outcome(
-                        iter_outcome, cmd_outcome
-                    )
+                    iter_outcome = _worst_verification_outcome(iter_outcome, cmd_outcome)
 
         return changed_paths, had_code_changes, iter_outcome, verify_cmds
 
@@ -1199,9 +1215,7 @@ class RequestOrchestrator:
             return None
         reason_by_outcome = {
             VerificationOutcome.PASSED: None,
-            VerificationOutcome.FAILED: (
-                "A verification command ran and reported failure."
-            ),
+            VerificationOutcome.FAILED: ("A verification command ran and reported failure."),
             VerificationOutcome.UNAVAILABLE: (
                 "Verification was attempted but the command could not run "
                 "(binary missing or spawn error)."
@@ -1228,11 +1242,7 @@ class RequestOrchestrator:
         # already produced cumulative changes and no fatal failure, the
         # workspace state actually reflects the user's intent. Swap the
         # red "no progress" suffix for the soft-completion variant.
-        if (
-            stop_reason is LoopStopReason.NO_PROGRESS
-            and cumulative_changed_paths
-            and not had_fatal
-        ):
+        if stop_reason is LoopStopReason.NO_PROGRESS and cumulative_changed_paths and not had_fatal:
             return message + _NO_PROGRESS_SOFT_SUFFIX
         suffix = _STOP_REASON_SUFFIXES.get(stop_reason)
         if suffix:
@@ -1264,8 +1274,7 @@ class RequestOrchestrator:
             return None
 
         planned_commit = any(
-            action.tool_call is not None
-            and action.tool_call.capability_id == _COMMIT_CAPABILITY_ID
+            action.tool_call is not None and action.tool_call.capability_id == _COMMIT_CAPABILITY_ID
             for action in final_iteration.plan.actions
         )
         if planned_commit:
@@ -1422,23 +1431,16 @@ class RequestOrchestrator:
                 if cumulative_changed_paths is not None
                 else cls._aggregate_changed_paths(iterations)
             )
-            fatal = (
-                had_fatal
-                if had_fatal is not None
-                else cls._iterations_had_fatal(iterations)
-            )
+            fatal = had_fatal if had_fatal is not None else cls._iterations_had_fatal(iterations)
             if cumulative and not fatal:
                 return SessionStatus.COMPLETED
             return SessionStatus.COMPLETED_INCONCLUSIVE
         if stop_reason in {LoopStopReason.MAX_ITERATIONS, LoopStopReason.MAX_ACTIONS}:
             last_iter_failed = bool(iterations) and any(
-                r.status is ExecutionStatus.FAILED
-                for r in iterations[-1].execution_results
+                r.status is ExecutionStatus.FAILED for r in iterations[-1].execution_results
             )
             return (
-                SessionStatus.FAILED
-                if last_iter_failed
-                else SessionStatus.COMPLETED_INCONCLUSIVE
+                SessionStatus.FAILED if last_iter_failed else SessionStatus.COMPLETED_INCONCLUSIVE
             )
         # Fallback: no stop reason (e.g. zero-action first plan). Treat as completed
         # unless the aggregate shows unresolved failures, which is a legacy path.
@@ -1464,9 +1466,7 @@ class RequestOrchestrator:
         return ordered
 
     @classmethod
-    def _iterations_had_fatal(
-        cls, iterations: list[OrchestrationIteration]
-    ) -> bool:
+    def _iterations_had_fatal(cls, iterations: list[OrchestrationIteration]) -> bool:
         for it in iterations:
             for r in it.execution_results:
                 if cls._is_fatal_result(r):

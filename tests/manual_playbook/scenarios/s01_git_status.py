@@ -38,7 +38,8 @@ def setup(
 ) -> dict[str, Any]:
     del monkeypatch  # unused for S1
     (workspace / "README.md").write_text(
-        "# playbook repo\n", encoding="utf-8",
+        "# playbook repo\n",
+        encoding="utf-8",
     )
     init_git_repo(workspace)
 

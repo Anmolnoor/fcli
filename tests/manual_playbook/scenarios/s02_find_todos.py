@@ -54,9 +54,7 @@ def stub_responses(workspace: Path) -> list[ProviderResponse]:
             }
         ],
     }
-    summary = zero_action_response(
-        "No TODO comments were found under src/."
-    )
+    summary = zero_action_response("No TODO comments were found under src/.")
     return [provider_response(plan), summary]
 
 

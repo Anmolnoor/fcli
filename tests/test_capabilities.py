@@ -196,9 +196,7 @@ def test_registry_reports_invalid_manifest_documents(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _registry(tmp_path, monkeypatch)
-    invalid_path = (
-        registry.store.root / "broken.manifest" / "1.0.0" / "manifest.json"
-    )
+    invalid_path = registry.store.root / "broken.manifest" / "1.0.0" / "manifest.json"
     invalid_path.parent.mkdir(parents=True, exist_ok=True)
     invalid_path.write_text('{"capability_id": "broken.manifest"}\n', encoding="utf-8")
 

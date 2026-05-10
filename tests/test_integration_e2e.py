@@ -37,7 +37,9 @@ def _provider_response(payload: dict[str, Any]) -> ProviderResponse:
         content=json.dumps(payload),
         structured_output=payload,
         metadata=ProviderResponseMetadata(
-            provider="stub", model="stub-model", latency_seconds=0.01,
+            provider="stub",
+            model="stub-model",
+            latency_seconds=0.01,
         ),
     )
 
@@ -48,9 +50,7 @@ class _StubProvider:
 
     def complete(self, _prompt: ProviderPrompt) -> ProviderResponse:
         if not self._responses:
-            return _provider_response(
-                {"assistant_message": "Done.", "actions": []}
-            )
+            return _provider_response({"assistant_message": "Done.", "actions": []})
         return self._responses.pop(0)
 
 
@@ -85,7 +85,8 @@ def _git_workspace(tmp_path: Path) -> Path:
 
     (workspace / "src" / "pkg").mkdir(parents=True)
     (workspace / "src" / "pkg" / "__init__.py").write_text(
-        "def hello() -> str:\n    return 'world'\n", encoding="utf-8",
+        "def hello() -> str:\n    return 'world'\n",
+        encoding="utf-8",
     )
     (workspace / "tests").mkdir()
     (workspace / "tests" / "test_hello.py").write_text(
@@ -93,12 +94,15 @@ def _git_workspace(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (workspace / "pyproject.toml").write_text(
-        "[project]\nname = 'pkg'\nversion = '0.0.1'\n", encoding="utf-8",
+        "[project]\nname = 'pkg'\nversion = '0.0.1'\n",
+        encoding="utf-8",
     )
 
     def git(*args: str) -> None:
         subprocess.run(
-            ["git", *args], cwd=workspace, check=True,
+            ["git", *args],
+            cwd=workspace,
+            check=True,
             capture_output=True,
         )
 
@@ -129,7 +133,8 @@ def _orchestrator_for(
         capture_limit_kb=64,
     )
     approval_service = ApprovalService(
-        mode=ApprovalMode.PROMPT, prompt_callback=approval_callback,
+        mode=ApprovalMode.PROMPT,
+        prompt_callback=approval_callback,
     )
     return RequestOrchestrator(
         workspace_root=workspace,
@@ -157,9 +162,7 @@ def _full_workflow_plan(workspace: Path) -> dict[str, Any]:
                     "arguments": {
                         "path": str(target),
                         "content": (
-                            "def hello() -> str:\n"
-                            "    # tightened greeting\n"
-                            "    return 'world'\n"
+                            "def hello() -> str:\n    # tightened greeting\n    return 'world'\n"
                         ),
                         "overwrite": True,
                     },
@@ -198,7 +201,8 @@ def _full_workflow_plan(workspace: Path) -> dict[str, Any]:
 
 
 def test_e2e_full_coding_workflow_happy_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Happy path: edit, verify (PASSED), stage, commit (auto-approved)."""
     workspace = _git_workspace(tmp_path)
@@ -207,7 +211,8 @@ def test_e2e_full_coding_workflow_happy_path(
     provider = _StubProvider([_provider_response(_full_workflow_plan(workspace))])
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     orchestrator = _orchestrator_for(
-        workspace, provider,
+        workspace,
+        provider,
         history_store=history_store,
         approval_callback=lambda _req: True,  # auto-approve commit
     )
@@ -225,8 +230,11 @@ def test_e2e_full_coding_workflow_happy_path(
 
     # Commit landed in the real repo.
     log = subprocess.run(
-        ["git", "log", "--oneline"], cwd=workspace,
-        check=True, capture_output=True, text=True,
+        ["git", "log", "--oneline"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     assert "tighten greeting contract" in log.stdout
 
@@ -235,7 +243,8 @@ def test_e2e_full_coding_workflow_happy_path(
 
 
 def test_e2e_commit_approval_denied_leaves_workspace_staged_not_committed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Denying commit approval stops the loop, leaves staged edits, no commit."""
     workspace = _git_workspace(tmp_path)
@@ -248,7 +257,8 @@ def test_e2e_commit_approval_denied_leaves_workspace_staged_not_committed(
     provider = _StubProvider([_provider_response(_full_workflow_plan(workspace))])
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     orchestrator = _orchestrator_for(
-        workspace, provider,
+        workspace,
+        provider,
         history_store=history_store,
         approval_callback=approval_callback,
     )
@@ -256,15 +266,16 @@ def test_e2e_commit_approval_denied_leaves_workspace_staged_not_committed(
     result = orchestrator.orchestrate(UserRequest(message="fix and try commit"))
 
     # Commit action did NOT execute.
-    commit_result = next(
-        r for r in result.execution_results if r.action_id == "commit_it"
-    )
+    commit_result = next(r for r in result.execution_results if r.action_id == "commit_it")
     assert commit_result.status is not ExecutionStatus.EXECUTED
 
     # No new commit on the real repo; only the initial commit remains.
     log = subprocess.run(
-        ["git", "log", "--oneline"], cwd=workspace,
-        check=True, capture_output=True, text=True,
+        ["git", "log", "--oneline"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     assert log.stdout.count("\n") == 1  # exactly one commit
 
@@ -273,14 +284,13 @@ def test_e2e_commit_approval_denied_leaves_workspace_staged_not_committed(
     assert target.read_text(encoding="utf-8").strip().endswith("'world'")
 
     # The stage action DID execute, so the edit is staged.
-    stage_result = next(
-        r for r in result.execution_results if r.action_id == "stage_edit"
-    )
+    stage_result = next(r for r in result.execution_results if r.action_id == "stage_edit")
     assert stage_result.status is ExecutionStatus.EXECUTED
 
 
 def test_e2e_verification_unavailable_on_fatal_binary_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Missing verification binary reports UNAVAILABLE and leaves edits applied."""
     workspace = _git_workspace(tmp_path)
@@ -293,7 +303,8 @@ def test_e2e_verification_unavailable_on_fatal_binary_missing(
     provider = _StubProvider([_provider_response(_full_workflow_plan(workspace))])
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     orchestrator = _orchestrator_for(
-        workspace, provider,
+        workspace,
+        provider,
         history_store=history_store,
         approval_callback=lambda _req: True,
     )
@@ -314,7 +325,8 @@ def test_e2e_verification_unavailable_on_fatal_binary_missing(
 
 
 def test_e2e_concise_and_verbose_presenter_parity_on_happy_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Happy path renders concise notices + verbose retains full detail."""
     from foundation.cli import _build_chat_turn_presentation
@@ -326,7 +338,8 @@ def test_e2e_concise_and_verbose_presenter_parity_on_happy_path(
     provider = _StubProvider([_provider_response(_full_workflow_plan(workspace))])
     history_store = HistoryStore(database_path=tmp_path / "history.sqlite3")
     orchestrator = _orchestrator_for(
-        workspace, provider,
+        workspace,
+        provider,
         history_store=history_store,
         approval_callback=lambda _req: True,
     )
@@ -342,8 +355,7 @@ def test_e2e_concise_and_verbose_presenter_parity_on_happy_path(
     assert any("Changed file" in t for t in concise_notice_texts)
     assert any("Command" in t and "pytest" in t for t in concise_notice_texts)
     assert any(
-        n.text.startswith("Verification: passed")
-        and n.level is PresentationNoticeLevel.INFO
+        n.text.startswith("Verification: passed") and n.level is PresentationNoticeLevel.INFO
         for n in concise.notices
     )
 
