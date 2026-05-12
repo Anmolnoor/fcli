@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
 
@@ -19,6 +21,15 @@ from foundation.models import (
     ProviderResponseMetadata,
     UserRequest,
 )
+from foundation.observability import (
+    EVENT_PLAN_PROVIDER_CALL_FINISHED,
+    EVENT_PLAN_PROVIDER_CALL_STARTED,
+    EVENT_PLAN_REPAIR_ATTEMPT,
+    EVENT_PLAN_VALIDATION_STARTED,
+)
+
+if TYPE_CHECKING:
+    from foundation.services.observer import ObserverService
 from foundation.models.file import (
     FileApplyDiffRequest,
     FileEditRequest,
@@ -70,6 +81,7 @@ class PlannerService:
         tool_service: LocalToolService,
         capability_registry: CapabilityRegistry,
         max_plan_attempts: int = 2,
+        observer: ObserverService | None = None,
     ) -> None:
         self._workspace_root = workspace_root
         self._approval_mode = approval_mode
@@ -77,6 +89,7 @@ class PlannerService:
         self._tool_service = tool_service
         self._capability_registry = capability_registry
         self._max_plan_attempts = max_plan_attempts
+        self._observer = observer
 
     def gather_context(self, *, request_cwd: str) -> ContextSnapshot:
         capability_snapshots = self._capability_registry.planner_snapshot()
@@ -116,6 +129,7 @@ class PlannerService:
         context: ContextSnapshot,
         *,
         request_id: str,
+        session_id: str | None = None,
         observation_messages: list[ProviderMessage] | None = None,
         iteration: int = 1,
         remaining_actions: int = _MAX_TOTAL_ACTIONS,
@@ -144,14 +158,41 @@ class PlannerService:
                 schema_name="assistant_plan",
                 output_schema=AssistantPlan.model_json_schema(),
             )
+            self._emit_substep(
+                EVENT_PLAN_PROVIDER_CALL_STARTED,
+                request_id=request_id,
+                session_id=session_id,
+                iteration=iteration,
+                attempt=attempt,
+            )
+            call_started = time.monotonic()
             try:
                 response = self._provider.complete(prompt)
             except ProviderError as exc:
+                self._emit_substep(
+                    EVENT_PLAN_PROVIDER_CALL_FINISHED,
+                    request_id=request_id,
+                    session_id=session_id,
+                    iteration=iteration,
+                    attempt=attempt,
+                    extra={
+                        "ok": False,
+                        "elapsed_seconds": round(time.monotonic() - call_started, 3),
+                    },
+                )
                 last_error = exc
                 if (
                     exc.code is ProviderErrorCode.INVALID_RESPONSE
                     and attempt < self._max_plan_attempts
                 ):
+                    self._emit_substep(
+                        EVENT_PLAN_REPAIR_ATTEMPT,
+                        request_id=request_id,
+                        session_id=session_id,
+                        iteration=iteration,
+                        attempt=attempt,
+                        extra={"reason": "invalid_response"},
+                    )
                     supplemental_messages = self._repair_messages(
                         "The previous response was not valid JSON.",
                         invalid_output=exc.response_text,
@@ -159,17 +200,44 @@ class PlannerService:
                     continue
                 raise
 
+            self._emit_substep(
+                EVENT_PLAN_PROVIDER_CALL_FINISHED,
+                request_id=request_id,
+                session_id=session_id,
+                iteration=iteration,
+                attempt=attempt,
+                extra={
+                    "ok": True,
+                    "elapsed_seconds": round(time.monotonic() - call_started, 3),
+                },
+            )
+
             if response.structured_output is None:
                 last_error = PlanningError(
                     "Provider did not return structured output for the plan request."
                 )
                 if attempt < self._max_plan_attempts:
+                    self._emit_substep(
+                        EVENT_PLAN_REPAIR_ATTEMPT,
+                        request_id=request_id,
+                        session_id=session_id,
+                        iteration=iteration,
+                        attempt=attempt,
+                        extra={"reason": "missing_structured_output"},
+                    )
                     supplemental_messages = self._repair_messages(
                         "The previous response omitted the required JSON object."
                     )
                     continue
                 break
 
+            self._emit_substep(
+                EVENT_PLAN_VALIDATION_STARTED,
+                request_id=request_id,
+                session_id=session_id,
+                iteration=iteration,
+                attempt=attempt,
+            )
             try:
                 plan = AssistantPlan.model_validate(response.structured_output)
                 self._validate_supported_actions(
@@ -180,6 +248,14 @@ class PlannerService:
             except (ValidationError, PlanningError) as exc:
                 last_error = exc
                 if attempt < self._max_plan_attempts:
+                    self._emit_substep(
+                        EVENT_PLAN_REPAIR_ATTEMPT,
+                        request_id=request_id,
+                        session_id=session_id,
+                        iteration=iteration,
+                        attempt=attempt,
+                        extra={"reason": "validation_failed"},
+                    )
                     supplemental_messages = self._repair_messages(
                         f"The previous JSON failed validation: {exc}",
                         invalid_output=response.content,
@@ -193,6 +269,34 @@ class PlannerService:
         raise PlanningError(
             "The provider did not produce a valid structured plan after "
             f"{self._max_plan_attempts} attempt(s): {detail}"
+        )
+
+    def _emit_substep(
+        self,
+        event_name: str,
+        *,
+        request_id: str,
+        session_id: str | None,
+        iteration: int,
+        attempt: int,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        if self._observer is None:
+            return
+        payload: dict[str, object] = {
+            "request_id": request_id,
+            "iteration": iteration,
+            "attempt": attempt,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+        if extra:
+            payload.update(extra)
+        self._observer.emit(
+            event_name,
+            payload=payload,
+            session_id=session_id,
+            logger_name="foundation.services.planner",
         )
 
     def _base_plan_messages(

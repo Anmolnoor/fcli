@@ -2519,3 +2519,106 @@ def test_commit_intent_zero_action_plan_is_repaired_to_commit_action(
         and action.requires_approval
         for action in result.iterations[-1].plan.actions
     )
+
+
+def test_planner_emits_substep_events_around_provider_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planner fires PROVIDER_CALL_STARTED → ..._FINISHED → VALIDATION_STARTED.
+
+    Slice C: gives the live UI material to render mid-plan instead of a single
+    static "planning iteration N" line.
+    """
+    from foundation.observability import (
+        EVENT_PLAN_FINISHED,
+        EVENT_PLAN_PROVIDER_CALL_FINISHED,
+        EVENT_PLAN_PROVIDER_CALL_STARTED,
+        EVENT_PLAN_STARTED,
+        EVENT_PLAN_VALIDATION_STARTED,
+    )
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Done — no actions needed.",
+                    "actions": [],
+                }
+            )
+        ]
+    )
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def sink(event_name: str, payload: Any) -> None:
+        events.append((event_name, dict(payload)))
+
+    orchestrator, _runtime, _workspace = _orchestrator(tmp_path, monkeypatch, provider)
+    orchestrator.set_event_sink(sink)
+
+    orchestrator.orchestrate(UserRequest(message="status check"))
+
+    names = [name for name, _ in events]
+    plan_started_idx = names.index(EVENT_PLAN_STARTED)
+    plan_finished_idx = names.index(EVENT_PLAN_FINISHED)
+
+    # The four substep events must land strictly between PLAN_STARTED and PLAN_FINISHED.
+    substep_slice = names[plan_started_idx + 1 : plan_finished_idx]
+    assert EVENT_PLAN_PROVIDER_CALL_STARTED in substep_slice
+    assert EVENT_PLAN_PROVIDER_CALL_FINISHED in substep_slice
+    assert EVENT_PLAN_VALIDATION_STARTED in substep_slice
+
+    # And the relative order matters for the UI to read sanely.
+    started_idx = substep_slice.index(EVENT_PLAN_PROVIDER_CALL_STARTED)
+    finished_idx = substep_slice.index(EVENT_PLAN_PROVIDER_CALL_FINISHED)
+    validation_idx = substep_slice.index(EVENT_PLAN_VALIDATION_STARTED)
+    assert started_idx < finished_idx < validation_idx
+
+    # Successful call carries ok=True in the FINISHED payload.
+    finished_payloads = [p for n, p in events if n == EVENT_PLAN_PROVIDER_CALL_FINISHED]
+    assert finished_payloads and finished_payloads[0]["ok"] is True
+
+
+def test_planner_emits_repair_attempt_when_first_response_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On structured-output failure, planner emits REPAIR_ATTEMPT + retries."""
+    from foundation.observability import (
+        EVENT_PLAN_PROVIDER_CALL_STARTED,
+        EVENT_PLAN_REPAIR_ATTEMPT,
+    )
+
+    # First response: structured_output=None forces the repair path.
+    bad = ProviderResponse(
+        content="garbage",
+        structured_output=None,
+        metadata=ProviderResponseMetadata(
+            provider="stub", model="stub-model", latency_seconds=0.01
+        ),
+    )
+    good = _provider_response(
+        {"assistant_message": "Done.", "actions": []},
+    )
+    provider = StubProvider([bad, good])
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def sink(event_name: str, payload: Any) -> None:
+        events.append((event_name, dict(payload)))
+
+    orchestrator, _runtime, _workspace = _orchestrator(tmp_path, monkeypatch, provider)
+    orchestrator.set_event_sink(sink)
+
+    orchestrator.orchestrate(UserRequest(message="status check"))
+
+    names = [name for name, _ in events]
+    assert EVENT_PLAN_REPAIR_ATTEMPT in names
+
+    # Provider was called twice (attempt 1 + repaired attempt 2).
+    starts = [p for n, p in events if n == EVENT_PLAN_PROVIDER_CALL_STARTED]
+    assert [p["attempt"] for p in starts] == [1, 2]
+
+    repair_payloads = [p for n, p in events if n == EVENT_PLAN_REPAIR_ATTEMPT]
+    assert repair_payloads[0]["reason"] == "missing_structured_output"

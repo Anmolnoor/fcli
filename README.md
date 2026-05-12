@@ -28,15 +28,17 @@ So: it's part working tool, part learning notebook.
 
 If any of that is a dealbreaker, that's totally fair — come back in a few months.
 
-## Try it (at your own risk)
+## Quickstart
 
 ```bash
-./scripts/bootstrap.sh
-./scripts/uv run foundation --help
-./scripts/uv run foundation
+./scripts/bootstrap.sh                       # install venv + uv
+./scripts/uv run foundation init             # pick provider, paste API key
+./scripts/uv run foundation doctor           # verify readiness
+./scripts/uv run foundation                  # start interactive chat
+./scripts/uv run foundation "list files in src"   # one-shot
 ```
 
-You'll need Python 3.12 and an API key for either OpenAI or Ollama. See [`docs/TECHNICAL.md`](docs/TECHNICAL.md) for full setup, configuration, the CLI surface, and architecture notes.
+`foundation init` writes `~/.config/foundation/config.toml` and your API key to `~/.config/foundation/foundation.env` (chmod 600). Supported providers are **openai** and **ollama**. See [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for the walkthrough, manual setup, and troubleshooting; [`docs/TECHNICAL.md`](docs/TECHNICAL.md) covers the full CLI surface and architecture.
 
 ## Where things live
 

@@ -1,5 +1,7 @@
 # Foundation CLI
 
+> **New here?** Start with [`QUICKSTART.md`](QUICKSTART.md) — bootstrap, `foundation init`, doctor, first chat.
+
 Foundation CLI is a local-first, shell-native coding agent that follows an explicit `plan -> approve -> execute -> observe` loop. The current runtime is **v3**: `foundation` is the primary agent entrypoint, typed file and git capabilities replace raw shell mutations, one user turn iterates through read / edit / run / fix cycles inside a bounded replan loop, and output stays concise by default with full trace detail available on demand.
 
 ## v3 Highlights

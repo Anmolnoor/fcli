@@ -144,7 +144,7 @@ class CLIRequestRoute(enum.Enum):
 # not as one-shot agent request text.
 # ---------------------------------------------------------------------------
 _ADMIN_SUBCOMMANDS: frozenset[str] = frozenset(
-    {"run", "tools", "history", "trace", "config", "doctor", "chat"}
+    {"run", "tools", "history", "trace", "config", "doctor", "chat", "init"}
 )
 
 
@@ -3678,6 +3678,257 @@ def doctor(ctx: typer.Context) -> None:
     _render_doctor_report(report)
     if not report.ok:
         raise typer.Exit(code=report.exit_code)
+
+
+@app.command("init")
+def init_command(
+    ctx: typer.Context,
+    non_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--non-interactive",
+            help="Skip prompts. Requires --provider, --model, --api-key, --workspace.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite an existing config (backs it up to .toml.bak)."),
+    ] = False,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe/--no-probe",
+            help="Run a 1-token provider probe after writing the config.",
+        ),
+    ] = True,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", help="Provider name: openai or ollama."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Model identifier (e.g. gpt-5-mini, qwen3:8b)."),
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option(
+            "--api-key",
+            help="API key value. Written to ~/.config/foundation/foundation.env (chmod 600).",
+        ),
+    ] = None,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", help="Workspace root (defaults to current directory)."),
+    ] = None,
+) -> None:
+    """Interactive setup wizard — pick provider, paste API key, land in a working chat."""
+    _run_setup_wizard(
+        ctx,
+        non_interactive=non_interactive,
+        force=force,
+        probe=probe,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        workspace=workspace,
+    )
+
+
+@config_app.command("init")
+def config_init_command(
+    ctx: typer.Context,
+    non_interactive: Annotated[
+        bool,
+        typer.Option("--non-interactive", help="Skip prompts. See `foundation init --help`."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite an existing config (backed up to .toml.bak)."),
+    ] = False,
+    probe: Annotated[
+        bool,
+        typer.Option("--probe/--no-probe", help="Probe provider after writing."),
+    ] = True,
+    provider: Annotated[str | None, typer.Option("--provider")] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    api_key: Annotated[str | None, typer.Option("--api-key")] = None,
+    workspace: Annotated[Path | None, typer.Option("--workspace")] = None,
+) -> None:
+    """Alias for `foundation init` — same wizard, nested under `config`."""
+    _run_setup_wizard(
+        ctx,
+        non_interactive=non_interactive,
+        force=force,
+        probe=probe,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        workspace=workspace,
+    )
+
+
+def _run_setup_wizard(
+    ctx: typer.Context,
+    *,
+    non_interactive: bool,
+    force: bool,
+    probe: bool,
+    provider: str | None,
+    model: str | None,
+    api_key: str | None,
+    workspace: Path | None,
+) -> None:
+    """Shared implementation for both `init` entry points."""
+    from foundation.setup_wizard import (
+        SUPPORTED_PROVIDERS,
+        default_choices,
+        run_wizard,
+    )
+
+    cli_context = ctx.obj if isinstance(ctx.obj, CLIContext) else CLIContext()
+    logger.info("command_invoked name=init non_interactive=%s force=%s", non_interactive, force)
+
+    try:
+        existing = load_settings(
+            config_path=cli_context.config_path,
+            overrides=cli_context.overrides,
+        )
+    except SettingsLoadError:
+        existing = None
+
+    has_existing = existing is not None and existing.config_exists
+    # Always seed from the resolved settings so an explicit `--config` is honored
+    # for the *target* paths even when no file exists at that location yet.
+    seed = default_choices(existing)
+
+    if non_interactive:
+        if provider is None or provider.strip().lower() not in SUPPORTED_PROVIDERS:
+            console.print("[red]--non-interactive requires --provider openai|ollama.[/red]")
+            raise typer.Exit(code=2)
+        seed.provider = provider.strip().lower()
+        seed.api_key_env_var = "OLLAMA_API_KEY" if seed.provider == "ollama" else "OPENAI_API_KEY"
+        if model:
+            seed.model = model.strip()
+        if workspace:
+            seed.workspace_root = Path(workspace).expanduser().resolve()
+        if api_key is not None:
+            seed.api_key = api_key
+        if has_existing and not force:
+            console.print(
+                f"[red]Config already exists at {existing.config_path}. "
+                "Re-run with --force to overwrite.[/red]"
+            )
+            raise typer.Exit(code=2)
+        choices = seed
+        overwrite = force or has_existing
+        outcome = run_wizard(
+            existing=existing if has_existing else None,
+            choices=choices,
+            overwrite=overwrite,
+            probe=probe,
+        )
+    else:
+        if has_existing:
+            console.print(f"[yellow]Existing config detected at {existing.config_path}.[/yellow]")
+            console.print(
+                f"  provider: [cyan]{existing.provider.normalized_name()}[/cyan]"
+                f"  model: [cyan]{existing.provider.model}[/cyan]"
+            )
+            if not typer.confirm("Reconfigure? (existing config will be backed up)", default=False):
+                console.print("Keeping existing config. Run `foundation doctor` to verify.")
+                return
+        prompts = _InteractivePrompts()
+        outcome = run_wizard(
+            existing=existing if has_existing else None,
+            interactive_prompts=prompts,
+            overwrite=has_existing,
+            probe=probe,
+        )
+
+    _render_wizard_outcome(outcome)
+
+
+class _InteractivePrompts:
+    """prompt_toolkit-driven `WizardPrompts` strategy."""
+
+    def gather(self, *, seed: Any, existing: Any) -> Any:
+        from foundation.setup_wizard import (
+            DEFAULT_MODELS,
+            SUPPORTED_PROVIDERS,
+            WizardChoices,
+        )
+
+        console.print()
+        console.print("[bold]foundation init[/bold] — three quick questions.")
+        console.print()
+
+        provider = _prompt_choice(
+            "Provider",
+            options=list(SUPPORTED_PROVIDERS),
+            default=seed.provider,
+        )
+        default_model = DEFAULT_MODELS.get(provider, seed.model)
+        model_value = _prompt_text("Model", default=default_model)
+        workspace_value = _prompt_text(
+            "Workspace root",
+            default=str(seed.workspace_root),
+        )
+        api_key_env_var = "OLLAMA_API_KEY" if provider == "ollama" else "OPENAI_API_KEY"
+        api_key_value = _prompt_secret(
+            f"API key (stored in {seed.env_file_path} as {api_key_env_var}; blank to skip)",
+        )
+
+        return WizardChoices(
+            provider=provider,
+            model=model_value,
+            workspace_root=Path(workspace_value).expanduser().resolve(),
+            config_path=seed.config_path,
+            env_file_path=seed.env_file_path,
+            api_key_env_var=api_key_env_var,
+            api_key=api_key_value or None,
+        )
+
+
+def _prompt_text(label: str, *, default: str) -> str:
+    response = typer.prompt(label, default=default)
+    return str(response).strip() or default
+
+
+def _prompt_secret(label: str) -> str:
+    return typer.prompt(label, hide_input=True, default="", show_default=False)
+
+
+def _prompt_choice(label: str, *, options: list[str], default: str) -> str:
+    choices = "/".join(options)
+    while True:
+        value = typer.prompt(f"{label} ({choices})", default=default).strip().lower()
+        if value in options:
+            return value
+        console.print(f"[red]Pick one of: {choices}[/red]")
+
+
+def _render_wizard_outcome(outcome: Any) -> None:
+    console.print()
+    console.print("[green]Configuration saved.[/green]")
+    console.print(f"  config:  [cyan]{outcome.choices.config_path}[/cyan]")
+    if outcome.env_written:
+        console.print(f"  env:     [cyan]{outcome.choices.env_file_path}[/cyan] (chmod 600)")
+    if outcome.config_backed_up_to is not None:
+        console.print(f"  backup:  [dim]{outcome.config_backed_up_to}[/dim]")
+    for note in outcome.notes:
+        console.print(f"  note:    [dim]{note}[/dim]")
+
+    probe = outcome.probe
+    if probe is not None:
+        if probe.ok:
+            console.print(f"  probe:   [green]✓[/green] {probe.detail}")
+        else:
+            console.print(f"  probe:   [red]✗[/red] {probe.detail}")
+
+    console.print()
+    console.print("Next:")
+    console.print("  [cyan]foundation doctor[/cyan]   — verify readiness")
+    console.print("  [cyan]foundation[/cyan]          — start interactive chat")
 
 
 def main() -> None:

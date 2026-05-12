@@ -20,7 +20,11 @@ from foundation.observability import (
     EVENT_ITERATION_COMPLETED,
     EVENT_ITERATION_STARTED,
     EVENT_PLAN_FINISHED,
+    EVENT_PLAN_PROVIDER_CALL_FINISHED,
+    EVENT_PLAN_PROVIDER_CALL_STARTED,
+    EVENT_PLAN_REPAIR_ATTEMPT,
     EVENT_PLAN_STARTED,
+    EVENT_PLAN_VALIDATION_STARTED,
     EVENT_SESSION_END,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
@@ -244,3 +248,57 @@ def test_renderer_pause_resume_safe_when_unmounted(tmp_path):
     # Both should be no-ops when the Live widget hasn't been entered.
     renderer.pause()
     renderer.resume()
+
+
+def test_planning_substep_transitions_through_fold():
+    state = TurnLiveState()
+    state.fold(EVENT_PLAN_STARTED, {})
+    assert state.planning_started_at is not None
+    assert state.planning_substep is None
+
+    state.fold(EVENT_PLAN_PROVIDER_CALL_STARTED, {"attempt": 1})
+    assert state.planning_substep == "contacting provider"
+
+    state.fold(EVENT_PLAN_PROVIDER_CALL_FINISHED, {"attempt": 1, "ok": True})
+    assert state.planning_substep is None
+
+    state.fold(EVENT_PLAN_VALIDATION_STARTED, {"attempt": 1})
+    assert state.planning_substep == "validating plan"
+
+    state.fold(EVENT_PLAN_FINISHED, {"action_count": 0})
+    assert state.planning_started_at is None
+    assert state.planning_substep is None
+
+
+def test_planning_substep_repair_path():
+    state = TurnLiveState()
+    state.fold(EVENT_PLAN_STARTED, {})
+    state.fold(EVENT_PLAN_PROVIDER_CALL_STARTED, {"attempt": 1})
+    state.fold(EVENT_PLAN_PROVIDER_CALL_FINISHED, {"attempt": 1, "ok": False})
+    # Substep is preserved after a failed call until the next event fires.
+    assert state.planning_substep == "contacting provider"
+
+    state.fold(EVENT_PLAN_REPAIR_ATTEMPT, {"attempt": 1, "reason": "invalid_response"})
+    assert state.planning_substep == "repairing invalid response"
+
+    state.fold(EVENT_PLAN_PROVIDER_CALL_STARTED, {"attempt": 2})
+    assert state.planning_substep == "contacting provider"
+
+
+def test_render_status_line_shows_substep_when_set():
+    state = TurnLiveState(
+        iteration=1,
+        planning_started_at=0.0,
+        planning_substep="contacting provider",
+    )
+    text = _render_to_text(render_status_line(state, elapsed_seconds=2.3))
+    assert "planning iter 1" in text
+    assert "contacting provider" in text
+
+
+def test_render_status_line_falls_back_when_no_substep():
+    state = TurnLiveState(iteration=1, planning_started_at=0.0)
+    text = _render_to_text(render_status_line(state, elapsed_seconds=2.3))
+    assert "planning iteration 1" in text
+    assert "contacting" not in text
+    assert "validating" not in text

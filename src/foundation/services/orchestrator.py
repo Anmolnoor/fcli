@@ -464,6 +464,7 @@ class RequestOrchestrator:
             tool_service=self._tool_service,
             capability_registry=self._capability_registry,
             max_plan_attempts=max_plan_attempts,
+            observer=self._observer,
         )
         state_dir = self._workspace_root / ".foundation" / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -672,6 +673,7 @@ class RequestOrchestrator:
                     request,
                     context,
                     request_id=request_id,
+                    session_id=session_id,
                     observation_messages=observation_messages or None,
                     iteration=iteration_index,
                     remaining_actions=remaining_actions,

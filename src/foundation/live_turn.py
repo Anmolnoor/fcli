@@ -32,7 +32,11 @@ from foundation.observability import (
     EVENT_ITERATION_COMPLETED,
     EVENT_ITERATION_STARTED,
     EVENT_PLAN_FINISHED,
+    EVENT_PLAN_PROVIDER_CALL_FINISHED,
+    EVENT_PLAN_PROVIDER_CALL_STARTED,
+    EVENT_PLAN_REPAIR_ATTEMPT,
     EVENT_PLAN_STARTED,
+    EVENT_PLAN_VALIDATION_STARTED,
     EVENT_SESSION_END,
     EVENT_SESSION_START,
     EVENT_TOOL_CALL_FAILED,
@@ -66,6 +70,8 @@ class TurnLiveState:
     iteration_started_at: float = 0.0
     planning_started_at: float | None = None
     planning_action_count: int | None = None
+    planning_substep: str | None = None
+    planning_substep_started_at: float | None = None
     current_action_id: str | None = None
     current_action_tool: str | None = None
     current_action_started_at: float | None = None
@@ -95,9 +101,30 @@ class TurnLiveState:
             return
         if event_name == EVENT_PLAN_STARTED:
             self.planning_started_at = now
+            self.planning_substep = None
+            self.planning_substep_started_at = None
+            return
+        if event_name == EVENT_PLAN_PROVIDER_CALL_STARTED:
+            self.planning_substep = "contacting provider"
+            self.planning_substep_started_at = now
+            return
+        if event_name == EVENT_PLAN_PROVIDER_CALL_FINISHED:
+            if payload.get("ok") is True:
+                self.planning_substep = None
+                self.planning_substep_started_at = None
+            return
+        if event_name == EVENT_PLAN_VALIDATION_STARTED:
+            self.planning_substep = "validating plan"
+            self.planning_substep_started_at = now
+            return
+        if event_name == EVENT_PLAN_REPAIR_ATTEMPT:
+            self.planning_substep = "repairing invalid response"
+            self.planning_substep_started_at = now
             return
         if event_name == EVENT_PLAN_FINISHED:
             self.planning_started_at = None
+            self.planning_substep = None
+            self.planning_substep_started_at = None
             count = payload.get("action_count")
             if isinstance(count, int):
                 self.planning_action_count = count
@@ -191,6 +218,12 @@ def render_status_line(state: TurnLiveState, *, elapsed_seconds: float) -> Rende
         )
     if state.planning_started_at is not None:
         plan_elapsed = time.monotonic() - state.planning_started_at
+        if state.planning_substep:
+            return Text(
+                f"… planning iter {state.iteration} · {state.planning_substep} · "
+                f"{_format_duration(plan_elapsed)}",
+                style="cyan",
+            )
         return Text(
             f"… planning iteration {state.iteration} · {_format_duration(plan_elapsed)}",
             style="cyan",
