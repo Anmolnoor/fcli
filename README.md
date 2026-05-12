@@ -31,14 +31,18 @@ If any of that is a dealbreaker, that's totally fair — come back in a few mont
 ## Quickstart
 
 ```bash
-./scripts/bootstrap.sh                       # install venv + uv
-./scripts/uv run foundation init             # pick provider, paste API key
-./scripts/uv run foundation doctor           # verify readiness
-./scripts/uv run foundation                  # start interactive chat
-./scripts/uv run foundation "list files in src"   # one-shot
+./scripts/install.sh        # installs pipx if missing, then foundation-cli from main
+foundation init             # pick provider, paste API key
+foundation doctor           # verify readiness
+foundation                  # start interactive chat
+foundation "list files in src"   # one-shot
 ```
 
-`foundation init` writes `~/.config/foundation/config.toml` and your API key to `~/.config/foundation/foundation.env` (chmod 600). Supported providers are **openai** and **ollama**. See [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for the walkthrough, manual setup, and troubleshooting; [`docs/TECHNICAL.md`](docs/TECHNICAL.md) covers the full CLI surface and architecture.
+`foundation init` writes `~/.config/foundation/config.toml` and your API key to `~/.config/foundation/foundation.env` (chmod 600). Supported providers are **openai** and **ollama**.
+
+**Upgrade:** `foundation update` (or `./scripts/update.sh`). **Remove:** `foundation uninstall` keeps your config; add `--purge --yes` to wipe history and capability store.
+
+See [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for the full walkthrough, manual setup, and troubleshooting; [`docs/TECHNICAL.md`](docs/TECHNICAL.md) covers the developer setup (bootstrap.sh, uv) and architecture.
 
 ## Where things live
 

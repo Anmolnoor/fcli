@@ -254,6 +254,23 @@ snippets (Python + Node) are documented in
 - `foundation doctor` reports missing-but-creatable directories as warnings rather than mutating the filesystem.
 - `foundation tools files` depends on `fd` / `fdfind`; `foundation tools tldr` depends on a local TLDR client. Missing binaries are reported clearly but not auto-installed.
 
+## Install / Update / Uninstall internals
+
+End-user install goes through `scripts/install.sh` → `pipx install --force git+…@main`. The dev path (`bootstrap.sh` + uv venv) is unchanged.
+
+`foundation update` and `foundation uninstall` share an install-mechanism probe in `src/foundation/installer.py`:
+
+- **pipx** — detected when `sys.executable` lives under `~/.local/pipx/venvs/foundation-cli/`. Upgrade: `pipx install --force git+…@main`. Uninstall: `pipx uninstall foundation-cli`.
+- **pip --user** — `sys.executable` is under `~/.local/` and not pipx-managed. Upgrade: `pip install --user --upgrade git+…@main`. Uninstall: `pip uninstall -y foundation-cli`.
+- **Dev checkout** — `sys.executable` sits in a `.venv/` whose grandparent has a `pyproject.toml` declaring `name = "foundation-cli"`. The commands refuse to self-modify; they print `git pull && ./scripts/uv sync --extra dev` instead.
+- **Unknown** — falls back to printing the canonical pipx command.
+
+`fetch_latest_sha()` hits the public GitHub commits API (5s timeout, no auth) so `foundation update` can compare local `__version__` against `main`. Failure is non-fatal — the upgrade still works.
+
+`foundation uninstall --run` swaps to `os.execvp("pipx", ["uninstall", "foundation-cli"])` rather than `subprocess.run`: pipx wipes the venv mid-call, so the calling Python interpreter must not survive past the swap.
+
+The shell-alias block uses marker fences (`# >>> foundation cli alias >>>` / `# <<< foundation cli alias <<<`) so `uninstall` can strip it without scanning for the alias content itself. Lines outside the fence are never touched, and the previous rc is backed up to `<rc>.bak`.
+
 ## Development Notes
 - `foundation --help` is the primary smoke check for the CLI entrypoint.
 - `src/foundation/settings.py` owns the typed Stage 2 configuration model and precedence rules.

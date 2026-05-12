@@ -144,7 +144,18 @@ class CLIRequestRoute(enum.Enum):
 # not as one-shot agent request text.
 # ---------------------------------------------------------------------------
 _ADMIN_SUBCOMMANDS: frozenset[str] = frozenset(
-    {"run", "tools", "history", "trace", "config", "doctor", "chat", "init"}
+    {
+        "run",
+        "tools",
+        "history",
+        "trace",
+        "config",
+        "doctor",
+        "chat",
+        "init",
+        "update",
+        "uninstall",
+    }
 )
 
 
@@ -4042,6 +4053,178 @@ def _render_wizard_outcome(outcome: Any) -> None:
             f"  [dim]source {alias.rc_path} (or open a new shell) to pick up "
             f"`{outcome.choices.alias_name}`.[/dim]"
         )
+
+
+@app.command("update")
+def update_command(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show the upgrade command without running it."),
+    ] = False,
+    non_interactive: Annotated[
+        bool,
+        typer.Option("--non-interactive", help="Skip the confirm prompt; run anyway."),
+    ] = False,
+    ref: Annotated[
+        str,
+        typer.Option("--ref", help="Branch or tag to install (default: main)."),
+    ] = "main",
+) -> None:
+    """Upgrade Foundation in-place from the GitHub repository."""
+    from foundation import __version__
+    from foundation.installer import (
+        InstallMechanism,
+        build_update_plan,
+        detect_install_mechanism,
+        fetch_latest_sha,
+    )
+
+    _ = ctx  # CLIContext not needed; install lives outside config.
+    probe = detect_install_mechanism()
+    plan = build_update_plan(probe, ref=ref)
+
+    console.print(f"Foundation version: [cyan]{__version__}[/cyan]")
+    console.print(f"Install mechanism:  [cyan]{probe.mechanism.value}[/cyan] ({probe.detail})")
+
+    latest = fetch_latest_sha()
+    if latest is not None:
+        console.print(f"Latest on `{ref}`:   [cyan]{latest}[/cyan]")
+    else:
+        console.print("[dim]Could not reach api.github.com — proceeding without SHA check.[/dim]")
+
+    console.print()
+    console.print(f"[bold]Plan[/bold]: {plan.detail}")
+    if plan.command is None:
+        # Dev checkout or unknown — we cannot drive the upgrade ourselves.
+        raise typer.Exit(code=0 if probe.mechanism is InstallMechanism.DEV_CHECKOUT else 1)
+
+    rendered = " ".join(plan.command)
+    console.print(f"[dim]$ {rendered}[/dim]")
+    if dry_run:
+        return
+
+    if not non_interactive:
+        if not typer.confirm("Run upgrade now?", default=True):
+            console.print("Aborted.")
+            raise typer.Exit(code=1)
+
+    import subprocess
+
+    result = subprocess.run(plan.command, check=False)
+    if result.returncode != 0:
+        console.print(f"[red]Upgrade command exited {result.returncode}.[/red]")
+        raise typer.Exit(code=result.returncode)
+    console.print(
+        "[green]✓ Upgrade complete.[/green] "
+        "[dim]Open a new shell so PATH cache picks up the new binary.[/dim]"
+    )
+
+
+@app.command("uninstall")
+def uninstall_command(
+    ctx: typer.Context,
+    purge: Annotated[
+        bool,
+        typer.Option(
+            "--purge",
+            help="Delete config, history, and logs in addition to removing the package.",
+        ),
+    ] = False,
+    keep_alias: Annotated[
+        bool,
+        typer.Option("--keep-alias", help="Do not remove the `fcli` shell-alias block."),
+    ] = False,
+    run: Annotated[
+        bool,
+        typer.Option(
+            "--run",
+            help="Actually run `pipx uninstall foundation-cli` (default: print the command).",
+        ),
+    ] = False,
+    non_interactive: Annotated[
+        bool,
+        typer.Option("--non-interactive", help="Skip confirm prompts."),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Required alongside --purge in non-interactive mode to wipe state dirs.",
+        ),
+    ] = False,
+) -> None:
+    """Remove Foundation: shell alias, optionally state dirs, then the package itself."""
+    from foundation.installer import (
+        build_uninstall_plan,
+        detect_install_mechanism,
+        purge_state_dirs,
+        remove_alias_block,
+    )
+
+    cli_context = ctx.obj if isinstance(ctx.obj, CLIContext) else CLIContext()
+    logger.info("command_invoked name=uninstall purge=%s run=%s", purge, run)
+
+    # 1. Alias block.
+    if keep_alias:
+        console.print("[dim]Keeping shell-alias block (--keep-alias).[/dim]")
+    else:
+        removal = remove_alias_block()
+        if removal.removed:
+            console.print(f"  alias:   [green]✓[/green] {removal.detail}")
+        else:
+            console.print(f"  alias:   [dim]{removal.detail}[/dim]")
+
+    # 2. State dirs (gated).
+    if purge:
+        try:
+            settings = load_settings(
+                config_path=cli_context.config_path,
+                overrides=cli_context.overrides,
+            )
+        except SettingsLoadError as exc:
+            console.print(f"[yellow]Could not load settings to locate state dirs: {exc}[/yellow]")
+        else:
+            confirmed = yes
+            if not non_interactive:
+                console.print()
+                console.print("[yellow]--purge will remove:[/yellow]")
+                console.print(f"  - {settings.config_path.parent}")
+                console.print(f"  - {settings.app.data_dir}")
+                console.print(f"  - {settings.app.state_dir}")
+                confirmed = typer.confirm("Delete these directories?", default=False)
+            elif not yes:
+                console.print(
+                    "[red]--purge in --non-interactive mode requires --yes.[/red] "
+                    "Skipping state-dir removal."
+                )
+                confirmed = False
+            if confirmed:
+                result = purge_state_dirs(settings)
+                for path in result.removed:
+                    console.print(f"  purge:   [green]✓[/green] removed {path}")
+                for path in result.skipped:
+                    console.print(f"  purge:   [dim]skip (missing): {path}[/dim]")
+
+    # 3. Package removal.
+    probe = detect_install_mechanism()
+    plan = build_uninstall_plan(probe)
+    console.print()
+    console.print(f"[bold]Package removal[/bold]: {plan.detail}")
+    if plan.command is None:
+        # Dev checkout or unknown — print and exit cleanly.
+        return
+
+    rendered = " ".join(plan.command)
+    if run:
+        if not non_interactive and not typer.confirm(f"Run `{rendered}`?", default=False):
+            console.print("Aborted. Run the command yourself when ready.")
+            return
+
+        # Execvp would replace this process so subsequent Python code doesn't run.
+        os.execvp(plan.command[0], plan.command)  # noqa: S606 - explicit, audited.
+    else:
+        console.print(f"[dim]Run this yourself when ready:[/dim] [cyan]{rendered}[/cyan]")
 
 
 def main() -> None:

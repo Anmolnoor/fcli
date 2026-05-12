@@ -6,10 +6,17 @@ Foundation CLI is a local agent that reads, edits, and runs git in your workspac
 
 ```bash
 git clone https://github.com/Anmolnoor/fcli.git && cd fcli
-./scripts/bootstrap.sh
+./scripts/install.sh
 ```
 
-You need Python 3.12. The bootstrap script provisions a local venv and `uv`. All commands below use `./scripts/uv run <…>` to keep the bootstrapped environment in front of your PATH.
+You need Python 3.12. The installer:
+
+1. Installs `pipx` via `python3.12 -m pip install --user pipx` if it isn't already on PATH (calls `pipx ensurepath` afterward).
+2. Runs `pipx install --force git+https://github.com/Anmolnoor/fcli.git@main`, which gives you a clean isolated venv at `~/.local/pipx/venvs/foundation-cli/` and puts `foundation` on PATH.
+
+After install, open a new shell (or `source ~/.zshrc`) so PATH picks up the binary. Re-running `./scripts/install.sh` is safe — it always uses `--force` to refresh the install.
+
+**Dev setup** (working on Foundation itself) — `./scripts/bootstrap.sh` provisions a repo-local venv via `uv`; use `./scripts/uv run foundation …` to invoke that build. See [`docs/TECHNICAL.md`](TECHNICAL.md).
 
 ## 2. Configure
 
@@ -61,8 +68,8 @@ PASS / WARN / FAIL across config readability, required directories, provider cre
 ## 4. Run
 
 ```bash
-./scripts/uv run foundation                          # interactive shell
-./scripts/uv run foundation "list files in src"      # one-shot
+foundation                          # interactive shell
+foundation "list files in src"      # one-shot
 ```
 
 During planning you'll see the status line transition: `… planning iter 1 · contacting provider · 2.3s` → `… planning iter 1 · validating plan · 4.1s`. Press `?` to expand the live detail panel; `Ctrl-C` cancels.
@@ -98,6 +105,37 @@ OPENAI_API_KEY=sk-...
 - **`Config already exists at …; pass --force to replace it.`** — the file at `~/.config/foundation/config.toml` is intact; re-run with `--force` to swap it (a `.toml.bak` backup is written).
 - **Status line stays on `contacting provider` for >30s** — your provider is slow or unreachable. `Ctrl-C` to cancel; check the provider's status page or your network.
 - **State / logs / event NDJSON** — `~/.local/state/foundation/{history.sqlite3,logs,events}`. Inspect via `foundation history` and `foundation trace`.
+
+## Update
+
+```bash
+foundation update          # detects pipx / pip-user / dev checkout and runs the right upgrade
+foundation update --dry-run         # show the command without running
+foundation update --ref v0.3.0      # install a specific branch or tag
+```
+
+What it does:
+
+| Install mechanism | Command run |
+| --- | --- |
+| `pipx` | `pipx install --force git+https://github.com/Anmolnoor/fcli.git@main` |
+| `pip --user` | `python -m pip install --user --upgrade git+…@main` |
+| Dev checkout | prints `git pull && ./scripts/uv sync --extra dev` — does not self-modify |
+
+After an upgrade, open a new shell or re-run from a fresh terminal so the shell's PATH cache picks up the new binary.
+
+## Uninstall
+
+```bash
+foundation uninstall                   # removes shell alias block; prints pipx uninstall command
+foundation uninstall --run             # also runs `pipx uninstall foundation-cli`
+foundation uninstall --purge --yes     # additionally wipes ~/.config/foundation, ~/.local/share/foundation, ~/.local/state/foundation
+foundation uninstall --keep-alias      # leave the rc file alone
+```
+
+By default, your config + chat history + capability store are **preserved** so a reinstall picks them up. Add `--purge --yes` (or omit `--yes` for an interactive confirm) to delete them.
+
+The `--run` flag uses `os.execvp` to swap the running process to `pipx uninstall`, which avoids the "Python tries to import after its own venv is gone" trap.
 
 ## Next
 
