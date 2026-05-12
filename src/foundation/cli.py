@@ -3720,6 +3720,34 @@ def init_command(
         Path | None,
         typer.Option("--workspace", help="Workspace root (defaults to current directory)."),
     ] = None,
+    alias: Annotated[
+        bool,
+        typer.Option(
+            "--alias/--no-alias",
+            help=(
+                "Install an `fcli` shell alias in your rc file. "
+                "Interactive runs ask; non-interactive defaults to off."
+            ),
+        ),
+    ] = False,
+    alias_name: Annotated[
+        str,
+        typer.Option("--alias-name", help="Alias name to install (default: fcli)."),
+    ] = "fcli",
+    alias_target: Annotated[
+        str,
+        typer.Option(
+            "--alias-target",
+            help="Command the alias should resolve to (default: foundation).",
+        ),
+    ] = "foundation",
+    shell_rc: Annotated[
+        Path | None,
+        typer.Option(
+            "--shell-rc",
+            help="Path to the shell rc file (auto-detected from $SHELL by default).",
+        ),
+    ] = None,
 ) -> None:
     """Interactive setup wizard — pick provider, paste API key, land in a working chat."""
     _run_setup_wizard(
@@ -3731,6 +3759,10 @@ def init_command(
         model=model,
         api_key=api_key,
         workspace=workspace,
+        alias=alias,
+        alias_name=alias_name,
+        alias_target=alias_target,
+        shell_rc=shell_rc,
     )
 
 
@@ -3753,6 +3785,10 @@ def config_init_command(
     model: Annotated[str | None, typer.Option("--model")] = None,
     api_key: Annotated[str | None, typer.Option("--api-key")] = None,
     workspace: Annotated[Path | None, typer.Option("--workspace")] = None,
+    alias: Annotated[bool, typer.Option("--alias/--no-alias")] = False,
+    alias_name: Annotated[str, typer.Option("--alias-name")] = "fcli",
+    alias_target: Annotated[str, typer.Option("--alias-target")] = "foundation",
+    shell_rc: Annotated[Path | None, typer.Option("--shell-rc")] = None,
 ) -> None:
     """Alias for `foundation init` — same wizard, nested under `config`."""
     _run_setup_wizard(
@@ -3764,6 +3800,10 @@ def config_init_command(
         model=model,
         api_key=api_key,
         workspace=workspace,
+        alias=alias,
+        alias_name=alias_name,
+        alias_target=alias_target,
+        shell_rc=shell_rc,
     )
 
 
@@ -3777,6 +3817,10 @@ def _run_setup_wizard(
     model: str | None,
     api_key: str | None,
     workspace: Path | None,
+    alias: bool,
+    alias_name: str,
+    alias_target: str,
+    shell_rc: Path | None,
 ) -> None:
     """Shared implementation for both `init` entry points."""
     from foundation.setup_wizard import (
@@ -3786,7 +3830,12 @@ def _run_setup_wizard(
     )
 
     cli_context = ctx.obj if isinstance(ctx.obj, CLIContext) else CLIContext()
-    logger.info("command_invoked name=init non_interactive=%s force=%s", non_interactive, force)
+    logger.info(
+        "command_invoked name=init non_interactive=%s force=%s alias=%s",
+        non_interactive,
+        force,
+        alias,
+    )
 
     try:
         existing = load_settings(
@@ -3813,6 +3862,10 @@ def _run_setup_wizard(
             seed.workspace_root = Path(workspace).expanduser().resolve()
         if api_key is not None:
             seed.api_key = api_key
+        seed.install_alias = alias
+        seed.alias_name = alias_name
+        seed.alias_target = alias_target
+        seed.shell_rc_path = shell_rc
         if has_existing and not force:
             console.print(
                 f"[red]Config already exists at {existing.config_path}. "
@@ -3837,7 +3890,12 @@ def _run_setup_wizard(
             if not typer.confirm("Reconfigure? (existing config will be backed up)", default=False):
                 console.print("Keeping existing config. Run `foundation doctor` to verify.")
                 return
-        prompts = _InteractivePrompts()
+        prompts = _InteractivePrompts(
+            alias_default=alias,
+            alias_name_default=alias_name,
+            alias_target_default=alias_target,
+            shell_rc_override=shell_rc,
+        )
         outcome = run_wizard(
             existing=existing if has_existing else None,
             interactive_prompts=prompts,
@@ -3851,15 +3909,29 @@ def _run_setup_wizard(
 class _InteractivePrompts:
     """prompt_toolkit-driven `WizardPrompts` strategy."""
 
+    def __init__(
+        self,
+        *,
+        alias_default: bool = False,
+        alias_name_default: str = "fcli",
+        alias_target_default: str = "foundation",
+        shell_rc_override: Path | None = None,
+    ) -> None:
+        self._alias_default = alias_default
+        self._alias_name_default = alias_name_default
+        self._alias_target_default = alias_target_default
+        self._shell_rc_override = shell_rc_override
+
     def gather(self, *, seed: Any, existing: Any) -> Any:
         from foundation.setup_wizard import (
             DEFAULT_MODELS,
             SUPPORTED_PROVIDERS,
             WizardChoices,
         )
+        from foundation.shell_alias import detect_shell
 
         console.print()
-        console.print("[bold]foundation init[/bold] — three quick questions.")
+        console.print("[bold]foundation init[/bold] — a few quick questions.")
         console.print()
 
         provider = _prompt_choice(
@@ -3878,6 +3950,25 @@ class _InteractivePrompts:
             f"API key (stored in {seed.env_file_path} as {api_key_env_var}; blank to skip)",
         )
 
+        install_alias = False
+        alias_name = self._alias_name_default
+        alias_target = self._alias_target_default
+        shell_rc_path = self._shell_rc_override
+        detected = detect_shell()
+        if detected is not None:
+            label = (
+                f"Install '{alias_name}' shell alias in {detected.rc_path}? "
+                f'(alias {alias_name}="{alias_target}")'
+            )
+            install_alias = typer.confirm(label, default=self._alias_default)
+            if install_alias and shell_rc_path is None:
+                shell_rc_path = detected.rc_path
+        else:
+            console.print(
+                "[dim]Skipping shell-alias step: could not detect your shell. "
+                "Re-run with `--alias --shell-rc <path>` to install one explicitly.[/dim]"
+            )
+
         return WizardChoices(
             provider=provider,
             model=model_value,
@@ -3886,6 +3977,10 @@ class _InteractivePrompts:
             env_file_path=seed.env_file_path,
             api_key_env_var=api_key_env_var,
             api_key=api_key_value or None,
+            install_alias=install_alias,
+            alias_name=alias_name,
+            alias_target=alias_target,
+            shell_rc_path=shell_rc_path,
         )
 
 
@@ -3925,10 +4020,28 @@ def _render_wizard_outcome(outcome: Any) -> None:
         else:
             console.print(f"  probe:   [red]✗[/red] {probe.detail}")
 
+    alias = outcome.alias_result
+    if alias is not None:
+        if alias.installed:
+            verb = "updated" if alias.replaced else "added"
+            console.print(
+                f"  alias:   [green]✓[/green] {verb} '{outcome.choices.alias_name}' in "
+                f"[cyan]{alias.rc_path}[/cyan]"
+            )
+            if alias.backup_path is not None:
+                console.print(f"           backup: [dim]{alias.backup_path}[/dim]")
+        else:
+            console.print(f"  alias:   [yellow]skipped[/yellow] {alias.detail}")
+
     console.print()
     console.print("Next:")
     console.print("  [cyan]foundation doctor[/cyan]   — verify readiness")
     console.print("  [cyan]foundation[/cyan]          — start interactive chat")
+    if alias is not None and alias.installed:
+        console.print(
+            f"  [dim]source {alias.rc_path} (or open a new shell) to pick up "
+            f"`{outcome.choices.alias_name}`.[/dim]"
+        )
 
 
 def main() -> None:

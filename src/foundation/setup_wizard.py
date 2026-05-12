@@ -32,6 +32,13 @@ from foundation.settings import (
     default_env_file_path,
     load_settings,
 )
+from foundation.shell_alias import (
+    AliasInstallResult,
+    ShellKind,
+    detect_shell,
+    install_alias,
+    render_alias_block,
+)
 
 SUPPORTED_PROVIDERS: tuple[str, ...] = ("openai", "ollama")
 DEFAULT_MODELS: dict[str, str] = {
@@ -51,6 +58,10 @@ class WizardChoices:
     env_file_path: Path
     api_key_env_var: str
     api_key: str | None = None  # None = user skipped (e.g., local ollama)
+    install_alias: bool = False
+    alias_name: str = "fcli"
+    alias_target: str = "foundation"
+    shell_rc_path: Path | None = None  # None = auto-detect
 
     def normalized(self) -> WizardChoices:
         return WizardChoices(
@@ -61,6 +72,14 @@ class WizardChoices:
             env_file_path=Path(self.env_file_path).expanduser().resolve(),
             api_key_env_var=self.api_key_env_var.strip(),
             api_key=self.api_key,
+            install_alias=self.install_alias,
+            alias_name=self.alias_name.strip() or "fcli",
+            alias_target=self.alias_target.strip() or "foundation",
+            shell_rc_path=(
+                Path(self.shell_rc_path).expanduser().resolve()
+                if self.shell_rc_path is not None
+                else None
+            ),
         )
 
 
@@ -81,6 +100,7 @@ class WizardOutcome:
     config_backed_up_to: Path | None = None
     env_written: bool = False
     probe: ProbeResult | None = None
+    alias_result: AliasInstallResult | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -232,8 +252,9 @@ def apply_choices(
     *,
     overwrite: bool,
     write_key: bool,
-) -> tuple[Path | None, bool]:
-    """Persist a `WizardChoices`. Returns (config_backup_path, env_written)."""
+    install_alias_step: bool = False,
+) -> tuple[Path | None, bool, AliasInstallResult | None]:
+    """Persist a `WizardChoices`. Returns (config_backup_path, env_written, alias_result)."""
     choices = choices.normalized()
     backup = write_config_toml(
         choices.config_path,
@@ -244,7 +265,58 @@ def apply_choices(
     if write_key and choices.api_key:
         write_env_file(choices.env_file_path, choices.api_key_env_var, choices.api_key)
         env_written = True
-    return backup, env_written
+
+    alias_result: AliasInstallResult | None = None
+    if install_alias_step:
+        alias_result = _install_alias_step(choices)
+    return backup, env_written, alias_result
+
+
+def _install_alias_step(choices: WizardChoices) -> AliasInstallResult | None:
+    """Resolve target rc path, render the alias block, and install it."""
+    if choices.shell_rc_path is not None:
+        rc_path = choices.shell_rc_path
+        shell = _infer_shell_kind_from_path(rc_path)
+        if shell is None:
+            return AliasInstallResult(
+                installed=False,
+                replaced=False,
+                rc_path=rc_path,
+                backup_path=None,
+                detail=(
+                    f"Could not infer shell from {rc_path.name}; pass a recognized "
+                    "rc filename (.zshrc, .bashrc, .bash_profile, config.fish)."
+                ),
+            )
+    else:
+        detected = detect_shell()
+        if detected is None:
+            return AliasInstallResult(
+                installed=False,
+                replaced=False,
+                rc_path=Path(),
+                backup_path=None,
+                detail=(
+                    "Could not detect an active shell. Re-run with --shell-rc <path> "
+                    "to point at the rc file explicitly."
+                ),
+            )
+        rc_path = detected.rc_path
+        shell = detected.kind
+
+    block = render_alias_block(choices.alias_name, choices.alias_target, shell)
+    return install_alias(rc_path, block)
+
+
+def _infer_shell_kind_from_path(path: Path) -> ShellKind | None:
+    name = path.name
+    if name in {".zshrc", "zshrc"}:
+        return ShellKind.ZSH
+    if name in {".bashrc", "bashrc", ".bash_profile", "bash_profile"}:
+        return ShellKind.BASH
+    if name == "config.fish":
+        return ShellKind.FISH
+    return None
 
 
 def run_wizard(
@@ -268,10 +340,11 @@ def run_wizard(
         choices = interactive_prompts.gather(seed=seed, existing=existing)
 
     notes: list[str] = []
-    backup, env_written = apply_choices(
+    backup, env_written, alias_result = apply_choices(
         choices,
         overwrite=overwrite,
         write_key=choices.api_key is not None,
+        install_alias_step=choices.install_alias,
     )
     if backup is not None:
         notes.append(f"Backed up previous config to {backup}.")
@@ -296,6 +369,7 @@ def run_wizard(
         config_backed_up_to=backup,
         env_written=env_written,
         probe=probe_result,
+        alias_result=alias_result,
         notes=notes,
     )
 

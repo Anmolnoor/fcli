@@ -17,7 +17,7 @@ You need Python 3.12. The bootstrap script provisions a local venv and `uv`. All
 ./scripts/uv run foundation init
 ```
 
-The wizard asks four things:
+The wizard asks five things:
 
 | Prompt | Default | Notes |
 | --- | --- | --- |
@@ -25,6 +25,7 @@ The wizard asks four things:
 | Model | `gpt-5-mini` (openai) / `qwen3:8b` (ollama) | Free-text — any model the provider serves. |
 | Workspace root | current directory | Foundation will only read/write inside this tree. |
 | API key | — | Stored in `~/.config/foundation/foundation.env` with `chmod 600`. Leave blank for a local Ollama. |
+| Install `fcli` alias? | `N` | Optional. Appends `alias fcli="foundation"` to your shell's rc file (detected from `$SHELL`). Re-running replaces the block in-place; previous rc is backed up to `<rc>.bak`. |
 
 What it writes:
 
@@ -47,7 +48,7 @@ For scripts and CI:
   --no-probe
 ```
 
-Add `--force` to overwrite an existing config.
+Add `--force` to overwrite an existing config. Add `--alias` (plus optional `--alias-name fcli`, `--alias-target foundation`, `--shell-rc ~/.zshrc`) to install the shell alias in the same call.
 
 ## 3. Verify
 

@@ -117,9 +117,10 @@ def test_apply_choices_writes_config_and_env(tmp_path: Path) -> None:
     choices = _make_choices(tmp_path)
     choices.workspace_root.mkdir(parents=True)
 
-    backup, env_written = apply_choices(choices, overwrite=False, write_key=True)
+    backup, env_written, alias_result = apply_choices(choices, overwrite=False, write_key=True)
     assert backup is None
     assert env_written is True
+    assert alias_result is None
     assert choices.config_path.exists()
     assert choices.env_file_path.exists()
     assert "OPENAI_API_KEY=sk-test-value" in choices.env_file_path.read_text()
@@ -130,8 +131,9 @@ def test_apply_choices_skips_env_when_no_key(tmp_path: Path) -> None:
     choices.workspace_root.mkdir(parents=True)
     choices.api_key = None
 
-    _backup, env_written = apply_choices(choices, overwrite=False, write_key=False)
+    _backup, env_written, alias_result = apply_choices(choices, overwrite=False, write_key=False)
     assert env_written is False
+    assert alias_result is None
     assert not choices.env_file_path.exists()
 
 
