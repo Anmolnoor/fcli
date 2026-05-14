@@ -93,6 +93,17 @@ plans/                  Stage-by-stage implementation plans
 `foundation chat` now supports both a persistent interactive session shell and the Stage 6 one-shot orchestration flow when a request is passed explicitly.
 
 ```bash
+foundation init
+foundation init --non-interactive --provider openai --model gpt-5-mini --api-key sk-... --workspace "$(pwd)"
+foundation init --force                 # back up existing config to .toml.bak and rewrite
+foundation init --alias --shell-rc ~/.zshrc   # also install the `fcli` shell alias
+foundation config init                   # alias for `foundation init`
+foundation update
+foundation update --dry-run              # show the upgrade command without running it
+foundation update --ref v0.3.0           # install a specific branch or tag
+foundation uninstall                     # remove shell-alias block; print pipx uninstall command
+foundation uninstall --run               # additionally execvp into `pipx uninstall foundation-cli`
+foundation uninstall --purge --yes       # also wipe ~/.config/foundation + ~/.local/share/foundation + ~/.local/state/foundation
 foundation run -- pwd
 foundation run --mode buffered -- python -c "print('hello')"
 foundation run --mode pty -- python -c "import sys; print(sys.stdout.isatty())"

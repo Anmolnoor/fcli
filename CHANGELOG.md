@@ -38,6 +38,43 @@ remain inspectable both in concise chat output and the full trace store.
   and failing tests don't get misreported as successful verification.
 - **Doctor approval-boundary visibility.** `foundation doctor` prints risk
   class, trust tier, and declared side effects for every capability.
+- **`foundation init` setup wizard.** Interactive (or `--non-interactive`)
+  first-run flow that picks the provider, prompts for an API key, and
+  writes `~/.config/foundation/config.toml` plus `~/.config/foundation/foundation.env`
+  (chmod 600, atomic, preserves other env entries). Flags: `--force`
+  (backs the prior config to `config.toml.bak`), `--probe`/`--no-probe`
+  (1-token provider ping), `--alias` plus `--alias-name` / `--alias-target`
+  / `--shell-rc`. `foundation config init` is an alias for the same wizard.
+- **`fcli` shell alias step.** The wizard can install a marker-fenced
+  `alias fcli="foundation"` block into the user's shell rc (auto-detected
+  from `$SHELL`; bash, zsh, and fish supported). Re-running replaces the
+  block in place; previous rc is backed up to `<rc>.bak`. Lines outside
+  the fence are never touched.
+- **Planning sub-steps in the live UI.** Planner now emits
+  `plan_provider_call_started/_finished`, `plan_validation_started`, and
+  `plan_repair_attempt` events around the provider call. The live status
+  line transitions through `… planning iter N · contacting provider · T`
+  → `validating plan` instead of a stuck-looking timer, fixing the
+  "is it frozen?" perception on slow providers.
+- **`foundation update`.** Detects the install mechanism (pipx,
+  pip --user, or dev checkout via `pyproject.toml` sniff) and runs the
+  matching upgrade command. `--dry-run`, `--non-interactive`,
+  `--ref <branch-or-tag>`. Dev checkouts get a `git pull && uv sync`
+  hint instead of self-modification. Best-effort latest-commit-SHA fetch
+  from the GitHub API (5 s timeout) so the prompt knows whether anything
+  changed.
+- **`foundation uninstall`.** Strips the marker-fenced shell alias,
+  optionally `--purge --yes` to wipe `~/.config/foundation`,
+  `~/.local/share/foundation`, and `~/.local/state/foundation`, then
+  prints (or with `--run` execvps into) `pipx uninstall foundation-cli`.
+  `--keep-alias`, `--non-interactive`, `--run` flags supported.
+- **End-user install scripts.** `scripts/install.sh` (bootstraps pipx via
+  `python3.12 -m pip install --user pipx` if missing, then
+  `pipx install --force git+https://github.com/Anmolnoor/fcli.git@main`),
+  `scripts/update.sh`, and `scripts/uninstall.sh` (mirrors the CLI for
+  users without a working `foundation` binary; uses inline Python for
+  the marker-fence alias removal so the shell-script path doesn't
+  duplicate logic).
 
 ### Changed
 

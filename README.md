@@ -38,7 +38,9 @@ foundation                  # start interactive chat
 foundation "list files in src"   # one-shot
 ```
 
-`foundation init` writes `~/.config/foundation/config.toml` and your API key to `~/.config/foundation/foundation.env` (chmod 600). Supported providers are **openai** and **ollama**.
+`foundation init` writes `~/.config/foundation/config.toml` and your API key to `~/.config/foundation/foundation.env` (chmod 600). Supported providers are **openai** and **ollama**. The wizard can also install an `fcli="foundation"` shell alias for you.
+
+While Foundation is thinking, the status line transitions through `… planning iter 1 · contacting provider · 2.3s` → `validating plan` so you can tell the difference between a slow LLM and a frozen process.
 
 **Upgrade:** `foundation update` (or `./scripts/update.sh`). **Remove:** `foundation uninstall` keeps your config; add `--purge --yes` to wipe history and capability store.
 

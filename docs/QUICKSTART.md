@@ -21,7 +21,7 @@ After install, open a new shell (or `source ~/.zshrc`) so PATH picks up the bina
 ## 2. Configure
 
 ```bash
-./scripts/uv run foundation init
+foundation init
 ```
 
 The wizard asks five things:
@@ -46,7 +46,7 @@ By default, the wizard runs a 1-token "ping" against the provider so you find ou
 For scripts and CI:
 
 ```bash
-./scripts/uv run foundation init \
+foundation init \
   --non-interactive \
   --provider openai \
   --model gpt-5-mini \
@@ -60,7 +60,7 @@ Add `--force` to overwrite an existing config. Add `--alias` (plus optional `--a
 ## 3. Verify
 
 ```bash
-./scripts/uv run foundation doctor
+foundation doctor
 ```
 
 PASS / WARN / FAIL across config readability, required directories, provider credential resolution, history DB, and the capability registry. If anything is FAIL, the chat won't work; fix it before step 4.
