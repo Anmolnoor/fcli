@@ -587,6 +587,74 @@ def test_run_executes_a_buffered_command(
     assert "Execution Summary" in result.stdout
 
 
+def test_run_dry_run_does_not_execute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    marker = tmp_path / "marker.txt"
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "--dry-run",
+            "run",
+            "--mode",
+            "buffered",
+            "--",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w').write('side-effect')",
+        ],
+    )
+
+    assert result.exit_code == 0
+    flattened = " ".join(result.stdout.split())
+    assert "DRY RUN" in flattened
+    assert "no shell command executed" in flattened
+    assert "command:" in flattened
+    # The script body should appear in the preview so the user can see what would have run.
+    assert "side-effect" in flattened
+    # And it must not have actually run — the file is never created.
+    assert not marker.exists()
+
+
+def test_chat_dry_run_implies_plan_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    captured_plan_only: dict[str, bool] = {}
+
+    def fake_execute(settings, *, message, cwd, plan_only, **kwargs):
+        captured_plan_only["value"] = plan_only
+        # Short-circuit before any real provider call.
+        raise typer.Exit(code=0)
+
+    monkeypatch.setattr("foundation.cli._execute_chat_request", fake_execute)
+
+    result = runner.invoke(
+        app,
+        [
+            "--config",
+            str(config_path),
+            "--dry-run",
+            "chat",
+            "tell me something",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured_plan_only.get("value") is True
+    flattened = " ".join(result.stdout.split())
+    assert "DRY RUN" in flattened
+
+
 def test_run_rejects_out_of_workspace_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

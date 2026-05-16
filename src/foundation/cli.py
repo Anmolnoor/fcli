@@ -279,6 +279,7 @@ class CLIContext:
     disable_monitor: bool = False
     monitor_socket: str | None = None
     monitor_http_port: int | None = None
+    dry_run: bool = False
 
 
 @dataclass(slots=True)
@@ -2820,6 +2821,18 @@ def callback(
             ),
         ),
     ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help=(
+                "Preview what would happen without performing side effects. "
+                "For `run`, prints the resolved command and exits without spawning a shell. "
+                "For `chat`/one-shot requests, behaves like --plan-only (plan only, no execution). "
+                "Read-only commands (config, doctor, tools, history, trace) are unaffected."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Foundation CLI — local-first, shell-native coding agent.
 
@@ -2869,6 +2882,7 @@ def callback(
         disable_monitor=no_monitor or monitor_env_off,
         monitor_socket=resolved_socket,
         monitor_http_port=resolved_http_port,
+        dry_run=dry_run,
     )
     configure_logging(LogLevel.DEBUG.value if debug else LogLevel.WARNING.value)
 
@@ -2912,7 +2926,8 @@ def run(
 ) -> None:
     """Execute a shell command inside the configured workspace."""
     settings = _load_runtime_settings(ctx)
-    history_store = _build_history_store(settings)
+    cli_ctx = ctx.obj if isinstance(ctx.obj, CLIContext) else None
+    dry_run = bool(cli_ctx and cli_ctx.dry_run)
     command_argv = list(ctx.args)
     if command_argv and command_argv[0] == "--":
         command_argv = command_argv[1:]
@@ -2928,6 +2943,20 @@ def run(
         console.print(f"[bold red]Execution error:[/bold red] {exc}")
         raise typer.Exit(code=2) from exc
 
+    if dry_run:
+        resolved_cwd = _resolve_cli_request_cwd(settings.workspace_root, cwd)
+        effective_timeout = timeout_seconds or settings.shell.default_timeout_seconds
+        console.print("[bold yellow]DRY RUN[/bold yellow] — no shell command executed.")
+        console.print(f"  command: {shlex.join(command_argv)}")
+        console.print(f"  cwd:     {resolved_cwd}")
+        console.print(f"  mode:    {mode.value}")
+        console.print(f"  timeout: {effective_timeout}s")
+        if env_overlay:
+            joined_env = " ".join(f"{name}={value}" for name, value in env_overlay.items())
+            console.print(f"  env:     {joined_env}")
+        return
+
+    history_store = _build_history_store(settings)
     request_id = f"req-{uuid.uuid4().hex}"
     runtime = _build_shell_runtime(settings)
     request = ShellCommandRequest(
@@ -3090,6 +3119,13 @@ def chat(
     shell opens; when request text is provided a single agent turn executes.
     """
     settings = _load_runtime_settings(ctx)
+    cli_ctx = ctx.obj if isinstance(ctx.obj, CLIContext) else None
+    dry_run = bool(cli_ctx and cli_ctx.dry_run)
+    if dry_run and not plan_only:
+        console.print(
+            "[bold yellow]DRY RUN[/bold yellow] — planning only; no actions will be executed."
+        )
+        plan_only = True
     request_parts = list(ctx.args)
     if request_parts and request_parts[0] == "--":
         request_parts = request_parts[1:]
@@ -3106,12 +3142,13 @@ def chat(
 
     logger.info(
         "command_invoked name=chat plan_only=%s render_mode=%s cwd=%s new_session=%s "
-        "resume_session=%s",
+        "resume_session=%s dry_run=%s",
         plan_only,
         render_mode.value,
         cwd,
         new_session,
         resume_session,
+        dry_run,
     )
 
     if new_session and resume_session is not None:
