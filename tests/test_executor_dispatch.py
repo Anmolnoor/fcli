@@ -252,6 +252,62 @@ def test_dispatch_invalid_arguments_reports_value_error_branch(
     assert result.error is not None
 
 
+def test_executor_writes_ledger_entry_per_action(workspace: Path, tmp_path: Path) -> None:
+    """When a Ledger is attached, ActionExecutor records one entry per action."""
+    from foundation.ledger import Ledger
+
+    state_dir = workspace / ".foundation" / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    tool_service = LocalToolService(workspace_root=workspace)
+    registry = CapabilityRegistry(
+        store=CapabilityStore(tmp_path / "capabilities"),
+        tool_service=tool_service,
+    )
+    observer = ObserverService(history_store=None, capability_registry=registry)
+    shell_runtime = ShellRuntime(
+        workspace_root=workspace,
+        default_timeout_seconds=5,
+        max_timeout_seconds=10,
+    )
+    policy_engine = GuardrailPolicyEngine(
+        workspace_root=workspace,
+        capability_registry=registry,
+    )
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger = Ledger(path=ledger_path)
+    executor_with_ledger = ActionExecutor(
+        workspace_root=workspace,
+        shell_runtime=shell_runtime,
+        tool_service=tool_service,
+        policy_engine=policy_engine,
+        approval_service=ApprovalService(mode=ApprovalMode.AUTO),
+        capability_registry=registry,
+        observer=observer,
+        file_service=FileService(workspace_root=workspace, state_dir=state_dir),
+        git_service=GitService(workspace_root=workspace),
+        ledger=ledger,
+    )
+
+    result = _run(
+        executor_with_ledger,
+        workspace,
+        "foundation.git.status",
+        {},
+        action_id="ledger1",
+    )
+
+    assert result.status is ExecutionStatus.EXECUTED
+    assert ledger_path.exists()
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    import json
+
+    record = json.loads(lines[0])
+    assert record["action_id"] == "ledger1"
+    assert record["capability_id"] == "foundation.git.status"
+    assert record["status"] == "executed"
+
+
 def test_dispatch_unknown_capability_reports_failed_resolution(
     workspace: Path,
     executor: ActionExecutor,

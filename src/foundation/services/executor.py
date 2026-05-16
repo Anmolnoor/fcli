@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from foundation.ledger import Ledger, build_entry
 from foundation.models import (
     ActionKind,
     ApprovalDecisionStatus,
@@ -120,6 +121,7 @@ class ActionExecutor:
         shell_output_callback: OutputCallback | None = None,
         file_service: FileService | None = None,
         git_service: GitService | None = None,
+        ledger: Ledger | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._shell_runtime = shell_runtime
@@ -131,6 +133,7 @@ class ActionExecutor:
         self._shell_output_callback = shell_output_callback
         self._file_service = file_service
         self._git_service = git_service
+        self._ledger = ledger
 
     def execute(
         self,
@@ -155,6 +158,8 @@ class ActionExecutor:
             session_id=session_id,
         )
         completed_at = _utcnow()
+        if self._ledger is not None:
+            self._ledger.record(build_entry(action, execution_result))
         return ActionExecutionEnvelope(
             execution_result=execution_result,
             approval_request=approval_request,
