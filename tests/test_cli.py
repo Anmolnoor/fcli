@@ -2054,12 +2054,12 @@ def _iteration_result_for_notices(
 
 
 def test_iteration_changed_files_notice_lists_paths() -> None:
-    from foundation.cli import _iteration_changed_files_notice
+    from foundation.notices import iteration_changed_files_notice
 
     result = _iteration_result_for_notices(
         changed_paths=["src/a.py", "src/b.py"],
     )
-    notice = _iteration_changed_files_notice(result)
+    notice = iteration_changed_files_notice(result)
     assert notice is not None
     assert "src/a.py" in notice.text
     assert "src/b.py" in notice.text
@@ -2067,7 +2067,7 @@ def test_iteration_changed_files_notice_lists_paths() -> None:
 
 
 def test_iteration_changed_files_notice_dedups_and_caps() -> None:
-    from foundation.cli import _iteration_changed_files_notice
+    from foundation.notices import iteration_changed_files_notice
 
     # Build a result with execution_results spanning 10 unique writes plus a
     # duplicate, without tripping the per-plan 5-action cap.  The notice
@@ -2085,21 +2085,21 @@ def test_iteration_changed_files_notice_dedups_and_caps() -> None:
                 artifact={"path": path},
             )
         )
-    notice = _iteration_changed_files_notice(result)
+    notice = iteration_changed_files_notice(result)
     assert notice is not None
     # 11 unique: "src/keep.py" + 10 distinct src/fN.py, cap 6 → 5 hidden
     assert "+5 more" in notice.text
 
 
 def test_iteration_changed_files_notice_empty() -> None:
-    from foundation.cli import _iteration_changed_files_notice
+    from foundation.notices import iteration_changed_files_notice
 
     result = _iteration_result_for_notices()
-    assert _iteration_changed_files_notice(result) is None
+    assert iteration_changed_files_notice(result) is None
 
 
 def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:
-    from foundation.cli import _iteration_commands_notice
+    from foundation.notices import iteration_commands_notice
 
     result = _iteration_result_for_notices(
         shell_commands=[
@@ -2108,15 +2108,15 @@ def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:
             ("ruff", ["check"]),
         ]
     )
-    notice = _iteration_commands_notice(result)
+    notice = iteration_commands_notice(result)
     assert notice is not None
     assert notice.text.count("$ pytest -x") == 1
     assert "$ ruff check" in notice.text
 
 
 def test_verification_outcome_notice_covers_all_outcomes() -> None:
-    from foundation.cli import _verification_outcome_notice
     from foundation.models import VerificationOutcome
+    from foundation.notices import verification_outcome_notice
 
     passed = _iteration_result_for_notices(
         verification={
@@ -2124,7 +2124,7 @@ def test_verification_outcome_notice_covers_all_outcomes() -> None:
             "verification_commands_run": ["pytest"],
         },
     )
-    notice = _verification_outcome_notice(passed)
+    notice = verification_outcome_notice(passed)
     assert notice is not None
     assert "passed" in notice.text
     assert "pytest" in notice.text
@@ -2135,7 +2135,7 @@ def test_verification_outcome_notice_covers_all_outcomes() -> None:
             "verification_commands_run": ["pytest"],
         },
     )
-    notice = _verification_outcome_notice(failed)
+    notice = verification_outcome_notice(failed)
     assert notice is not None
     assert "failed" in notice.text
 
@@ -2145,7 +2145,7 @@ def test_verification_outcome_notice_covers_all_outcomes() -> None:
             "verification_commands_run": ["pytest"],
         },
     )
-    notice = _verification_outcome_notice(unavailable)
+    notice = verification_outcome_notice(unavailable)
     assert notice is not None
     assert "unavailable" in notice.text
 
@@ -2155,24 +2155,24 @@ def test_verification_outcome_notice_covers_all_outcomes() -> None:
             "verification_commands_run": [],
         },
     )
-    notice = _verification_outcome_notice(not_attempted)
+    notice = verification_outcome_notice(not_attempted)
     assert notice is not None
     assert "no verification command" in notice.text
 
 
 def test_approval_required_notice_fires_only_for_pending_approval_stop() -> None:
-    from foundation.cli import _approval_required_notice
     from foundation.models import LoopStopReason
+    from foundation.notices import approval_required_notice
 
     pending = _iteration_result_for_notices(
         stop_reason=LoopStopReason.PENDING_APPROVAL,
         pending_approval_actions=2,
     )
-    notice = _approval_required_notice(pending)
+    notice = approval_required_notice(pending)
     assert notice is not None
     assert "2 actions" in notice.text
 
     completed = _iteration_result_for_notices(
         stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
     )
-    assert _approval_required_notice(completed) is None
+    assert approval_required_notice(completed) is None
