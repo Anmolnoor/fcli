@@ -606,8 +606,19 @@ def _read_env_file(
     return values
 
 
-def _validate_config_file(config_path: Path) -> bool:
+def _validate_config_file(config_path: Path, *, require_existing: bool = False) -> bool:
     if not config_path.exists():
+        if require_existing:
+            raise SettingsLoadError(
+                (
+                    f"Config file not found: {config_path}\n"
+                    "The path was passed explicitly, so falling back to defaults would silently "
+                    "ignore the request.\n"
+                    "Fix: create the file, correct the path, or omit --config to use the default "
+                    f"location ({default_config_path()})."
+                ),
+                config_path=config_path,
+            )
         return False
 
     try:
@@ -615,12 +626,18 @@ def _validate_config_file(config_path: Path) -> bool:
             tomllib.load(config_file)
     except tomllib.TOMLDecodeError as exc:
         raise SettingsLoadError(
-            f"Invalid TOML in {config_path}: {exc}",
+            (
+                f"Invalid TOML in {config_path}: {exc}\n"
+                "Fix: open the file at the reported line/column and correct the syntax."
+            ),
             config_path=config_path,
         ) from exc
     except OSError as exc:
         raise SettingsLoadError(
-            f"Could not read config file {config_path}: {exc}",
+            (
+                f"Could not read config file {config_path}: {exc}\n"
+                "Fix: check file permissions and that the path is a regular file."
+            ),
             config_path=config_path,
         ) from exc
 
@@ -648,11 +665,12 @@ def load_settings(
     config_path: Path | None = None,
     *,
     overrides: Mapping[str, Any] | None = None,
+    require_existing: bool = False,
 ) -> AppSettings:
     """Load typed settings using defaults, TOML, environment variables, and CLI overrides."""
     resolved_config_path = _resolve_path(config_path or default_config_path())
     resolved_env_file_path = default_env_file_path(resolved_config_path)
-    config_exists = _validate_config_file(resolved_config_path)
+    config_exists = _validate_config_file(resolved_config_path, require_existing=require_existing)
     env_file_values = _read_env_file(
         resolved_env_file_path,
         config_path=resolved_config_path,

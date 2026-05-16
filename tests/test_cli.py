@@ -358,6 +358,31 @@ def test_config_validate_reports_success(
     assert "Provider credential sources" in result.stdout
 
 
+def test_cli_errors_when_explicit_config_path_missing(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist.toml"
+
+    result = runner.invoke(app, ["--config", str(missing), "config", "show"])
+
+    assert result.exit_code == 1
+    flattened = " ".join(result.stdout.split())
+    assert "Configuration error" in flattened
+    assert "Config file not found" in flattened
+    # Rich may truncate long paths in the console; assert on the filename which is short enough.
+    assert missing.name in flattened
+
+
+def test_cli_errors_when_explicit_config_path_invalid(tmp_path: Path) -> None:
+    bad = tmp_path / "broken.toml"
+    bad.write_text("[provider\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["--config", str(bad), "config", "show"])
+
+    assert result.exit_code == 1
+    assert "Configuration error" in result.stdout
+    assert "Invalid TOML" in result.stdout
+    assert "Fix:" in result.stdout
+
+
 def test_config_show_reflects_provider_cli_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

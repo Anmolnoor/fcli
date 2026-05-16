@@ -204,8 +204,34 @@ def test_load_settings_rejects_invalid_toml(tmp_path: Path) -> None:
     config_path = tmp_path / "invalid.toml"
     config_path.write_text('[app\nworkspace_root = "/tmp"\n', encoding="utf-8")
 
-    with pytest.raises(SettingsLoadError):
+    with pytest.raises(SettingsLoadError) as excinfo:
         load_settings(config_path=config_path)
+
+    message = str(excinfo.value)
+    assert "Invalid TOML" in message
+    assert "Fix:" in message
+
+
+def test_load_settings_require_existing_errors_when_missing(tmp_path: Path) -> None:
+    missing = tmp_path / "definitely_missing.toml"
+
+    with pytest.raises(SettingsLoadError) as excinfo:
+        load_settings(config_path=missing, require_existing=True)
+
+    message = str(excinfo.value)
+    assert "Config file not found" in message
+    assert str(missing) in message
+    assert "--config" in message
+
+
+def test_load_settings_require_existing_passes_when_present(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[app]\n", encoding="utf-8")
+
+    settings = load_settings(config_path=config_path, require_existing=True)
+
+    assert settings.config_exists is True
+    assert settings.config_path == config_path.resolve()
 
 
 def test_history_db_follows_state_dir_override(

@@ -383,6 +383,7 @@ def _load_runtime_settings(ctx: typer.Context) -> AppSettings:
         settings = load_settings(
             config_path=cli_context.config_path,
             overrides=cli_context.overrides,
+            require_existing=cli_context.config_path is not None,
         )
     except SettingsLoadError as exc:
         logger.error("settings_load_failed: %s", exc)
