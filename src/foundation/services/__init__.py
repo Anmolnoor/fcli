@@ -1,0 +1,134 @@
+"""Service-layer package for Foundation CLI."""
+
+from foundation.services.approval import ApprovalPrompt, ApprovalService
+from foundation.services.capabilities import (
+    CapabilityDocument,
+    CapabilityRegistry,
+    CapabilityResolver,
+    CapabilityStore,
+)
+from foundation.services.executor import ActionExecutionEnvelope, ActionExecutor
+from foundation.services.file_service import FileService
+from foundation.services.git_service import GitService
+from foundation.services.guardrails import (
+    CapabilityPolicyEngine,
+    GuardrailPolicyEngine,
+    SimplePolicyEngine,
+)
+from foundation.services.history import HistoryStore, TraceStore
+from foundation.services.observer import ObserverService
+from foundation.services.orchestrator import (
+    OrchestrationError,
+    OrchestrationPlanError,
+    RequestOrchestrator,
+)
+from foundation.services.planner import PlannerService, PlanningError
+from foundation.services.provider import (
+    OllamaChatAdapter,
+    OpenAIResponsesAdapter,
+    ProviderAdapter,
+    ProviderError,
+    ProviderErrorCode,
+    build_provider_adapter,
+)
+from foundation.services.session import ConversationCompactor, SessionManager
+from foundation.services.shell import (
+    ExecutionMode,
+    OutputStream,
+    ShellCommandRequest,
+    ShellCommandResult,
+    ShellExecutionCancelled,
+    ShellExecutionError,
+    ShellExecutionSpawnError,
+    ShellExecutionTimeout,
+    ShellOutputEvent,
+    ShellRuntime,
+)
+from foundation.services.staging import WorkspaceRewriteStager
+from foundation.services.tools import (
+    FileDiscoveryRequest,
+    FileDiscoveryResult,
+    FileDiscoveryType,
+    GitCommitSummary,
+    GitContextRequest,
+    GitContextResult,
+    GitDiffStat,
+    GitStatusEntry,
+    HelpLookupRequest,
+    HelpLookupResult,
+    HelpLookupSource,
+    LocalToolService,
+    SearchMatch,
+    SearchRequest,
+    SearchResult,
+    ToolAvailabilityStatus,
+    ToolBinaryStatus,
+    ToolError,
+    ToolErrorCode,
+    ToolExecutionError,
+    WorkspacePathFilter,
+)
+
+__all__ = [
+    "ApprovalPrompt",
+    "ApprovalService",
+    "ActionExecutionEnvelope",
+    "ActionExecutor",
+    "CapabilityDocument",
+    "CapabilityRegistry",
+    "CapabilityResolver",
+    "CapabilityStore",
+    "CapabilityPolicyEngine",
+    "ConversationCompactor",
+    "ExecutionMode",
+    "FileService",
+    "GitService",
+    "FileDiscoveryRequest",
+    "FileDiscoveryResult",
+    "FileDiscoveryType",
+    "GitCommitSummary",
+    "GuardrailPolicyEngine",
+    "GitContextRequest",
+    "GitContextResult",
+    "GitDiffStat",
+    "GitStatusEntry",
+    "HelpLookupRequest",
+    "HelpLookupResult",
+    "HelpLookupSource",
+    "HistoryStore",
+    "LocalToolService",
+    "ObserverService",
+    "OpenAIResponsesAdapter",
+    "OllamaChatAdapter",
+    "OrchestrationError",
+    "OrchestrationPlanError",
+    "OutputStream",
+    "PlannerService",
+    "PlanningError",
+    "ProviderAdapter",
+    "ProviderError",
+    "ProviderErrorCode",
+    "RequestOrchestrator",
+    "SearchMatch",
+    "SearchRequest",
+    "SearchResult",
+    "SessionManager",
+    "ShellCommandRequest",
+    "ShellCommandResult",
+    "ShellExecutionCancelled",
+    "ShellExecutionError",
+    "ShellExecutionSpawnError",
+    "ShellExecutionTimeout",
+    "ShellOutputEvent",
+    "ShellRuntime",
+    "SimplePolicyEngine",
+    "ToolAvailabilityStatus",
+    "ToolBinaryStatus",
+    "ToolError",
+    "ToolErrorCode",
+    "ToolExecutionError",
+    "TraceStore",
+    "WorkspaceRewriteStager",
+    "WorkspacePathFilter",
+    "build_provider_adapter",
+]

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system tools (ripgrep)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap (venv + uv + dev deps)
+        run: ./scripts/bootstrap.sh
+
+      - name: Ruff lint
+        run: ./scripts/uv run ruff check src tests
+
+      - name: Ruff format check
+        run: ./scripts/uv run ruff format --check src tests
+
+      - name: Pytest
+        run: ./scripts/uv run pytest -q

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UV_BIN="${ROOT_DIR}/.venv/bin/uv"
+
+if [[ ! -x "${UV_BIN}" ]]; then
+  echo "Missing ${UV_BIN}. Run ./scripts/bootstrap.sh first." >&2
+  exit 1
+fi
+
+export UV_CACHE_DIR="${ROOT_DIR}/.uv-cache"
+mkdir -p "${UV_CACHE_DIR}"
+
+if [[ "${1:-}" == "run" && "${FOUNDATION_UV_RUN_SYNC:-0}" != "1" && -z "${UV_NO_SYNC:-}" ]]; then
+  # Keep repeated verification commands offline-friendly. Use `uv sync` or
+  # set FOUNDATION_UV_RUN_SYNC=1 when you intentionally want a fresh sync.
+  export UV_NO_SYNC=1
+fi
+
+exec "${UV_BIN}" "$@"
