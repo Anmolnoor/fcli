@@ -8,7 +8,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator, model_validator
 
-from foundation.models.capability import CapabilitySnapshot, PolicyEvaluationRecord
+from foundation.models.capability import (
+    CapabilitySnapshot,
+    PolicyEvaluationRecord,
+    PolicyReasonCode,
+)
 
 
 class StrictModel(BaseModel):
@@ -320,6 +324,7 @@ class PolicyDecision(StrictModel):
     risk_categories: list[str] = Field(default_factory=list)
     command_preview: str | None = None
     paths: list[str] = Field(default_factory=list)
+    reason_codes: list[PolicyReasonCode] = Field(default_factory=list)
 
 
 class ExecutionResult(StrictModel):

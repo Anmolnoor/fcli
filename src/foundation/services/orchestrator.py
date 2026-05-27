@@ -66,6 +66,7 @@ from foundation.services.history import HistoryStore
 from foundation.services.observer import EventSink, ObserverService
 from foundation.services.planner import PlannerService, PlanningError
 from foundation.services.provider import ProviderAdapter, ProviderError
+from foundation.services.scope_grants import ScopeGrantStore
 from foundation.services.shell import OutputCallback, ShellRuntime
 from foundation.services.tools import LocalToolService
 from foundation.settings import ApprovalMode
@@ -452,9 +453,12 @@ class RequestOrchestrator:
             store=CapabilityStore(store_root),
             tool_service=self._tool_service,
         )
+        # Shared, session-scoped read grants for out-of-workspace escalation.
+        self._grant_store = ScopeGrantStore()
         self._policy_engine = policy_engine or GuardrailPolicyEngine(
             workspace_root=self._workspace_root,
             capability_registry=self._capability_registry,
+            grant_store=self._grant_store,
         )
         self._approval_service = approval_service or ApprovalService(mode=approval_mode)
         self._history_store = history_store
@@ -488,9 +492,11 @@ class RequestOrchestrator:
             file_service=FileService(
                 workspace_root=self._workspace_root,
                 state_dir=state_dir,
+                read_grant_store=self._grant_store,
             ),
             git_service=self._git_service,
             question_callback=question_callback,
+            grant_store=self._grant_store,
         )
 
     def set_event_sink(self, event_sink: EventSink | None) -> None:

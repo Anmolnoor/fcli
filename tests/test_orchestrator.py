@@ -11,6 +11,7 @@ import pytest
 
 from foundation.models import (
     ActionKind,
+    ExecutionArtifactType,
     ExecutionStatus,
     ExecutionStep,
     LoopStopReason,
@@ -498,6 +499,149 @@ def test_orchestrator_question_without_callback_stops_awaiting_input(
     assert any(
         r.status is ExecutionStatus.AWAITING_INPUT for r in result.execution_results
     )
+
+
+def _read_action(action_id: str, path: str) -> dict[str, Any]:
+    return {
+        "id": action_id,
+        "kind": "tool_call",
+        "summary": f"Read {path}",
+        "tool_call": {"capability_id": "foundation.file.read", "arguments": {"path": path}},
+    }
+
+
+def test_orchestrator_out_of_scope_read_escalation_grants_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("top secret\n", encoding="utf-8")
+    sibling = outside / "other.md"
+    sibling.write_text("also here\n", encoding="utf-8")
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Reading the external file.",
+                    "actions": [_read_action("read_secret", str(secret))],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Reading a sibling under the same root.",
+                    "actions": [_read_action("read_sibling", str(sibling))],
+                }
+            ),
+        ]
+    )
+    prompts: list[str] = []
+
+    def callback(question: QuestionAction) -> str:
+        prompts.append(question.prompt)
+        return "Allow for this session"
+
+    orchestrator, _, _ = _orchestrator(
+        tmp_path, monkeypatch, provider, question_callback=callback
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="read the external secret"))
+
+    # Prompted exactly once; the sibling read under the granted root did not re-prompt.
+    assert len(prompts) == 1
+    executed_reads = [
+        r
+        for r in result.execution_results
+        if r.artifact_type is ExecutionArtifactType.FILE_READ
+        and r.status is ExecutionStatus.EXECUTED
+    ]
+    assert len(executed_reads) == 2
+    assert any(r.artifact and r.artifact.get("content") == "top secret\n" for r in executed_reads)
+
+
+def test_orchestrator_out_of_scope_read_escalation_deny_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("top secret\n", encoding="utf-8")
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Reading the external file.",
+                    "actions": [_read_action("read_secret", str(secret))],
+                }
+            )
+        ]
+    )
+
+    def callback(_question: QuestionAction) -> str:
+        return "Deny"
+
+    orchestrator, _, _ = _orchestrator(
+        tmp_path, monkeypatch, provider, question_callback=callback
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="read the external secret"))
+
+    assert any(r.status is ExecutionStatus.BLOCKED for r in result.execution_results)
+    assert not any(
+        r.artifact_type is ExecutionArtifactType.FILE_READ
+        and r.status is ExecutionStatus.EXECUTED
+        for r in result.execution_results
+    )
+
+
+def test_orchestrator_out_of_scope_write_stays_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "evil.md"
+
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing outside the workspace.",
+                    "actions": [
+                        {
+                            "id": "write_evil",
+                            "kind": "tool_call",
+                            "summary": "Write outside the workspace",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {"path": str(target), "content": "x"},
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    prompts: list[str] = []
+
+    def callback(question: QuestionAction) -> str:
+        prompts.append(question.prompt)
+        return "Allow for this session"
+
+    orchestrator, _, _ = _orchestrator(
+        tmp_path, monkeypatch, provider, question_callback=callback
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="write outside"))
+
+    # Writes are never escalated: no prompt, blocked, nothing written.
+    assert prompts == []
+    assert any(r.status is ExecutionStatus.BLOCKED for r in result.execution_results)
+    assert not target.exists()
 
 
 def test_orchestrator_retries_shell_cat_plan_without_executing_it(

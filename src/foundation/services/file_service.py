@@ -20,6 +20,7 @@ from foundation.models.file import (
     FileServiceError,
     FileWriteRequest,
 )
+from foundation.services.scope_grants import ScopeGrantStore
 from foundation.services.staging import WorkspaceRewriteStager
 
 _MAX_READ_BYTES = 256 * 1024  # 256 KB
@@ -231,8 +232,15 @@ def _parse_and_apply_diff(original: str, diff_text: str, *, file_path: str) -> s
 class FileService:
     """Workspace-bound text file operations for v3 file capabilities."""
 
-    def __init__(self, *, workspace_root: Path, state_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: Path,
+        state_dir: Path,
+        read_grant_store: ScopeGrantStore | None = None,
+    ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
+        self._read_grant_store = read_grant_store
         self._stager = WorkspaceRewriteStager(
             workspace_root=self._workspace_root,
             state_dir=state_dir,
@@ -256,6 +264,31 @@ class FileService:
                 path=raw_path,
             )
         return resolved
+
+    def _resolve_read_path(self, raw_path: str) -> Path:
+        """Resolve a read path, also allowing session-granted out-of-scope roots.
+
+        Reads may target the workspace or any directory the user approved via a
+        scope escalation. Writes never use this — they stay workspace-confined.
+        """
+        candidate = Path(raw_path)
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self._workspace_root / candidate).resolve()
+        )
+        try:
+            resolved.relative_to(self._workspace_root)
+            return resolved
+        except ValueError:
+            pass
+        if self._read_grant_store is not None and self._read_grant_store.is_granted(resolved):
+            return resolved
+        _raise(
+            FileErrorCode.PATH_OUTSIDE_WORKSPACE,
+            "Path escapes the workspace boundary.",
+            path=raw_path,
+        )
 
     # -- raw I/O helpers ----------------------------------------------------
 
@@ -309,7 +342,7 @@ class FileService:
 
     def read(self, request: FileReadRequest) -> FileReadResult:
         """Read one workspace text file up to 256 KB."""
-        resolved = self._resolve_path(request.path)
+        resolved = self._resolve_read_path(request.path)
         if not resolved.exists():
             _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
         file_size = resolved.stat().st_size
@@ -332,7 +365,7 @@ class FileService:
 
     def read_chunk(self, request: FileReadChunkRequest) -> FileReadChunkResult:
         """Read a line-based chunk from a workspace text file."""
-        resolved = self._resolve_path(request.path)
+        resolved = self._resolve_read_path(request.path)
         if not resolved.exists():
             _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
 

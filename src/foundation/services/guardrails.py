@@ -36,6 +36,7 @@ from foundation.models import (
     TrustTier,
 )
 from foundation.services.capabilities import SHELL_CAPABILITY_ID, CapabilityRegistry
+from foundation.services.scope_grants import ScopeGrantStore
 from foundation.settings import ApprovalMode
 
 _SIMPLE_NO_ARG_COMMANDS = {"date", "pwd", "uname", "whoami"}
@@ -118,9 +119,11 @@ class CapabilityPolicyEngine:
         *,
         workspace_root: Path,
         capability_registry: CapabilityRegistry | None = None,
+        grant_store: ScopeGrantStore | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._capability_registry = capability_registry
+        self._grant_store = grant_store
         self._invocation_counts: dict[str, int] = defaultdict(int)
         self._invocation_log: dict[str, deque[float]] = defaultdict(deque)
 
@@ -211,6 +214,7 @@ class CapabilityPolicyEngine:
             risk_categories=self._risk_categories_for_evaluation(evaluation),
             command_preview=evaluation.policy_input.command_preview,
             paths=list(evaluation.policy_input.requested_paths),
+            reason_codes=list(evaluation.verdict.reason_codes),
         )
 
     def register_invocation(self, evaluation: PolicyEvaluationRecord) -> None:
@@ -549,6 +553,16 @@ class CapabilityPolicyEngine:
                 policy_input,
             )
         if not self._paths_in_scope(policy_input):
+            if self._can_escalate_scope(policy_input):
+                return CapabilityPolicyVerdict(
+                    outcome=CapabilityPolicyOutcome.REQUIRE_APPROVAL,
+                    summary=(
+                        "Requested path is outside the workspace; reading it needs "
+                        "your approval."
+                    ),
+                    reason_codes=[PolicyReasonCode.SCOPE_ESCALATION],
+                    constraints=policy_input.constraints.model_copy(deep=True),
+                )
             return self._blocked_verdict(
                 "Requested paths are outside the capability's declared path scope.",
                 PolicyReasonCode.PATH_OUT_OF_SCOPE,
@@ -617,6 +631,23 @@ class CapabilityPolicyEngine:
             summary=summary,
             constraints=effective_constraints,
         )
+
+    def _can_escalate_scope(self, policy_input: CapabilityPolicyInput) -> bool:
+        """Whether an out-of-scope path may be escalated to the user.
+
+        Only read-only typed file reads are eligible: a single grant can be
+        honored by the file service, and reads are the lowest-risk escalation.
+        Writes, shell, and discovery stay hard-blocked.
+        """
+        if self._grant_store is None:
+            return False
+        if policy_input.runtime_endpoint not in {
+            "builtin.file.read",
+            "builtin.file.read_chunk",
+        }:
+            return False
+        effects = set(policy_input.requested_side_effects)
+        return effects == {"filesystem_read"}
 
     def _blocked_verdict(
         self,
@@ -694,6 +725,10 @@ class CapabilityPolicyEngine:
         if not rules:
             return False
         resolved_path = path.resolve()
+        # A session-granted out-of-scope read root counts as in-scope, so a
+        # second read under an already-approved root does not re-prompt.
+        if self._grant_store is not None and self._grant_store.is_granted(resolved_path):
+            return True
         for rule in rules:
             if rule.kind is CapabilityScopeKind.ANY:
                 return True
