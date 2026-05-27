@@ -279,6 +279,42 @@ def test_orchestrator_retries_invalid_plans_without_duplicate_shell_execution(
     assert result.execution_results[0].artifact["stdout"] == f"{workspace_root}\n"
 
 
+def test_orchestrator_recovers_from_truncated_plan_with_content_brief_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from foundation.services.provider import ProviderError, ProviderErrorCode
+
+    class _TruncateThenSucceed:
+        def __init__(self) -> None:
+            self.calls: list[ProviderPrompt] = []
+            self._raised = False
+
+        def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
+            self.calls.append(prompt)
+            if not self._raised:
+                self._raised = True
+                raise ProviderError(
+                    "Provider response was truncated before completion (done_reason=length).",
+                    code=ProviderErrorCode.TRUNCATED,
+                    response_text='{"assistant_message":"writing","actions":[{"id":"w"',
+                )
+            return _provider_response({"assistant_message": "Done.", "actions": []})
+
+    provider = _TruncateThenSucceed()
+    orchestrator, runtime, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="write a big file"))
+
+    # Truncated attempt + repaired retry, both within iteration 1's planning.
+    assert len(provider.calls) == 2
+    assert runtime.calls == 0
+    repair_text = "\n".join(m.content for m in provider.calls[1].messages)
+    assert "truncated" in repair_text.lower()
+    assert "content_brief" in repair_text
+    assert result.summary is not None
+
+
 def test_orchestrator_retries_shell_cat_plan_without_executing_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -200,6 +200,8 @@ class ProviderSection(BaseModel):
     model: str = "gpt-5-mini"
     base_url: AnyUrl | None = None
     request_timeout_seconds: PositiveInt = 60
+    max_output_tokens: PositiveInt | None = None
+    num_ctx: PositiveInt | None = None
     api_key_env_var: str | None = OPENAI_DEFAULT_API_KEY_ENV_VAR
     api_key_keychain: KeychainSecretRef | None = Field(default_factory=KeychainSecretRef)
 

@@ -61,7 +61,7 @@ from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
 from foundation.services.observer import EventSink, ObserverService
 from foundation.services.planner import PlannerService, PlanningError
-from foundation.services.provider import ProviderAdapter
+from foundation.services.provider import ProviderAdapter, ProviderError
 from foundation.services.shell import OutputCallback, ShellRuntime
 from foundation.services.tools import LocalToolService
 from foundation.settings import ApprovalMode
@@ -576,6 +576,11 @@ class RequestOrchestrator:
                 )
             return result
         except Exception as exc:
+            # Preserve the raw (capped) provider response on parse/truncation
+            # failures so the persisted event log is self-diagnosing.
+            failure_extra: dict[str, str] = {}
+            if isinstance(exc, ProviderError) and exc.response_text:
+                failure_extra["response_text"] = exc.response_text[:4096]
             self._observer.emit_exception(
                 EVENT_EXCEPTION,
                 exc,
@@ -583,6 +588,7 @@ class RequestOrchestrator:
                     "request_id": request_id,
                     "session_id": session_id,
                     "request_text": request.message,
+                    **failure_extra,
                 },
                 session_id=session_id,
                 logger_name="foundation.services.orchestrator",
@@ -590,7 +596,11 @@ class RequestOrchestrator:
             self._observer.emit_exception(
                 EVENT_PLAN_FAILED,
                 exc,
-                payload={"request_id": request_id, "session_id": session_id},
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    **failure_extra,
+                },
                 session_id=session_id,
                 logger_name="foundation.services.orchestrator",
             )

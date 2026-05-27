@@ -41,6 +41,7 @@ class ProviderErrorCode(StrEnum):
     RATE_LIMIT = "rate_limit"
     SERVER_ERROR = "server_error"
     INVALID_RESPONSE = "invalid_response"
+    TRUNCATED = "truncated"
     REFUSAL = "refusal"
     UNSUPPORTED_PROVIDER = "unsupported_provider"
 
@@ -197,6 +198,7 @@ class OpenAIResponsesAdapter:
         timeout_seconds: int = 60,
         max_attempts: int = 3,
         retry_backoff_seconds: float = 0.25,
+        max_output_tokens: int | None = None,
         transport: JsonTransport | None = None,
     ) -> None:
         self._model = model
@@ -205,6 +207,7 @@ class OpenAIResponsesAdapter:
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
         self._retry_backoff_seconds = retry_backoff_seconds
+        self._max_output_tokens = max_output_tokens
         self._transport = transport or UrllibJsonTransport()
 
     def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
@@ -333,6 +336,8 @@ class OpenAIResponsesAdapter:
                 for message in prompt.messages
             ],
         }
+        if self._max_output_tokens is not None:
+            payload["max_output_tokens"] = self._max_output_tokens
         if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
             assert prompt.schema_name is not None
             assert prompt.output_schema is not None
@@ -347,6 +352,21 @@ class OpenAIResponsesAdapter:
         return payload
 
     def _extract_content(self, payload: Mapping[str, Any]) -> str:
+        # An incomplete response means the model hit max_output_tokens; the
+        # output is partial.  Flag it explicitly rather than parsing truncated JSON.
+        if payload.get("status") == "incomplete":
+            details = payload.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, Mapping) else None
+            if reason in (None, "max_output_tokens"):
+                raise ProviderError(
+                    "Provider response was truncated before completion "
+                    f"(status=incomplete, reason={reason}). Raise provider.max_output_tokens, "
+                    "or have the planner emit a smaller plan (use content_brief for large "
+                    "file bodies).",
+                    code=ProviderErrorCode.TRUNCATED,
+                    response_text=_coerce_optional_string(payload.get("output_text")),
+                )
+
         top_level_text = payload.get("output_text")
         if isinstance(top_level_text, str) and top_level_text.strip():
             return top_level_text.strip()
@@ -423,6 +443,8 @@ class OllamaChatAdapter:
         timeout_seconds: int = 60,
         max_attempts: int = 3,
         retry_backoff_seconds: float = 0.25,
+        max_output_tokens: int | None = None,
+        num_ctx: int | None = None,
         transport: JsonTransport | None = None,
     ) -> None:
         self._model = model
@@ -431,6 +453,8 @@ class OllamaChatAdapter:
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
         self._retry_backoff_seconds = retry_backoff_seconds
+        self._max_output_tokens = max_output_tokens
+        self._num_ctx = num_ctx
         self._transport = transport or UrllibJsonTransport()
 
     def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
@@ -586,14 +610,19 @@ class OllamaChatAdapter:
             ],
             "stream": False,
         }
+        options: dict[str, Any] = {}
+        if self._max_output_tokens is not None:
+            options["num_predict"] = self._max_output_tokens
+        if self._num_ctx is not None:
+            options["num_ctx"] = self._num_ctx
         if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
             assert prompt.output_schema is not None
             payload["format"] = prompt.output_schema
-            payload["options"] = {
-                "temperature": 0,
-            }
+            options["temperature"] = 0
             if self._needs_think_for_structured_output(self._model):
                 payload["think"] = True
+        if options:
+            payload["options"] = options
         return payload
 
     def _extract_content(
@@ -603,6 +632,23 @@ class OllamaChatAdapter:
         response_format: ProviderResponseFormat,
     ) -> str:
         json_requested = response_format is ProviderResponseFormat.JSON_OBJECT
+
+        # A truncated generation (model hit its output-token budget) leaves the
+        # JSON object unterminated.  Surface that explicitly here instead of
+        # letting it fall through to a confusing json.loads failure downstream.
+        if payload.get("done_reason") == "length":
+            message = payload.get("message")
+            partial = ""
+            if isinstance(message, Mapping) and isinstance(message.get("content"), str):
+                partial = message["content"]
+            raise ProviderError(
+                "Provider response was truncated before completion (done_reason=length). "
+                "The model hit its output-token limit, so the response is incomplete. "
+                "Raise provider.max_output_tokens, or have the planner emit a smaller plan "
+                "(use content_brief for large file bodies).",
+                code=ProviderErrorCode.TRUNCATED,
+                response_text=partial,
+            )
 
         # Standard Ollama local format: {"message": {"content": "...", "thinking": "..."}}
         message = payload.get("message")
@@ -800,6 +846,8 @@ def build_provider_adapter(
             api_key=api_key,
             base_url=settings.provider.effective_base_url(),
             timeout_seconds=settings.provider.request_timeout_seconds,
+            max_output_tokens=settings.provider.max_output_tokens,
+            num_ctx=settings.provider.num_ctx,
             transport=transport,
         )
 
@@ -808,5 +856,6 @@ def build_provider_adapter(
         api_key=api_key or "",
         base_url=settings.provider.effective_base_url(),
         timeout_seconds=settings.provider.request_timeout_seconds,
+        max_output_tokens=settings.provider.max_output_tokens,
         transport=transport,
     )

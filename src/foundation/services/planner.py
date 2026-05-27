@@ -148,12 +148,22 @@ class PlannerService:
                 response = self._provider.complete(prompt)
             except ProviderError as exc:
                 last_error = exc
-                if (
-                    exc.code is ProviderErrorCode.INVALID_RESPONSE
-                    and attempt < self._max_plan_attempts
-                ):
+                repairable = exc.code in (
+                    ProviderErrorCode.INVALID_RESPONSE,
+                    ProviderErrorCode.TRUNCATED,
+                )
+                if repairable and attempt < self._max_plan_attempts:
+                    if exc.code is ProviderErrorCode.TRUNCATED:
+                        feedback = (
+                            "Your previous response was truncated before the JSON closed. "
+                            "Produce a SHORTER plan: do not inline large file contents — for "
+                            "any sizable file body, omit `content` and provide a brief "
+                            "`content_brief` describing what to write instead."
+                        )
+                    else:
+                        feedback = "The previous response was not valid JSON."
                     supplemental_messages = self._repair_messages(
-                        "The previous response was not valid JSON.",
+                        feedback,
                         invalid_output=exc.response_text,
                     )
                     continue
