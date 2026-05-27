@@ -53,6 +53,7 @@ from foundation.models import (
     PolicyDecisionType,
     PresentationNoticeLevel,
     ProviderMessage,
+    QuestionAction,
     RenderMode,
     ResumeTarget,
     SessionKind,
@@ -529,6 +530,35 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
             renderer.resume()
 
 
+def _prompt_for_question(question: QuestionAction) -> str | None:
+    lines = [f"[bold]{escape(question.prompt)}[/bold]"]
+    if question.options:
+        lines.append("")
+        for index, option in enumerate(question.options, start=1):
+            lines.append(f"  [cyan]{index}[/cyan]. {escape(option)}")
+    renderer = get_active_renderer()
+    if renderer is not None:
+        renderer.pause()
+    try:
+        console.print(Panel.fit("\n".join(lines), title="Question"))
+        try:
+            raw = typer.prompt("Your answer")
+        except (EOFError, click.exceptions.Abort):
+            return None
+        answer = raw.strip()
+        if not answer:
+            return None
+        # Allow selecting an option by its number.
+        if question.options and answer.isdigit():
+            choice = int(answer)
+            if 1 <= choice <= len(question.options):
+                return question.options[choice - 1]
+        return answer
+    finally:
+        if renderer is not None:
+            renderer.resume()
+
+
 def _build_orchestrator(
     settings: AppSettings,
     *,
@@ -549,6 +579,7 @@ def _build_orchestrator(
         ),
         history_store=_build_history_store(settings),
         shell_output_callback=shell_output_callback,
+        question_callback=_prompt_for_question,
         capability_registry=_build_capability_registry(settings, tool_service=tool_service),
     )
 
@@ -2151,6 +2182,29 @@ def _approval_required_notice(
     )
 
 
+def _awaiting_input_notice(
+    result: OrchestrationResult,
+) -> ChatNotice | None:
+    """Surface an unanswered question (non-interactive / dismissed) as a notice."""
+    if result.stop_reason is not LoopStopReason.AWAITING_USER_INPUT:
+        return None
+    prompts = [
+        str(item.artifact.get("question", "")).strip()
+        for item in result.execution_results
+        if item.artifact_type is ExecutionArtifactType.QUESTION
+        and item.artifact is not None
+        and item.status is ExecutionStatus.AWAITING_INPUT
+    ]
+    question_text = next((prompt for prompt in prompts if prompt), "a question")
+    return ChatNotice(
+        level=PresentationNoticeLevel.WARNING,
+        text=(
+            f'Waiting on your input: "{question_text}" '
+            "Re-run with your answer in the request to continue."
+        ),
+    )
+
+
 def _build_chat_turn_presentation(
     result: OrchestrationResult,
     *,
@@ -2191,6 +2245,7 @@ def _build_chat_turn_presentation(
         _iteration_commands_notice(result),
         _verification_outcome_notice(result),
         _approval_required_notice(result),
+        _awaiting_input_notice(result),
     ):
         if iteration_notice is not None and iteration_notice.text not in seen_messages:
             notices.append(iteration_notice)

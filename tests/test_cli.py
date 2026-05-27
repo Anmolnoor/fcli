@@ -2005,6 +2005,60 @@ def test_iteration_changed_files_notice_empty() -> None:
     assert _iteration_changed_files_notice(result) is None
 
 
+def test_awaiting_input_notice_surfaces_question() -> None:
+    from foundation.cli import _awaiting_input_notice
+    from foundation.models import LoopStopReason
+
+    result = _iteration_result_for_notices(stop_reason=LoopStopReason.AWAITING_USER_INPUT)
+    result.execution_results.append(
+        ExecutionResult(
+            action_id="ask",
+            status=ExecutionStatus.AWAITING_INPUT,
+            summary="Which format?",
+            artifact_type=ExecutionArtifactType.QUESTION,
+            artifact={"question": "Which format?", "answer": None},
+        )
+    )
+    notice = _awaiting_input_notice(result)
+    assert notice is not None
+    assert "Which format?" in notice.text
+
+
+def test_awaiting_input_notice_none_without_stop_reason() -> None:
+    from foundation.cli import _awaiting_input_notice
+
+    result = _iteration_result_for_notices()
+    assert _awaiting_input_notice(result) is None
+
+
+def test_prompt_for_question_selects_option_by_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import typer as _typer
+
+    from foundation.cli import _prompt_for_question
+    from foundation.models import QuestionAction
+
+    monkeypatch.setattr(_typer, "prompt", lambda *_a, **_k: "2")
+    answer = _prompt_for_question(
+        QuestionAction(prompt="Which format?", options=["json", "yaml"])
+    )
+    assert answer == "yaml"
+
+
+def test_prompt_for_question_accepts_free_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import typer as _typer
+
+    from foundation.cli import _prompt_for_question
+    from foundation.models import QuestionAction
+
+    monkeypatch.setattr(_typer, "prompt", lambda *_a, **_k: "  use msgpack  ")
+    answer = _prompt_for_question(QuestionAction(prompt="Which format?"))
+    assert answer == "use msgpack"
+
+
 def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:
     from foundation.cli import _iteration_commands_notice
 

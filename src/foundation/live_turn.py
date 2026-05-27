@@ -33,6 +33,8 @@ from foundation.observability import (
     EVENT_ITERATION_STARTED,
     EVENT_PLAN_FINISHED,
     EVENT_PLAN_STARTED,
+    EVENT_QUESTION_ANSWERED,
+    EVENT_QUESTION_ASKED,
     EVENT_SESSION_END,
     EVENT_SESSION_START,
     EVENT_TOOL_CALL_FAILED,
@@ -74,6 +76,8 @@ class TurnLiveState:
     failure_count: int = 0
     awaiting_approval: bool = False
     approval_summary: str | None = None
+    awaiting_input: bool = False
+    question_summary: str | None = None
     finished: bool = False
     final_status: str | None = None
 
@@ -126,6 +130,14 @@ class TurnLiveState:
             self.awaiting_approval = False
             self.approval_summary = None
             return
+        if event_name == EVENT_QUESTION_ASKED:
+            self.awaiting_input = True
+            self.question_summary = str(payload.get("prompt") or "a question")
+            return
+        if event_name == EVENT_QUESTION_ANSWERED:
+            self.awaiting_input = False
+            self.question_summary = None
+            return
         if event_name == EVENT_ITERATION_COMPLETED:
             return
         if event_name == EVENT_SESSION_END:
@@ -177,6 +189,11 @@ def render_status_line(state: TurnLiveState, *, elapsed_seconds: float) -> Rende
         text = Text("⏸ awaiting approval", style="yellow")
         if state.approval_summary:
             text.append(f" · {state.approval_summary}", style="yellow")
+        return text
+    if state.awaiting_input:
+        text = Text("⏸ awaiting your answer", style="yellow")
+        if state.question_summary:
+            text.append(f" · {state.question_summary}", style="yellow")
         return text
     if state.current_action_id is not None:
         action_elapsed = (

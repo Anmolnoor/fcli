@@ -19,6 +19,7 @@ from foundation.models import (
     ProviderResponse,
     ProviderResponseFormat,
     ProviderResponseMetadata,
+    QuestionAction,
     SessionStatus,
     TraceQuery,
     UserRequest,
@@ -117,6 +118,7 @@ def _orchestrator(
     approval_service: ApprovalService | None = None,
     history_store: HistoryStore | None = None,
     shell_output_callback: Any | None = None,
+    question_callback: Any | None = None,
 ) -> tuple[RequestOrchestrator, CountingShellRuntime, Path]:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -137,6 +139,7 @@ def _orchestrator(
         approval_service=approval_service,
         history_store=history_store,
         shell_output_callback=shell_output_callback,
+        question_callback=question_callback,
     )
     return orchestrator, runtime, workspace_root
 
@@ -419,6 +422,82 @@ def test_orchestrator_deferred_write_failure_degrades_to_failed_action(
     # Body generation failed -> the write degrades to a failed action, no file written.
     assert not (workspace_root / "report.md").exists()
     assert any(r.status is ExecutionStatus.FAILED for r in result.execution_results)
+
+
+def test_orchestrator_question_answer_flows_to_next_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "I need to clarify the format first.",
+                    "actions": [
+                        {
+                            "id": "ask_format",
+                            "kind": "question",
+                            "summary": "Ask which output format",
+                            "question": {
+                                "prompt": "Which format?",
+                                "options": ["json", "yaml"],
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    asked: list[str] = []
+
+    def callback(question: QuestionAction) -> str:
+        asked.append(question.prompt)
+        return "json"
+
+    orchestrator, _, _ = _orchestrator(
+        tmp_path, monkeypatch, provider, question_callback=callback
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="export the data"))
+
+    assert asked == ["Which format?"]
+    assert any(r.status is ExecutionStatus.EXECUTED for r in result.execution_results)
+    # Iteration 2's plan request carried the answer back to the planner.
+    second_plan_text = "\n".join(m.content for m in provider.calls[1].messages)
+    assert "User answered" in second_plan_text
+    assert "json" in second_plan_text
+
+
+def test_orchestrator_question_without_callback_stops_awaiting_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "I need to clarify the format first.",
+                    "actions": [
+                        {
+                            "id": "ask_format",
+                            "kind": "question",
+                            "summary": "Ask which output format",
+                            "question": {"prompt": "Which format?"},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    # No question_callback => non-interactive.
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="export the data"))
+
+    assert result.stop_reason is LoopStopReason.AWAITING_USER_INPUT
+    assert any(
+        r.status is ExecutionStatus.AWAITING_INPUT for r in result.execution_results
+    )
 
 
 def test_orchestrator_retries_shell_cat_plan_without_executing_it(

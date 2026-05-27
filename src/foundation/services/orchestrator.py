@@ -8,6 +8,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from foundation.models import (
     ProviderMessageRole,
     ProviderPrompt,
     ProviderResponseFormat,
+    QuestionAction,
     SessionKind,
     SessionStatus,
     UserRequest,
@@ -175,6 +177,9 @@ _STOP_REASON_SUFFIXES = {
     ),
     LoopStopReason.PENDING_APPROVAL: (
         "\n\n[Loop stopped: an action requires approval before continuing.]"
+    ),
+    LoopStopReason.AWAITING_USER_INPUT: (
+        "\n\n[Loop stopped: waiting for your answer to a question before continuing.]"
     ),
     LoopStopReason.FATAL_EXECUTION_FAILURE: (
         "\n\n[Loop stopped: a fatal execution failure occurred.]"
@@ -431,6 +436,7 @@ class RequestOrchestrator:
         capability_store_root: Path | None = None,
         max_plan_attempts: int = 2,
         event_sink: EventSink | None = None,
+        question_callback: Callable[[QuestionAction], str | None] | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._approval_mode = approval_mode
@@ -484,6 +490,7 @@ class RequestOrchestrator:
                 state_dir=state_dir,
             ),
             git_service=self._git_service,
+            question_callback=question_callback,
         )
 
     def set_event_sink(self, event_sink: EventSink | None) -> None:
@@ -923,10 +930,15 @@ class RequestOrchestrator:
             has_pending = any(
                 r.status is ExecutionStatus.PENDING_APPROVAL for r in execution_results
             )
+            has_awaiting_input = any(
+                r.status is ExecutionStatus.AWAITING_INPUT for r in execution_results
+            )
             has_fatal = any(self._is_fatal_result(r) for r in execution_results)
 
             if has_pending:
                 stop_reason = LoopStopReason.PENDING_APPROVAL
+            elif has_awaiting_input:
+                stop_reason = LoopStopReason.AWAITING_USER_INPUT
             elif has_fatal:
                 stop_reason = LoopStopReason.FATAL_EXECUTION_FAILURE
             elif total_actions_executed >= _MAX_TOTAL_ACTIONS:
@@ -1212,6 +1224,12 @@ class RequestOrchestrator:
                 stderr_preview = _truncate_preview(str(result.artifact.get("stderr", "")))
                 if result.artifact.get("path"):
                     action_changed.append(str(result.artifact["path"]))
+                # Surface a user's answer to a question action so the next
+                # planning iteration can act on it.
+                if action.kind is ActionKind.QUESTION and result.artifact.get("answer") is not None:
+                    stdout_preview = _truncate_preview(
+                        f'User answered: "{result.artifact["answer"]}"'
+                    )
 
             if result.status is ExecutionStatus.PENDING_APPROVAL:
                 approval_outcomes.append(f"{action.id}: pending approval")
@@ -1516,6 +1534,10 @@ class RequestOrchestrator:
             return SessionStatus.PENDING_APPROVAL
         if stop_reason is LoopStopReason.PENDING_APPROVAL:
             return SessionStatus.PENDING_APPROVAL
+        if stop_reason is LoopStopReason.AWAITING_USER_INPUT:
+            # Stopped to ask the user something we couldn't prompt for inline
+            # (non-interactive run, or the user dismissed the prompt).
+            return SessionStatus.COMPLETED_INCONCLUSIVE
         if stop_reason is LoopStopReason.FATAL_EXECUTION_FAILURE:
             return SessionStatus.FAILED
         if stop_reason is LoopStopReason.ZERO_ACTION_PLAN:

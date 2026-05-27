@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from foundation.models import (
     PolicyDecision,
     PolicyDecisionType,
     PolicyEvaluationRecord,
+    QuestionAction,
     ShellAction,
     ToolCall,
 )
@@ -51,6 +53,8 @@ from foundation.models.git import (
 from foundation.observability import (
     EVENT_APPROVAL_REQUESTED,
     EVENT_APPROVAL_RESOLVED,
+    EVENT_QUESTION_ANSWERED,
+    EVENT_QUESTION_ASKED,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
@@ -120,6 +124,7 @@ class ActionExecutor:
         shell_output_callback: OutputCallback | None = None,
         file_service: FileService | None = None,
         git_service: GitService | None = None,
+        question_callback: Callable[[QuestionAction], str | None] | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._shell_runtime = shell_runtime
@@ -131,6 +136,7 @@ class ActionExecutor:
         self._shell_output_callback = shell_output_callback
         self._file_service = file_service
         self._git_service = git_service
+        self._question_callback = question_callback
 
     def execute(
         self,
@@ -162,6 +168,66 @@ class ActionExecutor:
             started_at=started_at,
             completed_at=completed_at,
             duration_seconds=max(time.monotonic() - started_monotonic, 0.0),
+        )
+
+    def _handle_question(
+        self,
+        action_id: str,
+        question: QuestionAction,
+        *,
+        request_id: str,
+        session_id: str | None,
+    ) -> ExecutionResult:
+        self._observer.emit(
+            EVENT_QUESTION_ASKED,
+            payload={
+                "request_id": request_id,
+                "action_id": action_id,
+                "prompt": question.prompt,
+                "options": question.options,
+            },
+            session_id=session_id,
+            logger_name="foundation.services.executor",
+        )
+        artifact: dict[str, object] = {
+            "question": question.prompt,
+            "options": question.options,
+        }
+        # No interactive prompt available (non-TTY / one-shot run): stop the
+        # loop and surface the question rather than guessing an answer.
+        if self._question_callback is None:
+            return ExecutionResult(
+                action_id=action_id,
+                status=ExecutionStatus.AWAITING_INPUT,
+                summary=question.prompt,
+                artifact_type=ExecutionArtifactType.QUESTION,
+                artifact={**artifact, "answer": None},
+            )
+        answer = self._question_callback(question)
+        self._observer.emit(
+            EVENT_QUESTION_ANSWERED,
+            payload={
+                "request_id": request_id,
+                "action_id": action_id,
+                "answered": answer is not None,
+            },
+            session_id=session_id,
+            logger_name="foundation.services.executor",
+        )
+        if answer is None:
+            return ExecutionResult(
+                action_id=action_id,
+                status=ExecutionStatus.AWAITING_INPUT,
+                summary=f"Unanswered question: {question.prompt}",
+                artifact_type=ExecutionArtifactType.QUESTION,
+                artifact={**artifact, "answer": None},
+            )
+        return ExecutionResult(
+            action_id=action_id,
+            status=ExecutionStatus.EXECUTED,
+            summary=f"Asked the user: {question.prompt}",
+            artifact_type=ExecutionArtifactType.QUESTION,
+            artifact={**artifact, "answer": answer},
         )
 
     def _handle_action(
@@ -282,6 +348,19 @@ class ActionExecutor:
                     summary=action.explanation or action.summary,
                     artifact_type=ExecutionArtifactType.EXPLANATION,
                     artifact={"message": action.explanation or action.summary},
+                ),
+                approval_request,
+                approval_resolution,
+            )
+
+        if action.kind is ActionKind.QUESTION:
+            assert action.question is not None
+            return (
+                self._handle_question(
+                    action.id,
+                    action.question,
+                    request_id=request_id,
+                    session_id=session_id,
                 ),
                 approval_request,
                 approval_resolution,

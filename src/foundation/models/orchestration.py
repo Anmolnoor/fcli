@@ -47,6 +47,7 @@ class ActionKind(StrEnum):
     EXPLANATION = "explanation"
     SHELL = "shell"
     TOOL_CALL = "tool_call"
+    QUESTION = "question"
 
 
 class PolicyDecisionType(StrEnum):
@@ -63,6 +64,7 @@ class ExecutionStatus(StrEnum):
     NOT_EXECUTED = "not_executed"
     EXECUTED = "executed"
     PENDING_APPROVAL = "pending_approval"
+    AWAITING_INPUT = "awaiting_input"
     BLOCKED = "blocked"
     FAILED = "failed"
 
@@ -89,6 +91,7 @@ class ExecutionArtifactType(StrEnum):
     GIT_STAGE = "git_stage"
     GIT_UNSTAGE = "git_unstage"
     GIT_COMMIT = "git_commit"
+    QUESTION = "question"
 
 
 class LoopStopReason(StrEnum):
@@ -96,6 +99,7 @@ class LoopStopReason(StrEnum):
 
     ZERO_ACTION_PLAN = "zero_action_plan"
     PENDING_APPROVAL = "pending_approval"
+    AWAITING_USER_INPUT = "awaiting_user_input"
     FATAL_EXECUTION_FAILURE = "fatal_execution_failure"
     MAX_ITERATIONS = "max_iterations"
     MAX_ACTIONS = "max_actions"
@@ -219,6 +223,24 @@ class ShellAction(StrictModel):
         return [str(item) for item in value]
 
 
+class QuestionAction(StrictModel):
+    """A clarifying question the model asks the user mid-turn."""
+
+    prompt: str = Field(min_length=1, max_length=1000)
+    options: list[str] | None = None
+    allow_free_text: bool = True
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _normalize_options(cls, value: object) -> list[str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list | tuple):
+            raise TypeError("options must be a list or tuple")
+        normalized = [str(item) for item in value]
+        return normalized or None
+
+
 class PlannedAction(StrictModel):
     """One validated action returned by the planning model."""
 
@@ -230,6 +252,7 @@ class PlannedAction(StrictModel):
     explanation: str | None = None
     shell: ShellAction | None = None
     tool_call: ToolCall | None = None
+    question: QuestionAction | None = None
 
     @model_validator(mode="after")
     def _validate_payload_shape(self) -> PlannedAction:
@@ -248,6 +271,11 @@ class PlannedAction(StrictModel):
                 raise ValueError("Tool-call actions require the tool_call field")
             if self.explanation is not None or self.shell is not None:
                 raise ValueError("Tool-call actions cannot include explanation or shell payloads")
+        elif self.kind is ActionKind.QUESTION:
+            if self.question is None:
+                raise ValueError("Question actions require the question field")
+            if self.shell is not None or self.tool_call is not None:
+                raise ValueError("Question actions cannot include shell or tool payloads")
 
         if self.requires_approval and not self.approval_reason:
             raise ValueError("Approval-required actions must include approval_reason")

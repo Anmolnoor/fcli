@@ -131,7 +131,7 @@ class CapabilityPolicyEngine:
         request_cwd: Path,
         approval_mode: ApprovalMode,
     ) -> PolicyEvaluationRecord | None:
-        if action.kind is ActionKind.EXPLANATION:
+        if action.kind in (ActionKind.EXPLANATION, ActionKind.QUESTION):
             return None
 
         requested = self._requested_invocation(action, request_cwd=request_cwd)

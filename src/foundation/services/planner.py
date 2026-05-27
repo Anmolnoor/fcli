@@ -220,11 +220,16 @@ class PlannerService:
             "actions": [
                 {
                     "id": "unique action identifier",
-                    "kind": "explanation | shell | tool_call",
+                    "kind": "explanation | shell | tool_call | question",
                     "summary": "short description",
                     "requires_approval": "boolean",
                     "approval_reason": "string | null",
                     "explanation": "required for explanation actions",
+                    "question": {
+                        "prompt": "required for question actions",
+                        "options": ["optional", "choices"],
+                        "allow_free_text": "boolean",
+                    },
                     "shell": {
                         "command": "string",
                         "args": ["string"],
@@ -302,6 +307,9 @@ class PlannerService:
             "completing with zero actions, unless verification is unavailable and you explain why. "
             "If an action is risky, mutating, networked, or uncertain, mark requires_approval=true "
             "and explain why in approval_reason. "
+            "If the request is genuinely ambiguous or you are missing information only the "
+            "user can provide, emit a single `question` action (kind=question) with a clear "
+            "prompt and optional options, rather than guessing. Use this sparingly. "
             "If the user can be answered directly, return zero actions with your final answer. "
             "When returning zero actions to finish, your assistant_message "
             "becomes the user-facing answer. "
