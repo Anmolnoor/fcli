@@ -276,6 +276,47 @@ def _unwrap_generated_file_body(text: str) -> str:
     return text
 
 
+# Read-only typed results whose payload should be surfaced to the planner so it
+# can actually use what the tool returned (not just see that it ran). Writes and
+# mutations are excluded — echoing their content back only bloats the prompt.
+_RESULT_PREVIEW_TYPES = frozenset(
+    {
+        ExecutionArtifactType.FILE_READ,
+        ExecutionArtifactType.FILE_READ_CHUNK,
+        ExecutionArtifactType.SEARCH,
+        ExecutionArtifactType.FILES,
+        ExecutionArtifactType.GIT,
+        ExecutionArtifactType.GIT_STATUS,
+        ExecutionArtifactType.GIT_DIFF,
+        ExecutionArtifactType.GIT_SHOW,
+        ExecutionArtifactType.GIT_LOG,
+        ExecutionArtifactType.MAN,
+        ExecutionArtifactType.TLDR,
+    }
+)
+
+
+def _tool_result_preview(
+    artifact: dict[str, object] | None,
+    artifact_type: ExecutionArtifactType | None,
+) -> str:
+    """Render a read-only tool result's payload for the planner observation.
+
+    Typed capabilities (file reads, search, discovery, git inspect) don't use
+    the shell ``stdout`` field, so without this their output never reaches the
+    planner and it can't act on what it just fetched.
+    """
+    if not artifact or artifact_type not in _RESULT_PREVIEW_TYPES:
+        return ""
+    content = artifact.get("content")
+    if isinstance(content, str) and content:
+        return content
+    try:
+        return json.dumps(artifact, default=str)
+    except (TypeError, ValueError):
+        return ""
+
+
 def _action_target_path(action: PlannedAction) -> str | None:
     if action.kind is not ActionKind.TOOL_CALL or action.tool_call is None:
         return None
@@ -1280,6 +1321,13 @@ class RequestOrchestrator:
                     stdout_preview = _truncate_preview(
                         f'User answered: "{result.artifact["answer"]}"'
                     )
+                # Surface typed read-only results (file reads, search, git
+                # inspect) so the planner sees the data it fetched instead of an
+                # empty outcome — without this it re-runs the same read forever.
+                if not stdout_preview:
+                    preview = _tool_result_preview(result.artifact, result.artifact_type)
+                    if preview:
+                        stdout_preview = _truncate_preview(preview)
 
             if result.status is ExecutionStatus.PENDING_APPROVAL:
                 approval_outcomes.append(f"{action.id}: pending approval")

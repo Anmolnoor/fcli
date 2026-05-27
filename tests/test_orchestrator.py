@@ -3007,3 +3007,59 @@ def test_orchestrator_not_found_surfaces_siblings_for_self_correction(
         and r.artifact_type is ExecutionArtifactType.FILE_READ
         for r in result.execution_results
     )
+
+
+def test_tool_result_preview_surfaces_reads_not_writes() -> None:
+    from foundation.services.orchestrator import _tool_result_preview
+
+    # File-read content is surfaced verbatim.
+    assert (
+        _tool_result_preview(
+            {"path": "a.md", "content": "# Hi\nbody"}, ExecutionArtifactType.FILE_READ
+        )
+        == "# Hi\nbody"
+    )
+    # Structured read-only results (search) are surfaced as compact JSON.
+    search_preview = _tool_result_preview(
+        {"matches": ["a.py:1: needle"]}, ExecutionArtifactType.SEARCH
+    )
+    assert "a.py:1: needle" in search_preview
+    # Writes are NOT echoed back (would only re-bloat the prompt).
+    assert (
+        _tool_result_preview(
+            {"path": "a.md", "content": "huge body"}, ExecutionArtifactType.FILE_WRITE
+        )
+        == ""
+    )
+    assert _tool_result_preview(None, ExecutionArtifactType.FILE_READ) == ""
+
+
+def test_orchestrator_surfaces_file_read_content_to_next_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Reading the note.",
+                    "actions": [_read_action("read_note", "note.txt")],
+                }
+            )
+            # iteration 2: StubProvider returns a zero-action completion by default.
+        ]
+    )
+    orchestrator, _, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+    (workspace_root / "note.txt").write_text("SECRET-CONTENT-12345\n", encoding="utf-8")
+
+    result = orchestrator.orchestrate(UserRequest(message="read note.txt"))
+
+    # The read succeeded AND its content reached the planner's next iteration —
+    # previously the observation was blank and the model re-read forever.
+    assert any(
+        r.status is ExecutionStatus.EXECUTED
+        and r.artifact_type is ExecutionArtifactType.FILE_READ
+        for r in result.execution_results
+    )
+    second_plan_text = "\n".join(m.content for m in provider.calls[1].messages)
+    assert "SECRET-CONTENT-12345" in second_plan_text
