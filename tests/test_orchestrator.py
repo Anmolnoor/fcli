@@ -2969,3 +2969,41 @@ def test_orchestrator_unwraps_plan_wrapped_generated_body(
 
     # The plan-wrapped generation is unwrapped to the clean file body.
     assert (workspace_root / "report.md").read_text(encoding="utf-8") == clean
+
+
+def test_orchestrator_not_found_surfaces_siblings_for_self_correction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Reading the report.",
+                    "actions": [_read_action("read_wrong", "res/wrong-name.md")],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Retrying with the real filename.",
+                    "actions": [_read_action("read_right", "res/right-name.md")],
+                }
+            ),
+        ]
+    )
+    orchestrator, _, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+    (workspace_root / "res").mkdir()
+    (workspace_root / "res" / "right-name.md").write_text("# Found me\n", encoding="utf-8")
+
+    result = orchestrator.orchestrate(UserRequest(message="read the report in res"))
+
+    # The not-found error from iteration 1 carried the real filename into
+    # iteration 2's planning context, enabling self-correction.
+    second_plan_text = "\n".join(m.content for m in provider.calls[1].messages)
+    assert "right-name.md" in second_plan_text
+    # The corrected read then succeeded.
+    assert any(
+        r.status is ExecutionStatus.EXECUTED
+        and r.artifact_type is ExecutionArtifactType.FILE_READ
+        for r in result.execution_results
+    )

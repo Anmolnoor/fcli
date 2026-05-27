@@ -731,3 +731,17 @@ def test_read_grant_allows_out_of_scope_read_only(tmp_path: Path) -> None:
     with pytest.raises(FileServiceError) as exc_write:
         service.write(FileWriteRequest(path=str(outside / "new.md"), content="x"))
     assert exc_write.value.error.code == FileErrorCode.PATH_OUTSIDE_WORKSPACE
+
+
+def test_read_not_found_lists_sibling_files(tmp_path: Path) -> None:
+    service, workspace = _make_service(tmp_path)
+    (workspace / "res").mkdir()
+    (workspace / "res" / "anmolnoor-github-report.md").write_text("# Report\n", encoding="utf-8")
+
+    with pytest.raises(FileServiceError) as exc:
+        service.read(FileReadRequest(path="res/anmolnoor-report.md"))
+
+    assert exc.value.error.code == FileErrorCode.FILE_NOT_FOUND
+    # The error names the real sibling so the model can self-correct.
+    assert "anmolnoor-github-report.md" in exc.value.error.message
+    assert exc.value.error.suggestion is not None

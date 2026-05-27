@@ -47,6 +47,38 @@ def _raise(
     )
 
 
+def _sibling_hint(resolved: Path) -> str:
+    """List the entries in a missing file's parent dir, as a 'did you mean' hint."""
+    parent = resolved.parent
+    try:
+        if not parent.is_dir():
+            return ""
+        names = sorted(p.name + ("/" if p.is_dir() else "") for p in parent.iterdir())
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    shown = names[:12]
+    more = f" (+{len(names) - 12} more)" if len(names) > 12 else ""
+    return f" Directory '{parent.name}/' contains: {', '.join(shown)}{more}."
+
+
+def _raise_not_found(raw_path: str, resolved: Path) -> None:
+    """Raise FILE_NOT_FOUND with a sibling listing so the model can self-correct."""
+    hint = _sibling_hint(resolved)
+    _raise(
+        FileErrorCode.FILE_NOT_FOUND,
+        f"File does not exist: {raw_path}.{hint}",
+        path=raw_path,
+        suggestion=(
+            "Discover the correct path with foundation.files, or read one of the "
+            "files listed in the message."
+            if hint
+            else None
+        ),
+    )
+
+
 def _sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -344,7 +376,7 @@ class FileService:
         """Read one workspace text file up to 256 KB."""
         resolved = self._resolve_read_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
         file_size = resolved.stat().st_size
         if file_size > _MAX_READ_BYTES:
             _raise(
@@ -367,7 +399,7 @@ class FileService:
         """Read a line-based chunk from a workspace text file."""
         resolved = self._resolve_read_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
 
         # Peek at the first 8 KB for binary detection
         raw_head = resolved.read_bytes()[:8192]
@@ -452,7 +484,7 @@ class FileService:
         """Rewrite an existing file with conflict detection."""
         resolved = self._resolve_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
         old_content, _ = self._read_raw(resolved)
         actual_sha256 = _sha256(old_content)
         if actual_sha256 != request.expected_sha256:
@@ -475,7 +507,7 @@ class FileService:
         """Apply a unified diff atomically to a workspace text file."""
         resolved = self._resolve_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
         old_content, _ = self._read_raw(resolved)
         new_content = _parse_and_apply_diff(
             old_content,
