@@ -24,6 +24,7 @@ from foundation.models.file import (
     FileEditRequest,
     FileReadChunkRequest,
     FileReadRequest,
+    FileWriteBriefRequest,
     FileWriteRequest,
 )
 from foundation.models.git import (
@@ -235,6 +236,11 @@ class PlannerService:
                         "capability_id": "foundation.search",
                         "version": "1.0.0 | null",
                         "arguments": "tool-specific JSON object",
+                        "_file_write_note": (
+                            "for foundation.file.write use {path, content} for tiny "
+                            "files, or {path, content_brief} (NOT content) for "
+                            "anything longer — the body is generated separately"
+                        ),
                     },
                 }
             ],
@@ -264,6 +270,12 @@ class PlannerService:
             "Prefer typed file capabilities (foundation.file.read, "
             "foundation.file.write, foundation.file.edit, foundation.file.apply_diff) "
             "for reading and editing files. "
+            "For foundation.file.write, do NOT inline a large file body in the "
+            "`content` argument — long content bloats this JSON plan and can be "
+            "truncated. For anything beyond a few short lines, omit `content` and "
+            "instead provide `content_brief`: a concise description of what the file "
+            "should contain. The body is generated separately. Use literal `content` "
+            "only for very short files. "
             "Prefer typed git capabilities (foundation.git.*) for repository "
             "inspection and staging. "
             "The git.commit capability requires approval and never stages implicitly. "
@@ -457,10 +469,22 @@ class PlannerService:
 
             ShellAction.model_validate(arguments)
             return
+        if endpoint == "builtin.file.write":
+            has_content = bool(arguments.get("content"))
+            has_brief = bool(arguments.get("content_brief"))
+            if has_content and has_brief:
+                raise PlanningError(
+                    "foundation.file.write must provide either content or "
+                    "content_brief, not both."
+                )
+            if has_brief:
+                FileWriteBriefRequest.model_validate(arguments)
+            else:
+                FileWriteRequest.model_validate(arguments)
+            return
         _FILE_VALIDATORS: dict[str, type[BaseModel]] = {
             "builtin.file.read": FileReadRequest,
             "builtin.file.read_chunk": FileReadChunkRequest,
-            "builtin.file.write": FileWriteRequest,
             "builtin.file.edit": FileEditRequest,
             "builtin.file.apply_diff": FileApplyDiffRequest,
         }

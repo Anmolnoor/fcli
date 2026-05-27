@@ -33,6 +33,8 @@ from foundation.models import (
     PolicyEvaluationRecord,
     ProviderMessage,
     ProviderMessageRole,
+    ProviderPrompt,
+    ProviderResponseFormat,
     SessionKind,
     SessionStatus,
     UserRequest,
@@ -624,6 +626,80 @@ class RequestOrchestrator:
     # Bounded replan loop
     # ------------------------------------------------------------------
 
+    def _materialize_deferred_writes(
+        self,
+        actions: list[PlannedAction],
+        *,
+        request: UserRequest,
+        observation_messages: list[ProviderMessage],
+        request_id: str,
+        session_id: str | None,
+    ) -> None:
+        """Generate file bodies for writes that deferred content via content_brief.
+
+        On success the brief is replaced with literal ``content`` for the
+        executor. On a provider failure the brief is left in place so the
+        write fails as a normal action (the executor rejects the unknown
+        ``content_brief`` field) rather than killing the turn.
+        """
+        for action in actions:
+            if action.kind is not ActionKind.TOOL_CALL or action.tool_call is None:
+                continue
+            tool_call = action.tool_call
+            if tool_call.capability_id != "foundation.file.write":
+                continue
+            brief = tool_call.arguments.get("content_brief")
+            if not brief or tool_call.arguments.get("content"):
+                continue
+            path = str(tool_call.arguments.get("path", "<file>"))
+            try:
+                body = self._generate_file_body(
+                    path=path,
+                    brief=str(brief),
+                    request=request,
+                    observation_messages=observation_messages,
+                )
+            except ProviderError as exc:
+                logger.warning(
+                    "deferred_write_generation_failed action=%s path=%s error=%s",
+                    action.id,
+                    path,
+                    exc,
+                )
+                continue
+            tool_call.arguments.pop("content_brief", None)
+            tool_call.arguments["content"] = body
+
+    def _generate_file_body(
+        self,
+        *,
+        path: str,
+        brief: str,
+        request: UserRequest,
+        observation_messages: list[ProviderMessage],
+    ) -> str:
+        messages: list[ProviderMessage] = [
+            ProviderMessage(
+                role=ProviderMessageRole.DEVELOPER,
+                content=(
+                    f"You are generating the complete contents of the file `{path}`. "
+                    "Output ONLY the raw file body — no markdown code fences, no "
+                    "commentary, no surrounding quotes."
+                ),
+            )
+        ]
+        messages.extend(observation_messages)
+        messages.append(
+            ProviderMessage(
+                role=ProviderMessageRole.USER,
+                content=f"Original request: {request.message}\n\nFile to write: {brief}",
+            )
+        )
+        response = self._provider.complete(
+            ProviderPrompt(messages=messages, response_format=ProviderResponseFormat.TEXT)
+        )
+        return response.content
+
     def _run_replan_loop(
         self,
         *,
@@ -772,6 +848,18 @@ class RequestOrchestrator:
             # 4. Enforce action budget
             budget = _MAX_TOTAL_ACTIONS - total_actions_executed
             actions_to_execute = plan.actions[:budget]
+
+            # 4b. Materialize deferred file bodies (content_brief -> content) via a
+            # separate text-generation call, keeping large content out of the
+            # schema-constrained plan JSON. A generation failure leaves the brief
+            # in place so the write degrades to a normal failed action.
+            self._materialize_deferred_writes(
+                actions_to_execute,
+                request=request,
+                observation_messages=observation_messages,
+                request_id=request_id,
+                session_id=session_id,
+            )
 
             # 5. Policy evaluate + execute
             execution_results, decisions, evaluations, last_step_id = (
