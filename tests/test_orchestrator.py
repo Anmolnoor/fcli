@@ -329,6 +329,9 @@ def test_orchestrator_recovers_from_truncated_plan_with_content_brief_hint(
     repair_text = "\n".join(m.content for m in provider.calls[1].messages)
     assert "truncated" in repair_text.lower()
     assert "content_brief" in repair_text
+    # First attempt is deterministic; the repair retry nudges temperature off 0.
+    assert provider.calls[0].temperature is None
+    assert provider.calls[1].temperature == 0.4
     assert result.summary is not None
 
 
@@ -2884,3 +2887,85 @@ def test_commit_intent_zero_action_plan_is_repaired_to_commit_action(
         and action.requires_approval
         for action in result.iterations[-1].plan.actions
     )
+
+
+def test_unwrap_generated_file_body_extracts_plan_wrapped_content() -> None:
+    from foundation.services.orchestrator import _unwrap_generated_file_body
+
+    wrapped = json.dumps(
+        {
+            "assistant_message": "writing the file",
+            "actions": [
+                {
+                    "id": "w",
+                    "kind": "tool_call",
+                    "tool_call": {
+                        "capability_id": "foundation.file.write",
+                        "arguments": {"path": "r.md", "content": "# Real Title\n\nbody text"},
+                    },
+                }
+            ],
+        }
+    )
+    assert _unwrap_generated_file_body(wrapped) == "# Real Title\n\nbody text"
+
+
+def test_unwrap_generated_file_body_passes_through_plain_and_real_json() -> None:
+    from foundation.services.orchestrator import _unwrap_generated_file_body
+
+    assert _unwrap_generated_file_body("# Just markdown\n") == "# Just markdown\n"
+    # A legitimate JSON file (no actions array) must be left untouched.
+    config = '{"key": "value", "nested": {"a": 1}}'
+    assert _unwrap_generated_file_body(config) == config
+
+
+def test_orchestrator_unwraps_plan_wrapped_generated_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clean = "# Clean Report\n\nThe actual body of the report.\n"
+    wrapped_body = json.dumps(
+        {
+            "assistant_message": "writing",
+            "actions": [
+                {
+                    "id": "w",
+                    "kind": "tool_call",
+                    "tool_call": {
+                        "capability_id": "foundation.file.write",
+                        "arguments": {"path": "report.md", "content": clean},
+                    },
+                }
+            ],
+        }
+    )
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing the report.",
+                    "actions": [
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write the report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "content_brief": "a report about the project",
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _text_response(wrapped_body),
+        ]
+    )
+    orchestrator, _, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    orchestrator.orchestrate(UserRequest(message="write a report"))
+
+    # The plan-wrapped generation is unwrapped to the clean file body.
+    assert (workspace_root / "report.md").read_text(encoding="utf-8") == clean

@@ -133,6 +133,7 @@ class ProviderPrompt(StrictModel):
     response_format: ProviderResponseFormat = ProviderResponseFormat.TEXT
     schema_name: str | None = None
     output_schema: dict[str, Any] | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
     @model_validator(mode="after")
     def _validate_schema_requirements(self) -> ProviderPrompt:

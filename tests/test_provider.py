@@ -535,3 +535,25 @@ def test_openai_adapter_raises_truncated_on_incomplete_response() -> None:
         adapter.complete(_structured_prompt())
 
     assert exc_info.value.code is ProviderErrorCode.TRUNCATED
+
+
+def test_ollama_adapter_honors_prompt_temperature() -> None:
+    transport = FakeTransport(
+        [{"message": {"role": "assistant", "content": '{"assistant_message":"ok","actions":[]}'}}]
+    )
+    adapter = OllamaChatAdapter(
+        model="glm-5.1:cloud",
+        base_url="http://localhost:11434/api",
+        transport=transport,
+    )
+    prompt = ProviderPrompt(
+        messages=[ProviderMessage(role=ProviderMessageRole.USER, content="Plan this.")],
+        response_format=ProviderResponseFormat.JSON_OBJECT,
+        schema_name="assistant_plan",
+        output_schema={"type": "object"},
+        temperature=0.4,
+    )
+
+    adapter.complete(prompt)
+
+    assert transport.calls[0]["payload"]["options"]["temperature"] == 0.4

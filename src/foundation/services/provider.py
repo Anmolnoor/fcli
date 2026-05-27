@@ -618,9 +618,14 @@ class OllamaChatAdapter:
         if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
             assert prompt.output_schema is not None
             payload["format"] = prompt.output_schema
-            options["temperature"] = 0
+            # Default structured output to deterministic decoding, but allow a
+            # caller-supplied temperature (e.g. a repair retry nudging off 0 so
+            # it doesn't reproduce the same malformed JSON).
+            options["temperature"] = prompt.temperature if prompt.temperature is not None else 0
             if self._needs_think_for_structured_output(self._model):
                 payload["think"] = True
+        elif prompt.temperature is not None:
+            options["temperature"] = prompt.temperature
         if options:
             payload["options"] = options
         return payload

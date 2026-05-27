@@ -43,6 +43,9 @@ from foundation.settings import ApprovalMode
 
 _MAX_PLAN_ACTIONS = 40
 _MAX_TOTAL_ACTIONS = 200
+# Temperature used on a plan repair retry so the model doesn't deterministically
+# reproduce the same invalid/empty response it produced at temperature 0.
+_PLAN_REPAIR_TEMPERATURE = 0.4
 _COMMIT_INTENT_WORD_RE = re.compile(r"\bcommit(?:ing|ted|s)?\b", re.IGNORECASE)
 _COMMIT_INTENT_PHRASES = (
     "stop for approval",
@@ -139,11 +142,16 @@ class PlannerService:
         last_error: Exception | None = None
 
         for attempt in range(1, self._max_plan_attempts + 1):
+            # First attempt decodes deterministically (temperature 0). On a
+            # repair retry, nudge temperature up so the model doesn't
+            # deterministically reproduce the same malformed/empty response.
+            retry_temperature = _PLAN_REPAIR_TEMPERATURE if attempt > 1 else None
             prompt = ProviderPrompt(
                 messages=[*base_messages, *supplemental_messages],
                 response_format=ProviderResponseFormat.JSON_OBJECT,
                 schema_name="assistant_plan",
                 output_schema=AssistantPlan.model_json_schema(),
+                temperature=retry_temperature,
             )
             try:
                 response = self._provider.complete(prompt)

@@ -244,6 +244,38 @@ def _is_soft_failure_for_path(
     return path in cumulative_changed_paths
 
 
+def _unwrap_generated_file_body(text: str) -> str:
+    """Salvage raw file content if the model wrapped it in an AssistantPlan blob.
+
+    Some models, when asked to generate file content mid-loop, keep "planning"
+    and return a ``{assistant_message, actions: [...]}`` object with the real
+    content buried in a write action's ``content`` argument. Detect that shape
+    and extract the inner content; otherwise return the text untouched.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return text
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    if not isinstance(payload, dict) or "actions" not in payload:
+        return text
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return text
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        tool_call = action.get("tool_call")
+        if not isinstance(tool_call, dict):
+            continue
+        args = tool_call.get("arguments")
+        if isinstance(args, dict) and isinstance(args.get("content"), str):
+            return args["content"]
+    return text
+
+
 def _action_target_path(action: PlannedAction) -> str | None:
     if action.kind is not ActionKind.TOOL_CALL or action.tool_call is None:
         return None
@@ -691,27 +723,39 @@ class RequestOrchestrator:
         request: UserRequest,
         observation_messages: list[ProviderMessage],
     ) -> str:
-        messages: list[ProviderMessage] = [
+        # Fold the gathered context into a single plain-text reference block.
+        # We deliberately do NOT replay the planning conversation as assistant
+        # turns: those are JSON plans, and feeding them back primes the model to
+        # keep "planning" (emit another actions object) instead of writing the
+        # file's raw bytes.
+        reference = "\n\n".join(m.content for m in observation_messages).strip()
+        user_parts = [
+            f"Write the complete, literal contents of the file `{path}`.",
+            f"\nWhat the file should contain:\n{brief}",
+        ]
+        if reference:
+            user_parts.append(
+                "\nReference data gathered so far (use the real values from it; "
+                f"do not invent facts):\n{reference}"
+            )
+        user_parts.append(f"\nThe original user request was: {request.message}")
+        messages = [
             ProviderMessage(
                 role=ProviderMessageRole.DEVELOPER,
                 content=(
-                    f"You are generating the complete contents of the file `{path}`. "
-                    "Output ONLY the raw file body — no markdown code fences, no "
-                    "commentary, no surrounding quotes."
+                    "You are a file-content writer, not a planner. Output ONLY the "
+                    "raw, literal bytes to save to the file — nothing else. Do NOT "
+                    "wrap the output in JSON, do NOT emit an actions/plan object, do "
+                    "NOT fence the whole file, and do NOT add commentary before or "
+                    "after the content."
                 ),
-            )
+            ),
+            ProviderMessage(role=ProviderMessageRole.USER, content="\n".join(user_parts)),
         ]
-        messages.extend(observation_messages)
-        messages.append(
-            ProviderMessage(
-                role=ProviderMessageRole.USER,
-                content=f"Original request: {request.message}\n\nFile to write: {brief}",
-            )
-        )
         response = self._provider.complete(
             ProviderPrompt(messages=messages, response_format=ProviderResponseFormat.TEXT)
         )
-        return response.content
+        return _unwrap_generated_file_body(response.content)
 
     def _run_replan_loop(
         self,
