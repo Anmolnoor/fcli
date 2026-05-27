@@ -20,6 +20,7 @@ from foundation.models.file import (
     FileServiceError,
     FileWriteRequest,
 )
+from foundation.services.scope_grants import ScopeGrantStore
 from foundation.services.staging import WorkspaceRewriteStager
 
 _MAX_READ_BYTES = 256 * 1024  # 256 KB
@@ -43,6 +44,38 @@ def _raise(
             path=path,
             suggestion=suggestion,
         )
+    )
+
+
+def _sibling_hint(resolved: Path) -> str:
+    """List the entries in a missing file's parent dir, as a 'did you mean' hint."""
+    parent = resolved.parent
+    try:
+        if not parent.is_dir():
+            return ""
+        names = sorted(p.name + ("/" if p.is_dir() else "") for p in parent.iterdir())
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    shown = names[:12]
+    more = f" (+{len(names) - 12} more)" if len(names) > 12 else ""
+    return f" Directory '{parent.name}/' contains: {', '.join(shown)}{more}."
+
+
+def _raise_not_found(raw_path: str, resolved: Path) -> None:
+    """Raise FILE_NOT_FOUND with a sibling listing so the model can self-correct."""
+    hint = _sibling_hint(resolved)
+    _raise(
+        FileErrorCode.FILE_NOT_FOUND,
+        f"File does not exist: {raw_path}.{hint}",
+        path=raw_path,
+        suggestion=(
+            "Discover the correct path with foundation.files, or read one of the "
+            "files listed in the message."
+            if hint
+            else None
+        ),
     )
 
 
@@ -231,8 +264,15 @@ def _parse_and_apply_diff(original: str, diff_text: str, *, file_path: str) -> s
 class FileService:
     """Workspace-bound text file operations for v3 file capabilities."""
 
-    def __init__(self, *, workspace_root: Path, state_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_root: Path,
+        state_dir: Path,
+        read_grant_store: ScopeGrantStore | None = None,
+    ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
+        self._read_grant_store = read_grant_store
         self._stager = WorkspaceRewriteStager(
             workspace_root=self._workspace_root,
             state_dir=state_dir,
@@ -256,6 +296,31 @@ class FileService:
                 path=raw_path,
             )
         return resolved
+
+    def _resolve_read_path(self, raw_path: str) -> Path:
+        """Resolve a read path, also allowing session-granted out-of-scope roots.
+
+        Reads may target the workspace or any directory the user approved via a
+        scope escalation. Writes never use this — they stay workspace-confined.
+        """
+        candidate = Path(raw_path)
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self._workspace_root / candidate).resolve()
+        )
+        try:
+            resolved.relative_to(self._workspace_root)
+            return resolved
+        except ValueError:
+            pass
+        if self._read_grant_store is not None and self._read_grant_store.is_granted(resolved):
+            return resolved
+        _raise(
+            FileErrorCode.PATH_OUTSIDE_WORKSPACE,
+            "Path escapes the workspace boundary.",
+            path=raw_path,
+        )
 
     # -- raw I/O helpers ----------------------------------------------------
 
@@ -309,9 +374,9 @@ class FileService:
 
     def read(self, request: FileReadRequest) -> FileReadResult:
         """Read one workspace text file up to 256 KB."""
-        resolved = self._resolve_path(request.path)
+        resolved = self._resolve_read_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
         file_size = resolved.stat().st_size
         if file_size > _MAX_READ_BYTES:
             _raise(
@@ -332,9 +397,9 @@ class FileService:
 
     def read_chunk(self, request: FileReadChunkRequest) -> FileReadChunkResult:
         """Read a line-based chunk from a workspace text file."""
-        resolved = self._resolve_path(request.path)
+        resolved = self._resolve_read_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
 
         # Peek at the first 8 KB for binary detection
         raw_head = resolved.read_bytes()[:8192]
@@ -419,7 +484,7 @@ class FileService:
         """Rewrite an existing file with conflict detection."""
         resolved = self._resolve_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
         old_content, _ = self._read_raw(resolved)
         actual_sha256 = _sha256(old_content)
         if actual_sha256 != request.expected_sha256:
@@ -442,7 +507,7 @@ class FileService:
         """Apply a unified diff atomically to a workspace text file."""
         resolved = self._resolve_path(request.path)
         if not resolved.exists():
-            _raise(FileErrorCode.FILE_NOT_FOUND, "File does not exist.", path=request.path)
+            _raise_not_found(request.path, resolved)
         old_content, _ = self._read_raw(resolved)
         new_content = _parse_and_apply_diff(
             old_content,

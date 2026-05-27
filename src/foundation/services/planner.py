@@ -24,6 +24,7 @@ from foundation.models.file import (
     FileEditRequest,
     FileReadChunkRequest,
     FileReadRequest,
+    FileWriteBriefRequest,
     FileWriteRequest,
 )
 from foundation.models.git import (
@@ -42,6 +43,9 @@ from foundation.settings import ApprovalMode
 
 _MAX_PLAN_ACTIONS = 40
 _MAX_TOTAL_ACTIONS = 200
+# Temperature used on a plan repair retry so the model doesn't deterministically
+# reproduce the same invalid/empty response it produced at temperature 0.
+_PLAN_REPAIR_TEMPERATURE = 0.4
 _COMMIT_INTENT_WORD_RE = re.compile(r"\bcommit(?:ing|ted|s)?\b", re.IGNORECASE)
 _COMMIT_INTENT_PHRASES = (
     "stop for approval",
@@ -138,22 +142,37 @@ class PlannerService:
         last_error: Exception | None = None
 
         for attempt in range(1, self._max_plan_attempts + 1):
+            # First attempt decodes deterministically (temperature 0). On a
+            # repair retry, nudge temperature up so the model doesn't
+            # deterministically reproduce the same malformed/empty response.
+            retry_temperature = _PLAN_REPAIR_TEMPERATURE if attempt > 1 else None
             prompt = ProviderPrompt(
                 messages=[*base_messages, *supplemental_messages],
                 response_format=ProviderResponseFormat.JSON_OBJECT,
                 schema_name="assistant_plan",
                 output_schema=AssistantPlan.model_json_schema(),
+                temperature=retry_temperature,
             )
             try:
                 response = self._provider.complete(prompt)
             except ProviderError as exc:
                 last_error = exc
-                if (
-                    exc.code is ProviderErrorCode.INVALID_RESPONSE
-                    and attempt < self._max_plan_attempts
-                ):
+                repairable = exc.code in (
+                    ProviderErrorCode.INVALID_RESPONSE,
+                    ProviderErrorCode.TRUNCATED,
+                )
+                if repairable and attempt < self._max_plan_attempts:
+                    if exc.code is ProviderErrorCode.TRUNCATED:
+                        feedback = (
+                            "Your previous response was truncated before the JSON closed. "
+                            "Produce a SHORTER plan: do not inline large file contents — for "
+                            "any sizable file body, omit `content` and provide a brief "
+                            "`content_brief` describing what to write instead."
+                        )
+                    else:
+                        feedback = "The previous response was not valid JSON."
                     supplemental_messages = self._repair_messages(
-                        "The previous response was not valid JSON.",
+                        feedback,
                         invalid_output=exc.response_text,
                     )
                     continue
@@ -209,11 +228,16 @@ class PlannerService:
             "actions": [
                 {
                     "id": "unique action identifier",
-                    "kind": "explanation | shell | tool_call",
+                    "kind": "explanation | shell | tool_call | question",
                     "summary": "short description",
                     "requires_approval": "boolean",
                     "approval_reason": "string | null",
                     "explanation": "required for explanation actions",
+                    "question": {
+                        "prompt": "required for question actions",
+                        "options": ["optional", "choices"],
+                        "allow_free_text": "boolean",
+                    },
                     "shell": {
                         "command": "string",
                         "args": ["string"],
@@ -225,6 +249,11 @@ class PlannerService:
                         "capability_id": "foundation.search",
                         "version": "1.0.0 | null",
                         "arguments": "tool-specific JSON object",
+                        "_file_write_note": (
+                            "for foundation.file.write use {path, content} for tiny "
+                            "files, or {path, content_brief} (NOT content) for "
+                            "anything longer — the body is generated separately"
+                        ),
                     },
                 }
             ],
@@ -254,6 +283,12 @@ class PlannerService:
             "Prefer typed file capabilities (foundation.file.read, "
             "foundation.file.write, foundation.file.edit, foundation.file.apply_diff) "
             "for reading and editing files. "
+            "For foundation.file.write, do NOT inline a large file body in the "
+            "`content` argument — long content bloats this JSON plan and can be "
+            "truncated. For anything beyond a few short lines, omit `content` and "
+            "instead provide `content_brief`: a concise description of what the file "
+            "should contain. The body is generated separately. Use literal `content` "
+            "only for very short files. "
             "Prefer typed git capabilities (foundation.git.*) for repository "
             "inspection and staging. "
             "The git.commit capability requires approval and never stages implicitly. "
@@ -266,6 +301,10 @@ class PlannerService:
             "reading, search, or file edits. "
             "Use shell actions for running tests, builds, linters, and "
             "environment inspection only. "
+            "To read a file outside the workspace root, issue a normal "
+            "foundation.file.read with its absolute path; the user will be asked "
+            "to approve out-of-scope read access rather than it being silently "
+            "blocked. Do not refuse preemptively. "
             "Shell args are passed directly to the target binary via execve, "
             "NOT interpreted by a shell. Do NOT wrap args in single or double "
             "quotes, do NOT expect glob expansion or variable substitution, "
@@ -280,6 +319,9 @@ class PlannerService:
             "completing with zero actions, unless verification is unavailable and you explain why. "
             "If an action is risky, mutating, networked, or uncertain, mark requires_approval=true "
             "and explain why in approval_reason. "
+            "If the request is genuinely ambiguous or you are missing information only the "
+            "user can provide, emit a single `question` action (kind=question) with a clear "
+            "prompt and optional options, rather than guessing. Use this sparingly. "
             "If the user can be answered directly, return zero actions with your final answer. "
             "When returning zero actions to finish, your assistant_message "
             "becomes the user-facing answer. "
@@ -447,10 +489,22 @@ class PlannerService:
 
             ShellAction.model_validate(arguments)
             return
+        if endpoint == "builtin.file.write":
+            has_content = bool(arguments.get("content"))
+            has_brief = bool(arguments.get("content_brief"))
+            if has_content and has_brief:
+                raise PlanningError(
+                    "foundation.file.write must provide either content or "
+                    "content_brief, not both."
+                )
+            if has_brief:
+                FileWriteBriefRequest.model_validate(arguments)
+            else:
+                FileWriteRequest.model_validate(arguments)
+            return
         _FILE_VALIDATORS: dict[str, type[BaseModel]] = {
             "builtin.file.read": FileReadRequest,
             "builtin.file.read_chunk": FileReadChunkRequest,
-            "builtin.file.write": FileWriteRequest,
             "builtin.file.edit": FileEditRequest,
             "builtin.file.apply_diff": FileApplyDiffRequest,
         }

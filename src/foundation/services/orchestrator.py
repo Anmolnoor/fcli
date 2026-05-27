@@ -8,6 +8,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,6 +34,9 @@ from foundation.models import (
     PolicyEvaluationRecord,
     ProviderMessage,
     ProviderMessageRole,
+    ProviderPrompt,
+    ProviderResponseFormat,
+    QuestionAction,
     SessionKind,
     SessionStatus,
     UserRequest,
@@ -61,7 +65,8 @@ from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
 from foundation.services.observer import EventSink, ObserverService
 from foundation.services.planner import PlannerService, PlanningError
-from foundation.services.provider import ProviderAdapter
+from foundation.services.provider import ProviderAdapter, ProviderError
+from foundation.services.scope_grants import ScopeGrantStore
 from foundation.services.shell import OutputCallback, ShellRuntime
 from foundation.services.tools import LocalToolService
 from foundation.settings import ApprovalMode
@@ -174,6 +179,9 @@ _STOP_REASON_SUFFIXES = {
     LoopStopReason.PENDING_APPROVAL: (
         "\n\n[Loop stopped: an action requires approval before continuing.]"
     ),
+    LoopStopReason.AWAITING_USER_INPUT: (
+        "\n\n[Loop stopped: waiting for your answer to a question before continuing.]"
+    ),
     LoopStopReason.FATAL_EXECUTION_FAILURE: (
         "\n\n[Loop stopped: a fatal execution failure occurred.]"
     ),
@@ -234,6 +242,79 @@ def _is_soft_failure_for_path(
     if not any(fragment in lowered for fragment in _SOFT_FAILURE_FRAGMENTS):
         return False
     return path in cumulative_changed_paths
+
+
+def _unwrap_generated_file_body(text: str) -> str:
+    """Salvage raw file content if the model wrapped it in an AssistantPlan blob.
+
+    Some models, when asked to generate file content mid-loop, keep "planning"
+    and return a ``{assistant_message, actions: [...]}`` object with the real
+    content buried in a write action's ``content`` argument. Detect that shape
+    and extract the inner content; otherwise return the text untouched.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return text
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    if not isinstance(payload, dict) or "actions" not in payload:
+        return text
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return text
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        tool_call = action.get("tool_call")
+        if not isinstance(tool_call, dict):
+            continue
+        args = tool_call.get("arguments")
+        if isinstance(args, dict) and isinstance(args.get("content"), str):
+            return args["content"]
+    return text
+
+
+# Read-only typed results whose payload should be surfaced to the planner so it
+# can actually use what the tool returned (not just see that it ran). Writes and
+# mutations are excluded — echoing their content back only bloats the prompt.
+_RESULT_PREVIEW_TYPES = frozenset(
+    {
+        ExecutionArtifactType.FILE_READ,
+        ExecutionArtifactType.FILE_READ_CHUNK,
+        ExecutionArtifactType.SEARCH,
+        ExecutionArtifactType.FILES,
+        ExecutionArtifactType.GIT,
+        ExecutionArtifactType.GIT_STATUS,
+        ExecutionArtifactType.GIT_DIFF,
+        ExecutionArtifactType.GIT_SHOW,
+        ExecutionArtifactType.GIT_LOG,
+        ExecutionArtifactType.MAN,
+        ExecutionArtifactType.TLDR,
+    }
+)
+
+
+def _tool_result_preview(
+    artifact: dict[str, object] | None,
+    artifact_type: ExecutionArtifactType | None,
+) -> str:
+    """Render a read-only tool result's payload for the planner observation.
+
+    Typed capabilities (file reads, search, discovery, git inspect) don't use
+    the shell ``stdout`` field, so without this their output never reaches the
+    planner and it can't act on what it just fetched.
+    """
+    if not artifact or artifact_type not in _RESULT_PREVIEW_TYPES:
+        return ""
+    content = artifact.get("content")
+    if isinstance(content, str) and content:
+        return content
+    try:
+        return json.dumps(artifact, default=str)
+    except (TypeError, ValueError):
+        return ""
 
 
 def _action_target_path(action: PlannedAction) -> str | None:
@@ -429,6 +510,7 @@ class RequestOrchestrator:
         capability_store_root: Path | None = None,
         max_plan_attempts: int = 2,
         event_sink: EventSink | None = None,
+        question_callback: Callable[[QuestionAction], str | None] | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._approval_mode = approval_mode
@@ -444,9 +526,12 @@ class RequestOrchestrator:
             store=CapabilityStore(store_root),
             tool_service=self._tool_service,
         )
+        # Shared, session-scoped read grants for out-of-workspace escalation.
+        self._grant_store = ScopeGrantStore()
         self._policy_engine = policy_engine or GuardrailPolicyEngine(
             workspace_root=self._workspace_root,
             capability_registry=self._capability_registry,
+            grant_store=self._grant_store,
         )
         self._approval_service = approval_service or ApprovalService(mode=approval_mode)
         self._history_store = history_store
@@ -480,8 +565,11 @@ class RequestOrchestrator:
             file_service=FileService(
                 workspace_root=self._workspace_root,
                 state_dir=state_dir,
+                read_grant_store=self._grant_store,
             ),
             git_service=self._git_service,
+            question_callback=question_callback,
+            grant_store=self._grant_store,
         )
 
     def set_event_sink(self, event_sink: EventSink | None) -> None:
@@ -576,6 +664,11 @@ class RequestOrchestrator:
                 )
             return result
         except Exception as exc:
+            # Preserve the raw (capped) provider response on parse/truncation
+            # failures so the persisted event log is self-diagnosing.
+            failure_extra: dict[str, str] = {}
+            if isinstance(exc, ProviderError) and exc.response_text:
+                failure_extra["response_text"] = exc.response_text[:4096]
             self._observer.emit_exception(
                 EVENT_EXCEPTION,
                 exc,
@@ -583,6 +676,7 @@ class RequestOrchestrator:
                     "request_id": request_id,
                     "session_id": session_id,
                     "request_text": request.message,
+                    **failure_extra,
                 },
                 session_id=session_id,
                 logger_name="foundation.services.orchestrator",
@@ -590,7 +684,11 @@ class RequestOrchestrator:
             self._observer.emit_exception(
                 EVENT_PLAN_FAILED,
                 exc,
-                payload={"request_id": request_id, "session_id": session_id},
+                payload={
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    **failure_extra,
+                },
                 session_id=session_id,
                 logger_name="foundation.services.orchestrator",
             )
@@ -613,6 +711,92 @@ class RequestOrchestrator:
     # ------------------------------------------------------------------
     # Bounded replan loop
     # ------------------------------------------------------------------
+
+    def _materialize_deferred_writes(
+        self,
+        actions: list[PlannedAction],
+        *,
+        request: UserRequest,
+        observation_messages: list[ProviderMessage],
+        request_id: str,
+        session_id: str | None,
+    ) -> None:
+        """Generate file bodies for writes that deferred content via content_brief.
+
+        On success the brief is replaced with literal ``content`` for the
+        executor. On a provider failure the brief is left in place so the
+        write fails as a normal action (the executor rejects the unknown
+        ``content_brief`` field) rather than killing the turn.
+        """
+        for action in actions:
+            if action.kind is not ActionKind.TOOL_CALL or action.tool_call is None:
+                continue
+            tool_call = action.tool_call
+            if tool_call.capability_id != "foundation.file.write":
+                continue
+            brief = tool_call.arguments.get("content_brief")
+            if not brief or tool_call.arguments.get("content"):
+                continue
+            path = str(tool_call.arguments.get("path", "<file>"))
+            try:
+                body = self._generate_file_body(
+                    path=path,
+                    brief=str(brief),
+                    request=request,
+                    observation_messages=observation_messages,
+                )
+            except ProviderError as exc:
+                logger.warning(
+                    "deferred_write_generation_failed action=%s path=%s error=%s",
+                    action.id,
+                    path,
+                    exc,
+                )
+                continue
+            tool_call.arguments.pop("content_brief", None)
+            tool_call.arguments["content"] = body
+
+    def _generate_file_body(
+        self,
+        *,
+        path: str,
+        brief: str,
+        request: UserRequest,
+        observation_messages: list[ProviderMessage],
+    ) -> str:
+        # Fold the gathered context into a single plain-text reference block.
+        # We deliberately do NOT replay the planning conversation as assistant
+        # turns: those are JSON plans, and feeding them back primes the model to
+        # keep "planning" (emit another actions object) instead of writing the
+        # file's raw bytes.
+        reference = "\n\n".join(m.content for m in observation_messages).strip()
+        user_parts = [
+            f"Write the complete, literal contents of the file `{path}`.",
+            f"\nWhat the file should contain:\n{brief}",
+        ]
+        if reference:
+            user_parts.append(
+                "\nReference data gathered so far (use the real values from it; "
+                f"do not invent facts):\n{reference}"
+            )
+        user_parts.append(f"\nThe original user request was: {request.message}")
+        messages = [
+            ProviderMessage(
+                role=ProviderMessageRole.DEVELOPER,
+                content=(
+                    "You are a file-content writer, not a planner. Output ONLY the "
+                    "raw, literal bytes to save to the file — nothing else. Do NOT "
+                    "wrap the output in JSON, do NOT emit an actions/plan object, do "
+                    "NOT fence the whole file, and do NOT add commentary before or "
+                    "after the content."
+                ),
+            ),
+            ProviderMessage(role=ProviderMessageRole.USER, content="\n".join(user_parts)),
+        ]
+        response = self._provider.complete(
+            ProviderPrompt(messages=messages, response_format=ProviderResponseFormat.TEXT)
+        )
+        return _unwrap_generated_file_body(response.content)
 
     def _run_replan_loop(
         self,
@@ -763,6 +947,18 @@ class RequestOrchestrator:
             budget = _MAX_TOTAL_ACTIONS - total_actions_executed
             actions_to_execute = plan.actions[:budget]
 
+            # 4b. Materialize deferred file bodies (content_brief -> content) via a
+            # separate text-generation call, keeping large content out of the
+            # schema-constrained plan JSON. A generation failure leaves the brief
+            # in place so the write degrades to a normal failed action.
+            self._materialize_deferred_writes(
+                actions_to_execute,
+                request=request,
+                observation_messages=observation_messages,
+                request_id=request_id,
+                session_id=session_id,
+            )
+
             # 5. Policy evaluate + execute
             execution_results, decisions, evaluations, last_step_id = (
                 self._execute_iteration_actions(
@@ -825,10 +1021,15 @@ class RequestOrchestrator:
             has_pending = any(
                 r.status is ExecutionStatus.PENDING_APPROVAL for r in execution_results
             )
+            has_awaiting_input = any(
+                r.status is ExecutionStatus.AWAITING_INPUT for r in execution_results
+            )
             has_fatal = any(self._is_fatal_result(r) for r in execution_results)
 
             if has_pending:
                 stop_reason = LoopStopReason.PENDING_APPROVAL
+            elif has_awaiting_input:
+                stop_reason = LoopStopReason.AWAITING_USER_INPUT
             elif has_fatal:
                 stop_reason = LoopStopReason.FATAL_EXECUTION_FAILURE
             elif total_actions_executed >= _MAX_TOTAL_ACTIONS:
@@ -1114,6 +1315,19 @@ class RequestOrchestrator:
                 stderr_preview = _truncate_preview(str(result.artifact.get("stderr", "")))
                 if result.artifact.get("path"):
                     action_changed.append(str(result.artifact["path"]))
+                # Surface a user's answer to a question action so the next
+                # planning iteration can act on it.
+                if action.kind is ActionKind.QUESTION and result.artifact.get("answer") is not None:
+                    stdout_preview = _truncate_preview(
+                        f'User answered: "{result.artifact["answer"]}"'
+                    )
+                # Surface typed read-only results (file reads, search, git
+                # inspect) so the planner sees the data it fetched instead of an
+                # empty outcome — without this it re-runs the same read forever.
+                if not stdout_preview:
+                    preview = _tool_result_preview(result.artifact, result.artifact_type)
+                    if preview:
+                        stdout_preview = _truncate_preview(preview)
 
             if result.status is ExecutionStatus.PENDING_APPROVAL:
                 approval_outcomes.append(f"{action.id}: pending approval")
@@ -1418,6 +1632,10 @@ class RequestOrchestrator:
             return SessionStatus.PENDING_APPROVAL
         if stop_reason is LoopStopReason.PENDING_APPROVAL:
             return SessionStatus.PENDING_APPROVAL
+        if stop_reason is LoopStopReason.AWAITING_USER_INPUT:
+            # Stopped to ask the user something we couldn't prompt for inline
+            # (non-interactive run, or the user dismissed the prompt).
+            return SessionStatus.COMPLETED_INCONCLUSIVE
         if stop_reason is LoopStopReason.FATAL_EXECUTION_FAILURE:
             return SessionStatus.FAILED
         if stop_reason is LoopStopReason.ZERO_ACTION_PLAN:

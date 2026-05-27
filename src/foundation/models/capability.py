@@ -140,6 +140,7 @@ class PolicyReasonCode(StrEnum):
     SIDE_EFFECT_REQUIRES_APPROVAL = "side_effect_requires_approval"
     UNDECLARED_SIDE_EFFECT = "undeclared_side_effect"
     PATH_OUT_OF_SCOPE = "path_out_of_scope"
+    SCOPE_ESCALATION = "scope_escalation"
     NETWORK_OUT_OF_SCOPE = "network_out_of_scope"
     INVOCATION_LIMIT_EXCEEDED = "invocation_limit_exceeded"
     RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"

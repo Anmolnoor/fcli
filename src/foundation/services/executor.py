@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,8 @@ from foundation.models import (
     PolicyDecision,
     PolicyDecisionType,
     PolicyEvaluationRecord,
+    PolicyReasonCode,
+    QuestionAction,
     ShellAction,
     ToolCall,
 )
@@ -51,6 +54,8 @@ from foundation.models.git import (
 from foundation.observability import (
     EVENT_APPROVAL_REQUESTED,
     EVENT_APPROVAL_RESOLVED,
+    EVENT_QUESTION_ANSWERED,
+    EVENT_QUESTION_ASKED,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
@@ -64,6 +69,7 @@ from foundation.services.file_service import FileService
 from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.observer import ObserverService
+from foundation.services.scope_grants import ScopeGrantStore
 from foundation.services.shell import (
     ExecutionMode,
     OutputCallback,
@@ -120,6 +126,8 @@ class ActionExecutor:
         shell_output_callback: OutputCallback | None = None,
         file_service: FileService | None = None,
         git_service: GitService | None = None,
+        question_callback: Callable[[QuestionAction], str | None] | None = None,
+        grant_store: ScopeGrantStore | None = None,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._shell_runtime = shell_runtime
@@ -131,6 +139,8 @@ class ActionExecutor:
         self._shell_output_callback = shell_output_callback
         self._file_service = file_service
         self._git_service = git_service
+        self._question_callback = question_callback
+        self._grant_store = grant_store
 
     def execute(
         self,
@@ -163,6 +173,127 @@ class ActionExecutor:
             completed_at=completed_at,
             duration_seconds=max(time.monotonic() - started_monotonic, 0.0),
         )
+
+    def _handle_question(
+        self,
+        action_id: str,
+        question: QuestionAction,
+        *,
+        request_id: str,
+        session_id: str | None,
+    ) -> ExecutionResult:
+        self._observer.emit(
+            EVENT_QUESTION_ASKED,
+            payload={
+                "request_id": request_id,
+                "action_id": action_id,
+                "prompt": question.prompt,
+                "options": question.options,
+            },
+            session_id=session_id,
+            logger_name="foundation.services.executor",
+        )
+        artifact: dict[str, object] = {
+            "question": question.prompt,
+            "options": question.options,
+        }
+        # No interactive prompt available (non-TTY / one-shot run): stop the
+        # loop and surface the question rather than guessing an answer.
+        if self._question_callback is None:
+            return ExecutionResult(
+                action_id=action_id,
+                status=ExecutionStatus.AWAITING_INPUT,
+                summary=question.prompt,
+                artifact_type=ExecutionArtifactType.QUESTION,
+                artifact={**artifact, "answer": None},
+            )
+        answer = self._question_callback(question)
+        self._observer.emit(
+            EVENT_QUESTION_ANSWERED,
+            payload={
+                "request_id": request_id,
+                "action_id": action_id,
+                "answered": answer is not None,
+            },
+            session_id=session_id,
+            logger_name="foundation.services.executor",
+        )
+        if answer is None:
+            return ExecutionResult(
+                action_id=action_id,
+                status=ExecutionStatus.AWAITING_INPUT,
+                summary=f"Unanswered question: {question.prompt}",
+                artifact_type=ExecutionArtifactType.QUESTION,
+                artifact={**artifact, "answer": None},
+            )
+        return ExecutionResult(
+            action_id=action_id,
+            status=ExecutionStatus.EXECUTED,
+            summary=f"Asked the user: {question.prompt}",
+            artifact_type=ExecutionArtifactType.QUESTION,
+            artifact={**artifact, "answer": answer},
+        )
+
+    def _handle_scope_escalation(
+        self,
+        action: PlannedAction,
+        decision: PolicyDecision,
+        *,
+        request_id: str,
+        session_id: str | None,
+    ) -> ExecutionResult | None:
+        """Ask the user to allow an out-of-scope read; grant on approval.
+
+        Returns a BLOCKED result if the user declines (or cannot be prompted),
+        or None if access was granted and execution should proceed.
+        """
+        paths = list(decision.paths)
+        display = ", ".join(paths) if paths else "a path outside your workspace"
+        question = QuestionAction(
+            prompt=(
+                f"The agent wants to read {display}, which is outside your workspace "
+                "root. Allow read access for this session?"
+            ),
+            options=["Allow for this session", "Deny"],
+            allow_free_text=False,
+        )
+        self._observer.emit(
+            EVENT_QUESTION_ASKED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "prompt": question.prompt,
+                "kind": "scope_escalation",
+            },
+            session_id=session_id,
+            logger_name="foundation.services.executor",
+        )
+        answer = self._question_callback(question) if self._question_callback is not None else None
+        self._observer.emit(
+            EVENT_QUESTION_ANSWERED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "granted": answer == "Allow for this session",
+            },
+            session_id=session_id,
+            logger_name="foundation.services.executor",
+        )
+        if answer != "Allow for this session":
+            return ExecutionResult(
+                action_id=action.id,
+                status=ExecutionStatus.BLOCKED,
+                summary="Out-of-scope read was not approved.",
+                error="Out-of-scope read was not approved.",
+            )
+        if self._grant_store is not None:
+            for raw in paths:
+                target = Path(raw).expanduser()
+                if not target.is_absolute():
+                    target = self._workspace_root / target
+                root = target if target.is_dir() else target.parent
+                self._grant_store.grant(root)
+        return None
 
     def _handle_action(
         self,
@@ -198,7 +329,30 @@ class ActionExecutor:
                 None,
             )
 
-        if decision.decision is PolicyDecisionType.REQUIRE_APPROVAL:
+        if (
+            decision.decision is PolicyDecisionType.REQUIRE_APPROVAL
+            and PolicyReasonCode.SCOPE_ESCALATION in decision.reason_codes
+        ):
+            blocked = self._handle_scope_escalation(
+                action,
+                decision,
+                request_id=request_id,
+                session_id=session_id,
+            )
+            if blocked is not None:
+                return (blocked, None, None)
+            # Granted: fall through to normal execution with the grant recorded.
+            decision = PolicyDecision(
+                action_id=decision.action_id,
+                decision=PolicyDecisionType.ALLOW,
+                reason="Out-of-scope read approved for this session.",
+                risk_categories=list(decision.risk_categories),
+                command_preview=decision.command_preview,
+                paths=list(decision.paths),
+            )
+            approval_request = None
+            approval_resolution = None
+        elif decision.decision is PolicyDecisionType.REQUIRE_APPROVAL:
             if policy_evaluation is None:
                 raise RuntimeError(
                     f"Approval-required action {action.id!r} is missing a policy evaluation."
@@ -282,6 +436,19 @@ class ActionExecutor:
                     summary=action.explanation or action.summary,
                     artifact_type=ExecutionArtifactType.EXPLANATION,
                     artifact={"message": action.explanation or action.summary},
+                ),
+                approval_request,
+                approval_resolution,
+            )
+
+        if action.kind is ActionKind.QUESTION:
+            assert action.question is not None
+            return (
+                self._handle_question(
+                    action.id,
+                    action.question,
+                    request_id=request_id,
+                    session_id=session_id,
                 ),
                 approval_request,
                 approval_resolution,

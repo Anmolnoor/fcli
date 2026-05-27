@@ -456,3 +456,104 @@ def test_ollama_adapter_invalid_json_error_includes_raw() -> None:
 
     assert exc_info.value.code is ProviderErrorCode.INVALID_RESPONSE
     assert exc_info.value.response_text == garbage
+
+
+def test_ollama_adapter_sets_num_predict_and_num_ctx() -> None:
+    transport = FakeTransport(
+        [{"message": {"role": "assistant", "content": '{"assistant_message":"ok","actions":[]}'}}]
+    )
+    adapter = OllamaChatAdapter(
+        model="glm-5.1:cloud",
+        base_url="http://localhost:11434/api",
+        max_output_tokens=2048,
+        num_ctx=8192,
+        transport=transport,
+    )
+
+    adapter.complete(_structured_prompt())
+
+    options = transport.calls[0]["payload"]["options"]
+    assert options["num_predict"] == 2048
+    assert options["num_ctx"] == 8192
+    assert options["temperature"] == 0
+
+
+def test_ollama_adapter_raises_truncated_on_done_reason_length() -> None:
+    """A length-truncated response surfaces a distinct TRUNCATED error, not a JSON parse error."""
+    partial = '{"assistant_message":"writing","actions":[{"id":"w","kind":"tool_call"'
+    transport = FakeTransport(
+        [{"message": {"role": "assistant", "content": partial}, "done_reason": "length"}]
+    )
+    adapter = OllamaChatAdapter(
+        model="kimi-k2.6:cloud",
+        base_url="http://localhost:11434/api",
+        max_output_tokens=128,
+        transport=transport,
+    )
+
+    with pytest.raises(ProviderError, match="truncated") as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.TRUNCATED
+    assert exc_info.value.response_text == partial
+
+
+def test_openai_adapter_sets_max_output_tokens() -> None:
+    transport = FakeTransport(
+        [{"id": "r", "output_text": '{"assistant_message":"ok","actions":[]}'}]
+    )
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        api_key="sk-test",
+        max_output_tokens=4096,
+        transport=transport,
+    )
+
+    adapter.complete(_structured_prompt())
+
+    assert transport.calls[0]["payload"]["max_output_tokens"] == 4096
+
+
+def test_openai_adapter_raises_truncated_on_incomplete_response() -> None:
+    transport = FakeTransport(
+        [
+            {
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output_text": '{"assistant_message":"partial"',
+            }
+        ]
+    )
+    adapter = OpenAIResponsesAdapter(
+        model="gpt-5-mini",
+        api_key="sk-test",
+        transport=transport,
+    )
+
+    with pytest.raises(ProviderError, match="truncated") as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.TRUNCATED
+
+
+def test_ollama_adapter_honors_prompt_temperature() -> None:
+    transport = FakeTransport(
+        [{"message": {"role": "assistant", "content": '{"assistant_message":"ok","actions":[]}'}}]
+    )
+    adapter = OllamaChatAdapter(
+        model="glm-5.1:cloud",
+        base_url="http://localhost:11434/api",
+        transport=transport,
+    )
+    prompt = ProviderPrompt(
+        messages=[ProviderMessage(role=ProviderMessageRole.USER, content="Plan this.")],
+        response_format=ProviderResponseFormat.JSON_OBJECT,
+        schema_name="assistant_plan",
+        output_schema={"type": "object"},
+        temperature=0.4,
+    )
+
+    adapter.complete(prompt)
+
+    assert transport.calls[0]["payload"]["options"]["temperature"] == 0.4

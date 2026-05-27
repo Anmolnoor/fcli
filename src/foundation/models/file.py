@@ -81,6 +81,19 @@ class FileWriteRequest(StrictModel):
     overwrite: bool = False
 
 
+class FileWriteBriefRequest(StrictModel):
+    """Deferred write: the body is generated from a brief instead of inlined.
+
+    Keeps large file content out of the schema-constrained plan JSON. The
+    orchestrator materializes ``content_brief`` into ``content`` via a separate
+    text-generation call before the write executes.
+    """
+
+    path: str = Field(min_length=1)
+    content_brief: str = Field(min_length=1)
+    overwrite: bool = False
+
+
 class FileEditRequest(StrictModel):
     """Rewrite an existing file with conflict detection."""
 
