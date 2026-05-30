@@ -14,6 +14,7 @@ from foundation.models import (
     ExecutionArtifactType,
     ExecutionStatus,
     ExecutionStep,
+    GapOptionKind,
     LoopStopReason,
     PlanningStep,
     ProviderPrompt,
@@ -1297,6 +1298,44 @@ def test_fatal_failure_stops_loop(
     assert result.summary.failed_actions == 1
 
 
+def test_fatal_failure_reframed_as_capability_gap_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fatal stop surfaces a graceful handoff instead of a raw error suffix."""
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Running nonexistent.",
+                    "actions": [
+                        {
+                            "id": "spawn_fail",
+                            "kind": "shell",
+                            "summary": "Run a nonexistent binary",
+                            "shell": {"command": "nonexistent_binary_xyz"},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    orchestrator, _runtime, _workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="run nonexistent"))
+
+    assert result.stop_reason is LoopStopReason.FATAL_EXECUTION_FAILURE
+    # The chat surface shows the handoff message, not the red "[Loop stopped...]" suffix.
+    assert result.gap_handoff is not None
+    assert result.assistant_message.content == result.gap_handoff.message
+    assert "[Loop stopped" not in result.assistant_message.content
+    # The underlying failure is preserved for logs/trace (hidden from chat, not deleted).
+    assert any(r.status is ExecutionStatus.FAILED for r in result.execution_results)
+    option_kinds = {option.kind for option in result.gap_handoff.options}
+    assert GapOptionKind.REPORT in option_kinds
+    assert GapOptionKind.STOP in option_kinds
+
+
 def test_max_iteration_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1436,7 +1475,10 @@ def test_no_progress_detection(
 
     assert result.stop_reason is LoopStopReason.NO_PROGRESS
     assert len(result.iterations) == 2
-    assert "[Loop stopped:" in result.assistant_message.content
+    # A stuck loop with no cumulative changes is reframed as a capability-gap
+    # handoff, so the user sees a graceful message rather than the raw suffix.
+    assert result.gap_handoff is not None
+    assert "[Loop stopped:" not in result.assistant_message.content
 
 
 def test_observation_block_in_provider_messages(

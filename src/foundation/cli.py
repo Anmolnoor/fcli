@@ -33,12 +33,15 @@ from foundation.models import (
     AuditDetailRef,
     AuditReport,
     BrainSession,
+    CapabilityGapHandoff,
+    CapabilityGapOption,
     ChatNotice,
     ChatSurfacePolicy,
     ChatTurnPresentation,
     ExecutionArtifactType,
     ExecutionResult,
     ExecutionStatus,
+    GapOptionKind,
     HistorySessionDetail,
     HistorySessionSummary,
     InteractiveDetailCommand,
@@ -114,6 +117,7 @@ from foundation.services import (
     TraceStore,
     build_provider_adapter,
 )
+from foundation.services.gap_handoff import build_issue_url, write_gap_report
 from foundation.settings import (
     ApprovalMode,
     AppSettings,
@@ -557,6 +561,62 @@ def _prompt_for_question(question: QuestionAction) -> str | None:
     finally:
         if renderer is not None:
             renderer.resume()
+
+
+def _prompt_gap_option(handoff: CapabilityGapHandoff) -> CapabilityGapOption | None:
+    """Present a capability-gap handoff and return the option the user chose."""
+    lines = [f"[bold]{escape(handoff.message)}[/bold]", ""]
+    for index, option in enumerate(handoff.options, start=1):
+        lines.append(f"  [cyan]{index}[/cyan]. {escape(option.label)}")
+    renderer = get_active_renderer()
+    if renderer is not None:
+        renderer.pause()
+    try:
+        console.print(Panel.fit("\n".join(lines), title="How would you like to proceed?"))
+        try:
+            raw = typer.prompt("Choose an option", default="").strip()
+        except (EOFError, click.exceptions.Abort):
+            return None
+        if raw.isdigit():
+            choice = int(raw)
+            if 1 <= choice <= len(handoff.options):
+                return handoff.options[choice - 1]
+        return None
+    finally:
+        if renderer is not None:
+            renderer.resume()
+
+
+def _submit_gap_report(handoff: CapabilityGapHandoff, *, settings: AppSettings) -> None:
+    """Persist a gap report and show the user where it can be filed/fixed."""
+    path = write_gap_report(handoff.report, gaps_dir=settings.app.state_dir / "gaps")
+    url = build_issue_url(handoff.report)
+    console.print(
+        Panel.fit(
+            "Thanks — I saved a gap report so this can be fixed.\n\n"
+            f"Saved to: [cyan]{escape(str(path))}[/cyan]\n"
+            f"File it as an issue: [cyan]{escape(url)}[/cyan]",
+            title="Reported",
+        )
+    )
+
+
+def _handle_gap_handoff(
+    handoff: CapabilityGapHandoff,
+    *,
+    settings: AppSettings,
+) -> str | None:
+    """Drive the interactive gap handoff. Return a follow-up request to resume, or None."""
+    choice = _prompt_gap_option(handoff)
+    if choice is None:
+        return None
+    if choice.kind is GapOptionKind.REPORT:
+        _submit_gap_report(handoff, settings=settings)
+        return None
+    if choice.kind is GapOptionKind.ALTERNATIVE:
+        return choice.follow_up_request
+    console.print(Text("Okay — stopping here.", style="dim"))
+    return None
 
 
 def _build_orchestrator(
@@ -1444,19 +1504,32 @@ def _run_interactive_chat(
         memory_envelope=session_manager.build_memory_envelope(state.session),
     )
 
+    # When a capability-gap handoff offers a constrained retry and the user
+    # accepts, the chosen follow-up is queued here and run as the next turn
+    # without re-prompting.
+    pending_request: str | None = None
+
     while True:
-        try:
-            raw_input = prompt_session.prompt(
-                _chat_prompt(state, settings=settings, plan_only=plan_only)
-            )
-        except KeyboardInterrupt:
-            console.print(
-                Text("Input cancelled. Use /exit or Ctrl-D to leave the session.", style="dim")
-            )
-            continue
-        except EOFError:
-            console.print(Text("Interactive chat closed.", style="dim"))
-            return
+        if pending_request is not None:
+            raw_input = pending_request
+            pending_request = None
+            console.print(Text(f"↪ Continuing: {raw_input.splitlines()[0]}", style="dim"))
+        else:
+            try:
+                raw_input = prompt_session.prompt(
+                    _chat_prompt(state, settings=settings, plan_only=plan_only)
+                )
+            except KeyboardInterrupt:
+                console.print(
+                    Text(
+                        "Input cancelled. Use /exit or Ctrl-D to leave the session.",
+                        style="dim",
+                    )
+                )
+                continue
+            except EOFError:
+                console.print(Text("Interactive chat closed.", style="dim"))
+                return
 
         text = raw_input.strip()
         if not text:
@@ -1742,6 +1815,9 @@ def _run_interactive_chat(
             user_message=text,
             result=result,
         )
+
+        if result.gap_handoff is not None:
+            pending_request = _handle_gap_handoff(result.gap_handoff, settings=settings)
 
 
 def _parse_env_overlays(values: list[str]) -> dict[str, str]:
@@ -2250,6 +2326,24 @@ def _build_chat_turn_presentation(
         if iteration_notice is not None and iteration_notice.text not in seen_messages:
             notices.append(iteration_notice)
             seen_messages.add(iteration_notice.text)
+
+    # One-shot/non-TTY runs can't prompt for a gap-handoff choice, so surface the
+    # options and the report link inline. Interactive runs handle this via a prompt.
+    if result.gap_handoff is not None and not interactive:
+        handoff = result.gap_handoff
+        option_lines = "\n".join(
+            f"  {index}. {option.label}"
+            for index, option in enumerate(handoff.options, start=1)
+        )
+        gap_text = (
+            f"What you can do:\n{option_lines}\n"
+            f"To report it so it can be fixed, file: {build_issue_url(handoff.report)}"
+        )
+        if gap_text not in seen_messages:
+            notices.append(
+                ChatNotice(level=PresentationNoticeLevel.WARNING, text=gap_text)
+            )
+            seen_messages.add(gap_text)
 
     for execution_result in result.execution_results:
         artifact_notice = _artifact_preview_notice(execution_result)

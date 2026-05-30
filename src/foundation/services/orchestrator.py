@@ -46,6 +46,7 @@ from foundation.models import (
 from foundation.models.git import GitServiceError, GitStatusRequest
 from foundation.models.trace import TraceEdge, TraceEdgeKind
 from foundation.observability import (
+    EVENT_CAPABILITY_GAP,
     EVENT_EXCEPTION,
     EVENT_ITERATION_COMPLETED,
     EVENT_ITERATION_STARTED,
@@ -60,6 +61,7 @@ from foundation.services.approval import ApprovalService
 from foundation.services.capabilities import CapabilityRegistry, CapabilityStore
 from foundation.services.executor import ActionExecutor
 from foundation.services.file_service import FileService
+from foundation.services.gap_handoff import build_gap_handoff
 from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
@@ -1133,12 +1135,35 @@ class RequestOrchestrator:
         all_results = [r for it in iterations for r in it.execution_results]
 
         had_fatal_failure = any(self._is_fatal_result(r) for r in all_results)
-        msg_content = self._augment_message_with_stop_reason(
-            terminal_plan.assistant_message,
-            stop_reason,
-            cumulative_changed_paths=cumulative_changed_paths,
-            had_fatal=had_fatal_failure,
+
+        # When the loop is structurally stuck (missing capability, bad path, or
+        # no progress), reframe the raw failure as a graceful capability-gap
+        # handoff: the chat surface shows a plain-language message and options
+        # instead of an error. The underlying failure stays in execution_results
+        # and is recorded to the trace + event log via EVENT_CAPABILITY_GAP.
+        gap_handoff = build_gap_handoff(
+            request=request.message,
+            stop_reason=stop_reason,
+            results=all_results,
+            iteration=len(iterations),
+            had_cumulative_changes=bool(cumulative_changed_paths),
         )
+        if gap_handoff is not None:
+            msg_content = gap_handoff.message
+            self._observer.emit(
+                EVENT_CAPABILITY_GAP,
+                payload=gap_handoff.report.model_dump(mode="json"),
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+                level=logging.WARNING,
+            )
+        else:
+            msg_content = self._augment_message_with_stop_reason(
+                terminal_plan.assistant_message,
+                stop_reason,
+                cumulative_changed_paths=cumulative_changed_paths,
+                had_fatal=had_fatal_failure,
+            )
         assistant_message = AssistantMessage(content=msg_content)
 
         verification_notice = self._build_verification_notice(
@@ -1174,6 +1199,7 @@ class RequestOrchestrator:
             stop_reason=stop_reason,
             verification_notice=verification_notice,
             governance_notice=governance_notice,
+            gap_handoff=gap_handoff,
         )
 
     # ------------------------------------------------------------------

@@ -46,6 +46,7 @@ EVENT_EXCEPTION = "exception"
 EVENT_RETRY = "retry"
 EVENT_ITERATION_STARTED = "iteration_started"
 EVENT_ITERATION_COMPLETED = "iteration_completed"
+EVENT_CAPABILITY_GAP = "capability_gap"
 
 _SENSITIVE_KEY_HINTS = {
     "api_key",
