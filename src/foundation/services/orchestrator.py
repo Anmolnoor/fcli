@@ -61,7 +61,7 @@ from foundation.services.approval import ApprovalService
 from foundation.services.capabilities import CapabilityRegistry, CapabilityStore
 from foundation.services.executor import ActionExecutor
 from foundation.services.file_service import FileService
-from foundation.services.gap_handoff import build_gap_handoff
+from foundation.services.gap_handoff import build_gap_handoff, make_provider_phraser
 from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
@@ -1147,6 +1147,7 @@ class RequestOrchestrator:
             results=all_results,
             iteration=len(iterations),
             had_cumulative_changes=bool(cumulative_changed_paths),
+            phraser=make_provider_phraser(self._provider),
         )
         if gap_handoff is not None:
             msg_content = gap_handoff.message

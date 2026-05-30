@@ -1336,6 +1336,40 @@ def test_fatal_failure_reframed_as_capability_gap_handoff(
     assert GapOptionKind.STOP in option_kinds
 
 
+def test_capability_gap_message_is_model_phrased(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the fatal plan, the provider's text reply phrases the gap message."""
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Running nonexistent.",
+                    "actions": [
+                        {
+                            "id": "spawn_fail",
+                            "kind": "shell",
+                            "summary": "Run a nonexistent binary",
+                            "shell": {"command": "nonexistent_binary_xyz"},
+                        }
+                    ],
+                }
+            ),
+            _text_response("That tool isn't wired into fcli yet, so I couldn't run it."),
+        ]
+    )
+    orchestrator, _runtime, _workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="run nonexistent"))
+
+    assert result.gap_handoff is not None
+    assert result.gap_handoff.message == (
+        "That tool isn't wired into fcli yet, so I couldn't run it."
+    )
+    assert result.assistant_message.content == result.gap_handoff.message
+
+
 def test_max_iteration_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

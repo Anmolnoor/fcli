@@ -10,12 +10,39 @@ from foundation.models import (
     ExecutionStatus,
     GapOptionKind,
     LoopStopReason,
+    ProviderResponse,
+    ProviderResponseMetadata,
 )
 from foundation.services.gap_handoff import (
     build_gap_handoff,
     build_issue_url,
+    make_provider_phraser,
     write_gap_report,
 )
+from foundation.services.provider import ProviderError
+
+
+class _StubProvider:
+    """Minimal provider stub: returns a queued text body, or raises."""
+
+    def __init__(self, *, body: str | None = None, error: bool = False) -> None:
+        self._body = body
+        self._error = error
+        self.calls = 0
+
+    def complete(self, _prompt):  # noqa: ANN001 - test stub
+        self.calls += 1
+        if self._error:
+            raise ProviderError("boom")
+        return ProviderResponse(
+            content=self._body,
+            structured_output=None,
+            metadata=ProviderResponseMetadata(
+                provider="stub",
+                model="stub-model",
+                latency_seconds=0.01,
+            ),
+        )
 
 
 def _failed(error: str, action_id: str = "a1") -> ExecutionResult:
@@ -130,6 +157,63 @@ def test_issue_url_is_prefilled_and_labeled() -> None:
     assert url.startswith("https://github.com/Anmolnoor/fcli/issues/new?")
     assert "labels=capability-gap" in url
     assert "title=" in url and "body=" in url
+
+
+def test_phraser_overrides_message_but_keeps_options_and_report() -> None:
+    handoff = build_gap_handoff(
+        request="store this in a database",
+        stop_reason=LoopStopReason.FATAL_EXECUTION_FAILURE,
+        results=[_failed("unsupported capability: foundation.db.write")],
+        iteration=1,
+        had_cumulative_changes=False,
+        phraser=lambda kind, request, detail, fallback: "A clearer, friendlier explanation.",
+    )
+    assert handoff is not None
+    assert handoff.message == "A clearer, friendlier explanation."
+    # Structure stays deterministic.
+    assert handoff.report.detail == "foundation.db.write"
+    assert {o.kind for o in handoff.options} >= {GapOptionKind.REPORT, GapOptionKind.STOP}
+
+
+def test_phraser_returning_none_falls_back_to_template() -> None:
+    handoff = build_gap_handoff(
+        request="store this in a database",
+        stop_reason=LoopStopReason.FATAL_EXECUTION_FAILURE,
+        results=[_failed("unsupported capability: foundation.db.write")],
+        iteration=1,
+        had_cumulative_changes=False,
+        phraser=lambda *_args: None,
+    )
+    assert handoff is not None
+    assert "couldn't finish" in handoff.message.lower()
+
+
+def test_make_provider_phraser_returns_sanitized_prose() -> None:
+    provider = _StubProvider(body="  That data store isn't wired up in fcli yet.\n")
+    phraser = make_provider_phraser(provider)
+    result = phraser(CapabilityGapKind.MISSING_CAPABILITY, "save to db", "foundation.db.write", "x")
+    assert result == "That data store isn't wired up in fcli yet."
+    assert provider.calls == 1
+
+
+def test_make_provider_phraser_rejects_json_like_output() -> None:
+    provider = _StubProvider(body='{"assistant_message": "Done.", "actions": []}')
+    phraser = make_provider_phraser(provider)
+    assert phraser(CapabilityGapKind.MISSING_CAPABILITY, "r", "d", "fallback") is None
+
+
+def test_make_provider_phraser_handles_provider_error() -> None:
+    phraser = make_provider_phraser(_StubProvider(error=True))
+    assert phraser(CapabilityGapKind.STUCK_NO_PROGRESS, "r", "", "fallback") is None
+
+
+def test_make_provider_phraser_truncates_overlong_output() -> None:
+    provider = _StubProvider(body="word " * 200)
+    phraser = make_provider_phraser(provider)
+    result = phraser(CapabilityGapKind.UNKNOWN, "r", "", "fallback")
+    assert result is not None
+    assert len(result) <= 401  # _MAX_PHRASED_CHARS + ellipsis
+    assert result.endswith("…")
 
 
 def test_write_gap_report_round_trips(tmp_path) -> None:
