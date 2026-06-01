@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
@@ -56,6 +57,9 @@ _SHELL_EQUIVALENT_COMMANDS = {
     "grep": "foundation.search",
     "printf": "foundation.file.write or foundation.file.edit",
 }
+_FILE_WRITE_NOTE_KEY = "_file_write_note"
+_CONTENT_BRIEF_PREFIX = "content_brief:"
+_GH_API_UNSUPPORTED_FLAGS = frozenset({"-r"})
 
 
 class PlanningError(RuntimeError):
@@ -190,7 +194,8 @@ class PlannerService:
                 break
 
             try:
-                plan = AssistantPlan.model_validate(response.structured_output)
+                structured_output = self._normalize_plan_payload(response.structured_output)
+                plan = AssistantPlan.model_validate(structured_output)
                 self._validate_supported_actions(
                     plan,
                     request=request,
@@ -248,11 +253,11 @@ class PlannerService:
                     "tool_call": {
                         "capability_id": "foundation.search",
                         "version": "1.0.0 | null",
-                        "arguments": "tool-specific JSON object",
-                        "_file_write_note": (
-                            "for foundation.file.write use {path, content} for tiny "
-                            "files, or {path, content_brief} (NOT content) for "
-                            "anything longer — the body is generated separately"
+                        "arguments": (
+                            "tool-specific JSON object; for foundation.file.write use "
+                            "{path, content} for tiny files, or {path, content_brief} "
+                            "(NOT content) for anything longer — the body is generated "
+                            "separately"
                         ),
                     },
                 }
@@ -348,6 +353,58 @@ class PlannerService:
             ProviderMessage(role=ProviderMessageRole.USER, content=user_content),
         ]
 
+    @staticmethod
+    def _normalize_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        actions = payload.get("actions")
+        if not isinstance(actions, list):
+            return payload
+
+        normalized_actions: list[Any] = []
+        changed = False
+        for action in actions:
+            if not isinstance(action, dict):
+                normalized_actions.append(action)
+                continue
+
+            tool_call = action.get("tool_call")
+            if not isinstance(tool_call, dict) or _FILE_WRITE_NOTE_KEY not in tool_call:
+                normalized_actions.append(action)
+                continue
+            if tool_call.get("capability_id") != "foundation.file.write":
+                normalized_actions.append(action)
+                continue
+            arguments = tool_call.get("arguments")
+            note = tool_call.get(_FILE_WRITE_NOTE_KEY)
+            if not isinstance(arguments, dict) or not isinstance(note, str):
+                normalized_actions.append(action)
+                continue
+
+            brief = PlannerService._content_brief_from_file_write_note(note)
+            has_body = bool(arguments.get("content") or arguments.get("content_brief"))
+            if not brief and not has_body:
+                normalized_actions.append(action)
+                continue
+
+            normalized_tool_call = dict(tool_call)
+            normalized_tool_call.pop(_FILE_WRITE_NOTE_KEY)
+            changed = True
+
+            if brief and not has_body:
+                normalized_tool_call["arguments"] = {**arguments, "content_brief": brief}
+
+            normalized_actions.append({**action, "tool_call": normalized_tool_call})
+
+        if not changed:
+            return payload
+        return {**payload, "actions": normalized_actions}
+
+    @staticmethod
+    def _content_brief_from_file_write_note(note: str) -> str:
+        stripped = note.strip()
+        if stripped.lower().startswith(_CONTENT_BRIEF_PREFIX):
+            return stripped[len(_CONTENT_BRIEF_PREFIX) :].strip()
+        return stripped
+
     def _repair_messages(
         self,
         validation_feedback: str,
@@ -400,6 +457,16 @@ class PlannerService:
                         f"Shell action {action.id!r} must split the executable and args."
                     )
                 shell_command = action.shell.command.split("/")[-1]
+                if (
+                    shell_command == "gh"
+                    and action.shell.args[:1] == ["api"]
+                    and any(arg in _GH_API_UNSUPPORTED_FLAGS for arg in action.shell.args[1:])
+                ):
+                    raise PlanningError(
+                        f"Shell action {action.id!r} uses `gh api`, which does not "
+                        "support `-r`. Put raw-output behavior inside the jq "
+                        "expression or decode the output with an explicit shell."
+                    )
                 if shell_command in _SHELL_EQUIVALENT_COMMANDS:
                     equivalent = _SHELL_EQUIVALENT_COMMANDS[shell_command]
                     raise PlanningError(
@@ -494,8 +561,7 @@ class PlannerService:
             has_brief = bool(arguments.get("content_brief"))
             if has_content and has_brief:
                 raise PlanningError(
-                    "foundation.file.write must provide either content or "
-                    "content_brief, not both."
+                    "foundation.file.write must provide either content or content_brief, not both."
                 )
             if has_brief:
                 FileWriteBriefRequest.model_validate(arguments)

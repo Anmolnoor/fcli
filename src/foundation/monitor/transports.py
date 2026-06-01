@@ -26,6 +26,7 @@ import threading
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 
 from foundation.monitor.protocol import EVENT_SCHEMA_VERSION
@@ -70,7 +71,12 @@ class UnixSocketTransport:
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def start(self) -> None:
@@ -239,7 +245,12 @@ class LocalHttpSseTransport:
         self.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def start(self) -> None:
@@ -279,7 +290,7 @@ class LocalHttpSseTransport:
             thread.join(timeout=1.0)
 
 
-def _make_sse_handler(server: MonitorServer, token: str):
+def _make_sse_handler(server: MonitorServer, token: str) -> type[BaseHTTPRequestHandler]:
     class _Handler(BaseHTTPRequestHandler):
         # Suppress the noisy default logging.
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002, ARG002

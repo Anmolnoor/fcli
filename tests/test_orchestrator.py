@@ -297,6 +297,49 @@ def test_orchestrator_retries_invalid_plans_without_duplicate_shell_execution(
     assert result.execution_results[0].artifact["stdout"] == f"{workspace_root}\n"
 
 
+def test_orchestrator_rejects_gh_api_raw_flag_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Fetching README.",
+                    "actions": [
+                        {
+                            "id": "fetch_readme",
+                            "kind": "shell",
+                            "summary": "Fetch README",
+                            "shell": {
+                                "command": "gh",
+                                "args": [
+                                    "api",
+                                    "repos/anmolnoor/anmolnoor/readme",
+                                    "--jq",
+                                    ".content",
+                                    "-r",
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Corrected.", "actions": []}),
+        ]
+    )
+    orchestrator, runtime, _workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="fetch my GitHub README"))
+
+    assert runtime.calls == 0
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert len(provider.calls) == 2
+    repair_text = "\n".join(message.content for message in provider.calls[1].messages)
+    assert "gh api" in repair_text
+    assert "does not support `-r`" in repair_text
+
+
 def test_orchestrator_recovers_from_truncated_plan_with_content_brief_hint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -379,6 +422,48 @@ def test_orchestrator_materializes_content_brief_via_text_call(
     assert any(r.status is ExecutionStatus.EXECUTED for r in result.execution_results)
 
 
+def test_orchestrator_recovers_file_write_note_as_content_brief(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "# README Summary\n\n- Foundation CLI\n- Beekeeper\n"
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing the summary.",
+                    "actions": [
+                        {
+                            "id": "write_summary",
+                            "kind": "tool_call",
+                            "summary": "Write the summary",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "res/github-readme-summary.md",
+                                    "overwrite": True,
+                                },
+                                "_file_write_note": (
+                                    "content_brief: Markdown file containing extracted "
+                                    "sections from the GitHub README"
+                                ),
+                            },
+                        }
+                    ],
+                }
+            ),
+            _text_response(body),
+        ]
+    )
+    orchestrator, _, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="summarize my GitHub README"))
+
+    assert (workspace_root / "res/github-readme-summary.md").read_text(encoding="utf-8") == body
+    assert provider.calls[1].response_format is ProviderResponseFormat.TEXT
+    assert any(r.status is ExecutionStatus.EXECUTED for r in result.execution_results)
+
+
 def test_orchestrator_deferred_write_failure_degrades_to_failed_action(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -414,9 +499,7 @@ def test_orchestrator_deferred_write_failure_degrades_to_failed_action(
             if len(self.calls) == 1:
                 return plan
             if len(self.calls) == 2:
-                raise ProviderError(
-                    "body truncated", code=ProviderErrorCode.TRUNCATED
-                )
+                raise ProviderError("body truncated", code=ProviderErrorCode.TRUNCATED)
             return _provider_response({"assistant_message": "Done.", "actions": []})
 
     provider = _PlanThenFailBody()
@@ -459,9 +542,7 @@ def test_orchestrator_question_answer_flows_to_next_iteration(
         asked.append(question.prompt)
         return "json"
 
-    orchestrator, _, _ = _orchestrator(
-        tmp_path, monkeypatch, provider, question_callback=callback
-    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider, question_callback=callback)
 
     result = orchestrator.orchestrate(UserRequest(message="export the data"))
 
@@ -500,9 +581,7 @@ def test_orchestrator_question_without_callback_stops_awaiting_input(
     result = orchestrator.orchestrate(UserRequest(message="export the data"))
 
     assert result.stop_reason is LoopStopReason.AWAITING_USER_INPUT
-    assert any(
-        r.status is ExecutionStatus.AWAITING_INPUT for r in result.execution_results
-    )
+    assert any(r.status is ExecutionStatus.AWAITING_INPUT for r in result.execution_results)
 
 
 def _read_action(action_id: str, path: str) -> dict[str, Any]:
@@ -547,9 +626,7 @@ def test_orchestrator_out_of_scope_read_escalation_grants_session(
         prompts.append(question.prompt)
         return "Allow for this session"
 
-    orchestrator, _, _ = _orchestrator(
-        tmp_path, monkeypatch, provider, question_callback=callback
-    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider, question_callback=callback)
 
     result = orchestrator.orchestrate(UserRequest(message="read the external secret"))
 
@@ -588,16 +665,13 @@ def test_orchestrator_out_of_scope_read_escalation_deny_blocks(
     def callback(_question: QuestionAction) -> str:
         return "Deny"
 
-    orchestrator, _, _ = _orchestrator(
-        tmp_path, monkeypatch, provider, question_callback=callback
-    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider, question_callback=callback)
 
     result = orchestrator.orchestrate(UserRequest(message="read the external secret"))
 
     assert any(r.status is ExecutionStatus.BLOCKED for r in result.execution_results)
     assert not any(
-        r.artifact_type is ExecutionArtifactType.FILE_READ
-        and r.status is ExecutionStatus.EXECUTED
+        r.artifact_type is ExecutionArtifactType.FILE_READ and r.status is ExecutionStatus.EXECUTED
         for r in result.execution_results
     )
 
@@ -636,9 +710,7 @@ def test_orchestrator_out_of_scope_write_stays_blocked(
         prompts.append(question.prompt)
         return "Allow for this session"
 
-    orchestrator, _, _ = _orchestrator(
-        tmp_path, monkeypatch, provider, question_callback=callback
-    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider, question_callback=callback)
 
     result = orchestrator.orchestrate(UserRequest(message="write outside"))
 
@@ -1513,6 +1585,164 @@ def test_no_progress_detection(
     # handoff, so the user sees a graceful message rather than the raw suffix.
     assert result.gap_handoff is not None
     assert "[Loop stopped:" not in result.assistant_message.content
+
+
+def test_command_usage_error_adds_repair_instruction_to_next_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Fetching README.",
+                    "actions": [
+                        {
+                            "id": "readme",
+                            "kind": "shell",
+                            "summary": "Fetch README",
+                            "shell": {
+                                "command": "git",
+                                "args": [
+                                    "status",
+                                    "-r",
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Stopped.", "actions": []}),
+        ]
+    )
+    orchestrator, _runtime, _workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        scripts={
+            "git": """
+                import sys
+                print("unknown shorthand flag: 'r' in -r", file=sys.stderr)
+                print("Usage: git status [options]", file=sys.stderr)
+                raise SystemExit(1)
+            """,
+        },
+    )
+
+    orchestrator.orchestrate(UserRequest(message="fetch the README"))
+
+    second_prompt = "\n".join(message.content for message in provider.calls[1].messages)
+    assert "previous command failed because its argv is invalid" in second_prompt
+    assert "Do not repeat it" in second_prompt
+    assert "git status -r" in second_prompt
+    assert "unknown shorthand flag: 'r' in -r" in second_prompt
+
+
+def test_repeated_command_usage_error_preserves_stderr_in_final_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fail_response = _provider_response(
+        {
+            "assistant_message": "Trying git status.",
+            "actions": [
+                {
+                    "id": "bad_status",
+                    "kind": "shell",
+                    "summary": "Run git status",
+                    "shell": {"command": "git", "args": ["status", "-r"]},
+                }
+            ],
+        }
+    )
+    provider = StubProvider([fail_response, fail_response])
+    orchestrator, _runtime, _workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        scripts={
+            "git": """
+                import sys
+                print("unknown shorthand flag: 'r' in -r", file=sys.stderr)
+                print("Usage: git status [options]", file=sys.stderr)
+                raise SystemExit(1)
+            """,
+        },
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="run git status"))
+
+    assert result.stop_reason is LoopStopReason.NO_PROGRESS
+    assert result.gap_handoff is None
+    assert "command invocation error" in result.assistant_message.content
+    assert "git status -r" in result.assistant_message.content
+    assert "unknown shorthand flag: 'r' in -r" in result.assistant_message.content
+    assert "capability" not in result.assistant_message.content.lower()
+
+
+def test_recovered_command_usage_error_does_not_pollute_success_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Trying git status.",
+                    "actions": [
+                        {
+                            "id": "bad_status",
+                            "kind": "shell",
+                            "summary": "Run git status",
+                            "shell": {"command": "git", "args": ["status", "-r"]},
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Writing the result.",
+                    "actions": [
+                        {
+                            "id": "write_result",
+                            "kind": "tool_call",
+                            "summary": "Write the result",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "result.txt",
+                                    "content": "done\n",
+                                    "overwrite": True,
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Done.", "actions": []}),
+        ]
+    )
+    orchestrator, _runtime, workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        scripts={
+            "git": """
+                import sys
+                print("unknown shorthand flag: 'r' in -r", file=sys.stderr)
+                print("Usage: git status [options]", file=sys.stderr)
+                raise SystemExit(1)
+            """,
+        },
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="recover and finish"))
+
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert (workspace_root / "result.txt").read_text(encoding="utf-8") == "done\n"
+    assert result.assistant_message.content == "Done."
+    assert "command invocation error" not in result.assistant_message.content
+    assert "unknown shorthand flag" not in result.assistant_message.content
 
 
 def test_observation_block_in_provider_messages(
@@ -3079,8 +3309,7 @@ def test_orchestrator_not_found_surfaces_siblings_for_self_correction(
     assert "right-name.md" in second_plan_text
     # The corrected read then succeeded.
     assert any(
-        r.status is ExecutionStatus.EXECUTED
-        and r.artifact_type is ExecutionArtifactType.FILE_READ
+        r.status is ExecutionStatus.EXECUTED and r.artifact_type is ExecutionArtifactType.FILE_READ
         for r in result.execution_results
     )
 
@@ -3133,9 +3362,46 @@ def test_orchestrator_surfaces_file_read_content_to_next_iteration(
     # The read succeeded AND its content reached the planner's next iteration —
     # previously the observation was blank and the model re-read forever.
     assert any(
-        r.status is ExecutionStatus.EXECUTED
-        and r.artifact_type is ExecutionArtifactType.FILE_READ
+        r.status is ExecutionStatus.EXECUTED and r.artifact_type is ExecutionArtifactType.FILE_READ
         for r in result.execution_results
     )
     second_plan_text = "\n".join(m.content for m in provider.calls[1].messages)
     assert "SECRET-CONTENT-12345" in second_plan_text
+
+
+def test_repeated_successful_file_read_stops_as_no_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_response_1 = _provider_response(
+        {
+            "assistant_message": "Reading the note.",
+            "actions": [_read_action("read_note_1", "note.txt")],
+        }
+    )
+    read_response_2 = _provider_response(
+        {
+            "assistant_message": "Reading the note again.",
+            "actions": [_read_action("read_note_2", "note.txt")],
+        }
+    )
+    read_response_3 = _provider_response(
+        {
+            "assistant_message": "Reading the note yet again.",
+            "actions": [_read_action("read_note_3", "note.txt")],
+        }
+    )
+    provider = StubProvider([read_response_1, read_response_2, read_response_3])
+    orchestrator, _, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+    (workspace_root / "note.txt").write_text("SECRET-CONTENT-12345\n", encoding="utf-8")
+
+    result = orchestrator.orchestrate(UserRequest(message="read note.txt"))
+
+    assert result.stop_reason is LoopStopReason.NO_PROGRESS
+    assert len(result.iterations) == 2
+    plan_calls = [
+        call
+        for call in provider.calls
+        if call.response_format is ProviderResponseFormat.JSON_OBJECT
+    ]
+    assert len(plan_calls) == 2

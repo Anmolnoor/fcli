@@ -546,7 +546,7 @@ def _prompt_for_question(question: QuestionAction) -> str | None:
     try:
         console.print(Panel.fit("\n".join(lines), title="Question"))
         try:
-            raw = typer.prompt("Your answer")
+            raw = str(typer.prompt("Your answer"))
         except (EOFError, click.exceptions.Abort):
             return None
         answer = raw.strip()
@@ -1395,7 +1395,7 @@ def _run_orchestrate_with_sinks(
                 finally:
                     _attach_sink(None)
 
-            result_box: dict[str, Any] = {}
+            result_box: dict[str, OrchestrationResult | BaseException] = {}
 
             def worker() -> None:
                 try:
@@ -1416,9 +1416,13 @@ def _run_orchestrate_with_sinks(
                 finally:
                     _attach_sink(None)
 
-        if "error" in result_box:
-            raise result_box["error"]
-        return result_box["result"]
+        error = result_box.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        result = result_box.get("result")
+        if isinstance(result, OrchestrationResult):
+            return result
+        raise RuntimeError("Orchestration worker finished without a result.")
     finally:
         for transport in reversed(transport_stack):
             with suppress(Exception):
@@ -2332,17 +2336,14 @@ def _build_chat_turn_presentation(
     if result.gap_handoff is not None and not interactive:
         handoff = result.gap_handoff
         option_lines = "\n".join(
-            f"  {index}. {option.label}"
-            for index, option in enumerate(handoff.options, start=1)
+            f"  {index}. {option.label}" for index, option in enumerate(handoff.options, start=1)
         )
         gap_text = (
             f"What you can do:\n{option_lines}\n"
             f"To report it so it can be fixed, file: {build_issue_url(handoff.report)}"
         )
         if gap_text not in seen_messages:
-            notices.append(
-                ChatNotice(level=PresentationNoticeLevel.WARNING, text=gap_text)
-            )
+            notices.append(ChatNotice(level=PresentationNoticeLevel.WARNING, text=gap_text))
             seen_messages.add(gap_text)
 
     for execution_result in result.execution_results:

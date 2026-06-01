@@ -44,12 +44,36 @@ remain inspectable both in concise chat output and the full trace store.
 - **Planner instructions.** Prefer typed file/git capabilities over shell
   mutation commands; shell remains the home of verification runs
   (tests, builds, linters) and environment inspection.
+- **Live turn status.** The inline live renderer now tracks explicit phases
+  and last-event age, so long turns distinguish planning, tool execution,
+  observation, approval/input waits, stale event periods, and terminal states.
 - **Provider hardening.** Ollama adapter only sends `think=true` for Qwen 3.x
   structured-output calls; other thinking models (e.g. `deepseek-v3.2:cloud`)
   are no longer misrouted. Structured-JSON responses no longer fall back to
   the `thinking` field, so reasoning narrative can't be parsed as a plan.
 - **Ollama role mapping.** OpenAI-style `developer` role is mapped to `system`
   before hitting Ollama's chat endpoint.
+
+### Fixed
+
+- **Command usage recovery.** Repeated command invocation errors such as
+  unsupported flags are no longer framed as capability gaps. FCLI now feeds the
+  concrete stderr back to the planner for one repair attempt and, if still
+  unrepaired, shows the failed command and stderr in the final message.
+- **GitHub CLI planning.** Plans using `gh api ... -r` are rejected before
+  approval or execution because `gh api` does not support jq's standalone raw
+  output flag.
+- **Recovered command errors.** An early invalid command no longer pollutes the
+  final assistant message after a later iteration recovers and finishes
+  successfully.
+- **Deferred file writes.** Planner shape hints no longer advertise the
+  internal `_file_write_note` placeholder as a real tool-call field. If a model
+  still returns that older malformed shape, FCLI converts it to
+  `arguments.content_brief` instead of failing the turn during plan repair.
+- **Read-only loop detection.** Repeated successful read/search actions with
+  identical arguments now stop as no-progress instead of growing the planner
+  prompt until the provider fails.
+- **Static quality gates.** Formatting and strict mypy checks are clean again.
 
 ### Migration
 

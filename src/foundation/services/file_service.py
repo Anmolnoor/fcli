@@ -6,6 +6,7 @@ import hashlib
 import re
 import stat
 from pathlib import Path
+from typing import NoReturn
 
 from foundation.models.file import (
     FileApplyDiffRequest,
@@ -35,7 +36,7 @@ def _raise(
     detail: str | None = None,
     path: str | None = None,
     suggestion: str | None = None,
-) -> None:
+) -> NoReturn:
     raise FileServiceError(
         FileOperationError(
             code=code,

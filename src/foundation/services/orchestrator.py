@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import time
 import uuid
 from collections.abc import Callable
@@ -61,7 +62,11 @@ from foundation.services.approval import ApprovalService
 from foundation.services.capabilities import CapabilityRegistry, CapabilityStore
 from foundation.services.executor import ActionExecutor
 from foundation.services.file_service import FileService
-from foundation.services.gap_handoff import build_gap_handoff, make_provider_phraser
+from foundation.services.gap_handoff import (
+    build_gap_handoff,
+    is_recoverable_command_error,
+    make_provider_phraser,
+)
 from foundation.services.git_service import GitService
 from foundation.services.guardrails import GuardrailPolicyEngine
 from foundation.services.history import HistoryStore
@@ -273,8 +278,10 @@ def _unwrap_generated_file_body(text: str) -> str:
         if not isinstance(tool_call, dict):
             continue
         args = tool_call.get("arguments")
-        if isinstance(args, dict) and isinstance(args.get("content"), str):
-            return args["content"]
+        if isinstance(args, dict):
+            content = args.get("content")
+            if isinstance(content, str):
+                return content
     return text
 
 
@@ -364,16 +371,16 @@ def _filter_results_for_detector(
         if result.status is not ExecutionStatus.FAILED:
             filtered.append(result)
             continue
-        action = actions_by_id.get(result.action_id)
-        if action is None:
+        matched_action = actions_by_id.get(result.action_id)
+        if matched_action is None:
             filtered.append(result)
             continue
-        target = _action_target_path(action)
+        target = _action_target_path(matched_action)
         # Probe: read whose path is also a write target this iteration.
         if (
-            action.kind is ActionKind.TOOL_CALL
-            and action.tool_call is not None
-            and action.tool_call.capability_id == "foundation.file.read"
+            matched_action.kind is ActionKind.TOOL_CALL
+            and matched_action.tool_call is not None
+            and matched_action.tool_call.capability_id == "foundation.file.read"
             and target is not None
             and target in write_targets
         ):
@@ -428,11 +435,10 @@ class NoProgressDetector:
     """Detect replanning loops that make no forward progress.
 
     The detector requires ``window`` consecutive identical failure (or
-    action) fingerprints before declaring stuck. v4 stage 03 sets the
-    default to ``2`` to tolerate a single idempotent re-issue. When the
-    caller passes ``cumulative_changed_paths`` and that set is non-empty,
-    the detector never declares stuck — earlier-iteration progress is
-    treated as proof the workspace already moved forward.
+    action) fingerprints without workspace changes before declaring stuck.
+    Successful typed read-only loops are included: if the planner keeps
+    issuing the same file read/search after seeing the result, the turn should
+    stop instead of growing the next planner prompt until the provider fails.
     """
 
     def __init__(self, *, window: int = 2) -> None:
@@ -454,35 +460,58 @@ class NoProgressDetector:
         has_failures = len(failures) > 0
         failure_fp = hashlib.sha256("|".join(failures).encode()).hexdigest()[:16]
 
-        action_sigs = sorted(
-            f"{a.kind}:{a.tool_call.capability_id if a.tool_call else ''}:"
-            f"{a.shell.command if a.shell else ''}"
-            for a in actions
-        )
+        action_sigs = sorted(self._action_signature(action) for action in actions)
         action_fp = hashlib.sha256("|".join(action_sigs).encode()).hexdigest()[:16]
 
         has_changes = len(changed_paths) > 0
         cumulative_has_changes = bool(cumulative_changed_paths)
+        has_readonly_success = any(
+            result.status is ExecutionStatus.EXECUTED
+            and result.artifact_type in _RESULT_PREVIEW_TYPES
+            for result in execution_results
+        )
+        if has_changes:
+            self._failure_fingerprints.clear()
+            self._action_fingerprints.clear()
+            return False
 
-        # Append fingerprints for this iteration up front so window checks
-        # always see a consistent history regardless of the early-return.
         self._failure_fingerprints.append(failure_fp)
         self._action_fingerprints.append(action_fp)
 
-        # Only detect no-progress when this iteration has failures and no
-        # changes, AND the cumulative session hasn't already moved forward.
-        if not has_failures or has_changes or cumulative_has_changes:
-            return False
-
-        if len(self._failure_fingerprints) >= self._window and all(
-            fp == failure_fp for fp in self._failure_fingerprints[-self._window :]
+        if (
+            not cumulative_has_changes
+            and has_failures
+            and len(self._failure_fingerprints) >= self._window
+            and all(fp == failure_fp for fp in self._failure_fingerprints[-self._window :])
         ):
             return True
-        if len(self._action_fingerprints) >= self._window and all(
-            fp == action_fp for fp in self._action_fingerprints[-self._window :]
+        if (
+            has_readonly_success
+            and len(self._action_fingerprints) >= self._window
+            and all(fp == action_fp for fp in self._action_fingerprints[-self._window :])
         ):
             return True
         return False
+
+    @staticmethod
+    def _action_signature(action: PlannedAction) -> str:
+        payload: dict[str, object]
+        if action.kind is ActionKind.SHELL and action.shell is not None:
+            payload = {
+                "kind": action.kind.value,
+                "command": action.shell.command,
+                "args": action.shell.args,
+                "cwd": action.shell.cwd,
+            }
+        elif action.kind is ActionKind.TOOL_CALL and action.tool_call is not None:
+            payload = {
+                "kind": action.kind.value,
+                "capability_id": action.tool_call.capability_id,
+                "arguments": action.tool_call.arguments,
+            }
+        else:
+            payload = {"kind": action.kind.value}
+        return json.dumps(payload, sort_keys=True, default=str)
 
 
 class OrchestrationError(RuntimeError):
@@ -1159,11 +1188,23 @@ class RequestOrchestrator:
                 level=logging.WARNING,
             )
         else:
-            msg_content = self._augment_message_with_stop_reason(
-                terminal_plan.assistant_message,
-                stop_reason,
-                cumulative_changed_paths=cumulative_changed_paths,
-                had_fatal=had_fatal_failure,
+            command_error_message = (
+                self._command_usage_failure_message(
+                    terminal_plan.assistant_message,
+                    iterations,
+                )
+                if stop_reason is LoopStopReason.NO_PROGRESS
+                else None
+            )
+            msg_content = (
+                command_error_message
+                if command_error_message is not None
+                else self._augment_message_with_stop_reason(
+                    terminal_plan.assistant_message,
+                    stop_reason,
+                    cumulative_changed_paths=cumulative_changed_paths,
+                    had_fatal=had_fatal_failure,
+                )
             )
         assistant_message = AssistantMessage(content=msg_content)
 
@@ -1387,9 +1428,11 @@ class RequestOrchestrator:
         observation: IterationObservation,
     ) -> list[ProviderMessage]:
         assistant_content = json.dumps(plan.model_dump(mode="json"), indent=2)
+        repair_notice = RequestOrchestrator._command_usage_repair_notice(plan, observation)
         observation_content = (
             f"EXECUTION OBSERVATION (iteration {observation.iteration}):\n"
             f"{json.dumps(observation.model_dump(mode='json'), indent=2)}\n\n"
+            f"{repair_notice}"
             f"You have {observation.remaining_iterations} iteration(s) and "
             f"{observation.remaining_actions} action(s) remaining.\n"
             "Based on these results, decide your next actions. "
@@ -1400,6 +1443,58 @@ class RequestOrchestrator:
             ProviderMessage(role=ProviderMessageRole.ASSISTANT, content=assistant_content),
             ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=observation_content),
         ]
+
+    @staticmethod
+    def _command_usage_repair_notice(
+        plan: AssistantPlan,
+        observation: IterationObservation,
+    ) -> str:
+        actions_by_id = {action.id: action for action in plan.actions}
+        for outcome in observation.action_outcomes:
+            error_text = "\n".join(text for text in (outcome.error, outcome.stderr_preview) if text)
+            if not is_recoverable_command_error(error_text):
+                continue
+            action = actions_by_id.get(outcome.action_id)
+            if action is None or action.kind is not ActionKind.SHELL or action.shell is None:
+                continue
+            command = shlex.join([action.shell.command, *action.shell.args])
+            exit_code = f" Exit code: {outcome.exit_code}." if outcome.exit_code is not None else ""
+            stderr = outcome.stderr_preview or outcome.error or ""
+            return (
+                "The previous command failed because its argv is invalid. "
+                "Do not repeat it. Use the stderr and the command's help text "
+                "if needed, then issue a corrected command or explain why it "
+                f"cannot be corrected.\nFailed command: {command}.{exit_code}\n"
+                f"stderr:\n{stderr}\n\n"
+            )
+        return ""
+
+    @staticmethod
+    def _command_usage_failure_message(
+        fallback_message: str,
+        iterations: list[OrchestrationIteration],
+    ) -> str | None:
+        for iteration in reversed(iterations):
+            actions_by_id = {action.id: action for action in iteration.plan.actions}
+            for result in reversed(iteration.execution_results):
+                if not is_recoverable_command_error(result.error):
+                    continue
+                action = actions_by_id.get(result.action_id)
+                if action is None or action.kind is not ActionKind.SHELL or action.shell is None:
+                    continue
+                command = shlex.join([action.shell.command, *action.shell.args])
+                artifact = result.artifact or {}
+                stderr = str(artifact.get("stderr") or result.error or "").strip()
+                exit_code = artifact.get("exit_code")
+                exit_text = f" Exit code: {exit_code}." if exit_code is not None else ""
+                return (
+                    f"{fallback_message}\n\n"
+                    "The run stopped after a repeated command invocation error."
+                    f"{exit_text}\n\n"
+                    f"Failed command:\n  {command}\n\n"
+                    f"stderr:\n{stderr}"
+                )
+        return None
 
     # ------------------------------------------------------------------
     # Result classification helpers

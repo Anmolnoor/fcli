@@ -9,6 +9,7 @@ result panels render as before.
 
 from __future__ import annotations
 
+import enum
 import os
 import queue
 import select
@@ -17,6 +18,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import TracebackType
 from typing import Any
 
 from rich.console import Console, Group, RenderableType
@@ -47,6 +49,21 @@ _DISABLE_ENV = "FOUNDATION_DISABLE_LIVE_UX"
 _REFRESH_PER_SECOND = 8
 _MAX_COMPLETED_DETAIL = 12
 _TOGGLE_KEY = "?"
+_SOFT_STALE_SECONDS = 15.0
+_HARD_STALE_SECONDS = 60.0
+
+
+class LivePhase(enum.Enum):
+    STARTING = "starting"
+    THINKING = "thinking"
+    PLANNING = "planning"
+    RUNNING_TOOL = "running_tool"
+    OBSERVING = "observing"
+    WAITING_APPROVAL = "waiting_approval"
+    WAITING_USER = "waiting_user"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -64,6 +81,10 @@ class TurnLiveState:
 
     request_text: str = ""
     request_id: str | None = None
+    phase: LivePhase = LivePhase.STARTING
+    phase_started_at: float = 0.0
+    last_event_at: float = 0.0
+    last_event_name: str | None = None
     iteration: int = 0
     iteration_started_at: float = 0.0
     planning_started_at: float | None = None
@@ -84,11 +105,14 @@ class TurnLiveState:
     def fold(self, event_name: str, payload: Mapping[str, Any]) -> None:
         """Apply one redacted event to the state."""
         now = time.monotonic()
+        self.last_event_at = now
+        self.last_event_name = event_name
         if event_name == EVENT_USER_REQUEST:
             self.request_text = str(payload.get("request_text") or "")
             self.request_id = payload.get("request_id")
             return
         if event_name == EVENT_SESSION_START:
+            self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_ITERATION_STARTED:
             iteration = payload.get("iteration")
@@ -96,56 +120,74 @@ class TurnLiveState:
                 self.iteration = iteration
                 self.iteration_started_at = now
             self.planning_action_count = None
+            self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_PLAN_STARTED:
             self.planning_started_at = now
+            self._set_phase(LivePhase.PLANNING, now)
             return
         if event_name == EVENT_PLAN_FINISHED:
             self.planning_started_at = None
             count = payload.get("action_count")
             if isinstance(count, int):
                 self.planning_action_count = count
+            self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_TOOL_CALL_STARTED:
             self.current_action_id = str(payload.get("action_id") or "")
             self.current_action_tool = str(payload.get("tool") or "")
             self.current_action_started_at = now
+            self._set_phase(LivePhase.RUNNING_TOOL, now)
             return
         if event_name == EVENT_TOOL_CALL_FINISHED:
             self._close_current(now, outcome="ok")
             self.success_count += 1
+            self._set_phase(LivePhase.OBSERVING, now)
             return
         if event_name == EVENT_TOOL_CALL_FAILED:
             error = payload.get("error")
             self._close_current(now, outcome="failed", error=str(error) if error else None)
             self.failure_count += 1
+            self._set_phase(LivePhase.OBSERVING, now)
             return
         if event_name == EVENT_APPROVAL_REQUESTED:
             self.awaiting_approval = True
             self.approval_summary = (
                 f"approval required for {payload.get('action_id') or '<action>'}"
             )
+            self._set_phase(LivePhase.WAITING_APPROVAL, now)
             return
         if event_name == EVENT_APPROVAL_RESOLVED:
             self.awaiting_approval = False
             self.approval_summary = None
+            self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_QUESTION_ASKED:
             self.awaiting_input = True
             self.question_summary = str(payload.get("prompt") or "a question")
+            self._set_phase(LivePhase.WAITING_USER, now)
             return
         if event_name == EVENT_QUESTION_ANSWERED:
             self.awaiting_input = False
             self.question_summary = None
+            self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_ITERATION_COMPLETED:
+            self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_SESSION_END:
             self.finished = True
             status = payload.get("status")
             if status:
                 self.final_status = str(status)
+            self._set_phase(_terminal_phase(self.final_status), now)
             return
+
+    def _set_phase(self, phase: LivePhase, now: float) -> None:
+        if self.phase is phase:
+            return
+        self.phase = phase
+        self.phase_started_at = now
 
     def _close_current(self, now: float, *, outcome: str, error: str | None = None) -> None:
         if self.current_action_id is None:
@@ -165,6 +207,15 @@ class TurnLiveState:
         self.current_action_started_at = None
 
 
+def _terminal_phase(status: str | None) -> LivePhase:
+    normalized = (status or "").lower()
+    if "cancel" in normalized:
+        return LivePhase.CANCELLED
+    if "fail" in normalized or "error" in normalized:
+        return LivePhase.FAILED
+    return LivePhase.COMPLETED
+
+
 def _format_duration(seconds: float) -> str:
     if seconds < 1.0:
         return f"{seconds * 1000:.0f}ms"
@@ -180,54 +231,104 @@ def _truncate(value: str, *, limit: int) -> str:
     return value[: max(limit - 1, 1)] + "…"
 
 
-def render_status_line(state: TurnLiveState, *, elapsed_seconds: float) -> RenderableType:
+def _stale_status(state: TurnLiveState, *, now: float) -> Text | None:
+    if state.last_event_at <= 0:
+        return None
+    if state.phase in {
+        LivePhase.WAITING_APPROVAL,
+        LivePhase.WAITING_USER,
+        LivePhase.COMPLETED,
+        LivePhase.FAILED,
+        LivePhase.CANCELLED,
+    }:
+        return None
+    age = max(now - state.last_event_at, 0.0)
+    if age >= _HARD_STALE_SECONDS:
+        return Text(
+            f"No live events for {_format_duration(age)} · model may still be running · "
+            "Ctrl-C to cancel",
+            style="yellow",
+        )
+    if age >= _SOFT_STALE_SECONDS:
+        return Text(f"Still waiting on model · no events for {_format_duration(age)}", style="cyan")
+    return None
+
+
+def render_status_line(
+    state: TurnLiveState,
+    *,
+    elapsed_seconds: float,
+    now: float | None = None,
+) -> RenderableType:
     """One-line status (collapsed mode)."""
-    if state.finished:
+    now_value = time.monotonic() if now is None else now
+    if state.finished or state.phase in {
+        LivePhase.COMPLETED,
+        LivePhase.FAILED,
+        LivePhase.CANCELLED,
+    }:
         verb = state.final_status or "done"
-        return Text(f"✓ {verb} · {_format_duration(elapsed_seconds)}", style="green")
-    if state.awaiting_approval:
-        text = Text("⏸ awaiting approval", style="yellow")
+        style = "red" if state.phase is LivePhase.FAILED else "green"
+        return Text(f"✓ {verb} · {_format_duration(elapsed_seconds)}", style=style)
+    stale = _stale_status(state, now=now_value)
+    if stale is not None:
+        return stale
+    if state.awaiting_approval or state.phase is LivePhase.WAITING_APPROVAL:
+        text = Text("Waiting for approval", style="yellow")
         if state.approval_summary:
             text.append(f" · {state.approval_summary}", style="yellow")
         return text
-    if state.awaiting_input:
-        text = Text("⏸ awaiting your answer", style="yellow")
+    if state.awaiting_input or state.phase is LivePhase.WAITING_USER:
+        text = Text("Waiting for your answer", style="yellow")
         if state.question_summary:
             text.append(f" · {state.question_summary}", style="yellow")
         return text
-    if state.current_action_id is not None:
+    if state.current_action_id is not None or state.phase is LivePhase.RUNNING_TOOL:
         action_elapsed = (
-            time.monotonic() - state.current_action_started_at
+            now_value - state.current_action_started_at
             if state.current_action_started_at is not None
             else 0.0
         )
         descriptor = state.current_action_tool or "tool"
         return Text(
-            f"▶ iter {state.iteration} · {descriptor} · {_format_duration(action_elapsed)}",
+            f"Running {descriptor} · iter {state.iteration} · {_format_duration(action_elapsed)}",
             style="cyan",
         )
-    if state.planning_started_at is not None:
-        plan_elapsed = time.monotonic() - state.planning_started_at
+    if state.planning_started_at is not None or state.phase is LivePhase.PLANNING:
+        plan_elapsed = (
+            now_value - state.planning_started_at
+            if state.planning_started_at is not None
+            else elapsed_seconds
+        )
         return Text(
-            f"… planning iteration {state.iteration} · {_format_duration(plan_elapsed)}",
+            f"planning iteration {state.iteration} · {_format_duration(plan_elapsed)}",
+            style="cyan",
+        )
+    if state.phase is LivePhase.OBSERVING:
+        return Text(
+            f"Observing result · iter {state.iteration} · {_format_duration(elapsed_seconds)}",
             style="cyan",
         )
     if state.iteration > 0:
         return Text(
-            f"… iteration {state.iteration} · {_format_duration(elapsed_seconds)}",
+            f"Thinking · iteration {state.iteration} · {_format_duration(elapsed_seconds)}",
             style="cyan",
         )
-    return Text("… starting turn", style="cyan")
+    return Text("Starting turn", style="cyan")
 
 
 def render_detail_panel(state: TurnLiveState, *, elapsed_seconds: float) -> RenderableType:
     """Expanded panel: completed steps + in-flight step."""
+    now = time.monotonic()
     table = Table.grid(padding=(0, 1))
     table.add_column(style="dim", no_wrap=True)
     table.add_column(no_wrap=False)
 
     request = _truncate(state.request_text or "(no request)", limit=80)
     table.add_row("request", request)
+    phase_elapsed = max(now - state.phase_started_at, 0.0) if state.phase_started_at else 0.0
+    table.add_row("phase", f"{state.phase.value} · {_format_duration(phase_elapsed)}")
+    table.add_row("last event", state.last_event_name or "(none)")
     table.add_row(
         "iteration",
         f"{state.iteration} · ok={state.success_count} fail={state.failure_count}",
@@ -253,7 +354,7 @@ def render_detail_panel(state: TurnLiveState, *, elapsed_seconds: float) -> Rend
             )
         table.add_row("steps", body)
 
-    status = render_status_line(state, elapsed_seconds=elapsed_seconds)
+    status = render_status_line(state, elapsed_seconds=elapsed_seconds, now=now)
     table.add_row("now", status)
     table.add_row("press", Text("? to collapse · Ctrl-C to cancel", style="dim"))
 
@@ -355,7 +456,12 @@ class LiveTurnRenderer:
             _active_renderer = self
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         global _active_renderer
         try:
             self._teardown_keypress_reader()

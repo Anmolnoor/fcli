@@ -130,6 +130,17 @@ def test_command_unavailable_classification() -> None:
     assert handoff.kind is CapabilityGapKind.COMMAND_UNAVAILABLE
 
 
+def test_command_usage_error_does_not_build_gap_handoff() -> None:
+    handoff = build_gap_handoff(
+        request="fetch the README",
+        stop_reason=LoopStopReason.NO_PROGRESS,
+        results=[_failed("unknown shorthand flag: 'r' in -r\nUsage: gh api <endpoint>")],
+        iteration=2,
+        had_cumulative_changes=False,
+    )
+    assert handoff is None
+
+
 def test_no_progress_without_error_is_stuck_with_no_alternative() -> None:
     handoff = build_gap_handoff(
         request="make it perfect",

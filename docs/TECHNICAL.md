@@ -6,10 +6,16 @@ Foundation CLI is a local-first, shell-native coding agent that follows an expli
 
 - **Agent entrypoint.** `foundation` starts the interactive shell; `foundation <request>` runs a one-shot turn; admin subcommands (`run`, `tools`, `history`, `trace`, `config`, `doctor`) keep precedence. `foundation chat` remains a strict alias.
 - **Typed file capabilities.** `foundation.file.{read,read_chunk,write,edit,apply_diff}` — atomic writes with sha256 conflict detection, pure-Python unified-diff applier. Planner prefers these over `sed`/`echo`.
+- **Deferred file bodies.** Large `foundation.file.write` plans use `content_brief`; the orchestrator materializes the literal file body through a separate text-generation call, and malformed `_file_write_note` planner output is normalized back to `content_brief`.
 - **Typed git capabilities.** `foundation.git.{status,diff,show,log,stage,unstage,commit}` — workspace-confined, porcelain v2 parsing. Stage / unstage are auto-allowed; `commit` requires approval and never stages implicitly.
 - **Bounded replan loop.** Max 32 planning iterations × 40 actions each × 200 total per user turn. Six stop reasons surface why a turn ended (`zero_action_plan`, `pending_approval`, `fatal_execution_failure`, `max_iterations`, `max_actions`, `no_progress`).
 - **Iteration-aware trace.** Step ids are scoped `planning:{req}:{iter}` and `action:{req}:{iter}:{action_id}`; `REPLANNED_FROM` edges link iterations. Older v2 traces remain inspectable via schema v5 migration.
 - **Concise notices.** Multi-iteration turns summarize with changed-files, commands-run, verification outcome, and approval-required notices. Verification reports PASSED / FAILED / UNAVAILABLE / NOT_ATTEMPTED distinctly so missing binaries aren't misreported as success.
+- **Command error recovery.** Usage-shaped shell failures such as invalid flags are fed back to the planner as repairable command invocation errors, not capability gaps. If the loop still cannot recover, the final response keeps the failed command and stderr visible.
+- **Known shell-shape validation.** `gh api ... -r` is rejected during plan validation because `gh api` does not support jq's standalone raw-output flag; the planner must repair before approval/execution.
+- **Clean success messages after recovery.** If a later iteration recovers from an invalid command and finishes with a zero-action completion, the final assistant message comes from the successful terminal plan instead of appending stale stderr from the earlier failure.
+- **Read-only loop guard.** Repeated no-change actions with the same arguments, including successful file reads/searches, are treated as no-progress so a turn cannot keep re-reading the same data until provider context is exhausted.
+- **Live turn status.** The inline renderer tracks the current phase, last event, and stale event periods so long-running turns show whether FCLI is planning, running a tool, observing, waiting for approval/input, stale, or finished.
 - **Approval boundaries visible.** `foundation doctor` prints risk class, trust tier, and declared side effects for every capability.
 
 ## Requirements

@@ -42,9 +42,7 @@ logger = logging.getLogger("foundation.services.gap_handoff")
 GapMessagePhraser = Callable[[CapabilityGapKind, str, str, str], "str | None"]
 
 # Stop reasons that mean "the agent is stuck", not "work still in progress".
-GAP_STOP_REASONS = frozenset(
-    {LoopStopReason.FATAL_EXECUTION_FAILURE, LoopStopReason.NO_PROGRESS}
-)
+GAP_STOP_REASONS = frozenset({LoopStopReason.FATAL_EXECUTION_FAILURE, LoopStopReason.NO_PROGRESS})
 
 ISSUE_BASE_URL = "https://github.com/Anmolnoor/fcli/issues/new"
 
@@ -54,6 +52,14 @@ _COMMAND_UNAVAILABLE_PATTERNS = (
     "failed to start",
     "could not start command",
     "command not found",
+)
+_COMMAND_USAGE_ERROR_PATTERNS = (
+    "unknown shorthand flag",
+    "unknown option",
+    "unrecognized option",
+    "invalid option",
+    "usage:",
+    "try '--help'",
 )
 
 # Pull a capability id (foundation.x.y) or a quoted/space-delimited path out of
@@ -88,6 +94,8 @@ def build_gap_handoff(
 
     failing = _failing_result(results)
     last_error = failing.error if failing is not None else None
+    if is_recoverable_command_error(last_error):
+        return None
     kind = _classify(stop_reason, last_error)
     detail = _detail_from_error(kind, last_error)
 
@@ -136,6 +144,12 @@ def _classify(stop_reason: LoopStopReason, error: str | None) -> CapabilityGapKi
     if stop_reason is LoopStopReason.NO_PROGRESS:
         return CapabilityGapKind.STUCK_NO_PROGRESS
     return CapabilityGapKind.UNKNOWN
+
+
+def is_recoverable_command_error(error: str | None) -> bool:
+    """Return True for command usage failures the planner may repair."""
+    text = (error or "").lower()
+    return any(pattern in text for pattern in _COMMAND_USAGE_ERROR_PATTERNS)
 
 
 def _detail_from_error(kind: CapabilityGapKind, error: str | None) -> str:
@@ -203,9 +217,7 @@ def _message_and_options(
         return message, [retry, report_option, stop_option]
 
     if kind is CapabilityGapKind.COMMAND_UNAVAILABLE:
-        message = (
-            f"A command this needs isn't available in your environment{suffix}."
-        )
+        message = f"A command this needs isn't available in your environment{suffix}."
         retry = CapabilityGapOption(
             label="Have fcli retry without that command",
             kind=GapOptionKind.ALTERNATIVE,
@@ -251,15 +263,11 @@ _KIND_DESCRIPTIONS = {
     CapabilityGapKind.MISSING_CAPABILITY: (
         "the task needs an ability (capability) that fcli does not have yet"
     ),
-    CapabilityGapKind.PATH_NOT_FOUND: (
-        "a file or path the task depends on does not exist on disk"
-    ),
+    CapabilityGapKind.PATH_NOT_FOUND: ("a file or path the task depends on does not exist on disk"),
     CapabilityGapKind.COMMAND_UNAVAILABLE: (
         "a command-line tool the task needs is not available in this environment"
     ),
-    CapabilityGapKind.STUCK_NO_PROGRESS: (
-        "fcli kept trying but could not make further progress"
-    ),
+    CapabilityGapKind.STUCK_NO_PROGRESS: ("fcli kept trying but could not make further progress"),
     CapabilityGapKind.UNKNOWN: "fcli hit a problem it could not get past",
 }
 
@@ -279,9 +287,7 @@ def make_provider_phraser(provider: ProviderAdapter) -> GapMessagePhraser:
         fallback: str,
     ) -> str | None:
         try:
-            response = provider.complete(
-                _build_phrasing_prompt(kind, request, detail, fallback)
-            )
+            response = provider.complete(_build_phrasing_prompt(kind, request, detail, fallback))
         except ProviderError:
             return None
         except Exception:  # pragma: no cover - defensive on the recovery path
@@ -355,10 +361,7 @@ def build_issue_url(report: CapabilityGapReport) -> str:
     if report.detail:
         title += f": {report.detail}"
     body = build_issue_body(report)
-    return (
-        f"{ISSUE_BASE_URL}?title={quote(title)}"
-        f"&body={quote(body)}&labels=capability-gap"
-    )
+    return f"{ISSUE_BASE_URL}?title={quote(title)}&body={quote(body)}&labels=capability-gap"
 
 
 def gap_report_id(report: CapabilityGapReport) -> str:
