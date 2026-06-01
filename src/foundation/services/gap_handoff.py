@@ -47,7 +47,7 @@ GAP_STOP_REASONS = frozenset({LoopStopReason.FATAL_EXECUTION_FAILURE, LoopStopRe
 ISSUE_BASE_URL = "https://github.com/Anmolnoor/fcli/issues/new"
 
 _MISSING_CAPABILITY_PATTERNS = ("unsupported capability", "invalid_capability")
-_PATH_NOT_FOUND_PATTERNS = ("no such file or directory",)
+_PATH_NOT_FOUND_PATTERNS = ("no such file or directory", "file does not exist")
 _COMMAND_UNAVAILABLE_PATTERNS = (
     "failed to start",
     "could not start command",
@@ -66,6 +66,10 @@ _COMMAND_USAGE_ERROR_PATTERNS = (
 # an error string so the report and message can name the missing piece.
 _CAPABILITY_ID_RE = re.compile(r"(foundation\.[a-z0-9_.]+)", re.IGNORECASE)
 _PATH_RE = re.compile(r"['\"]([^'\"]+)['\"]")
+_FILE_DOES_NOT_EXIST_PATH_RE = re.compile(
+    r"file does not exist:\s*(.*?)(?:\.\s+directory\b|\.$|$)",
+    re.IGNORECASE,
+)
 
 
 def build_gap_handoff(
@@ -161,6 +165,9 @@ def _detail_from_error(kind: CapabilityGapKind, error: str | None) -> str:
             return match.group(1)
     if kind is CapabilityGapKind.PATH_NOT_FOUND:
         match = _PATH_RE.search(error)
+        if match:
+            return match.group(1)
+        match = _FILE_DOES_NOT_EXIST_PATH_RE.search(error)
         if match:
             return match.group(1)
     return ""

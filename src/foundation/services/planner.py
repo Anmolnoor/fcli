@@ -196,6 +196,14 @@ class PlannerService:
             try:
                 structured_output = self._normalize_plan_payload(response.structured_output)
                 plan = AssistantPlan.model_validate(structured_output)
+                prefix_plan = self._plan_with_executable_prefix(plan)
+                if prefix_plan is not None:
+                    self._validate_supported_actions(
+                        prefix_plan,
+                        request=request,
+                        context=context,
+                    )
+                    return prefix_plan, response.metadata
                 self._validate_supported_actions(
                     plan,
                     request=request,
@@ -257,7 +265,7 @@ class PlannerService:
                             "tool-specific JSON object; for foundation.file.write use "
                             "{path, content} for tiny files, or {path, content_brief} "
                             "(NOT content) for anything longer — the body is generated "
-                            "separately"
+                            "separately. Never omit both content and content_brief."
                         ),
                     },
                 }
@@ -293,7 +301,11 @@ class PlannerService:
             "truncated. For anything beyond a few short lines, omit `content` and "
             "instead provide `content_brief`: a concise description of what the file "
             "should contain. The body is generated separately. Use literal `content` "
-            "only for very short files. "
+            "only for very short files. Because `content_brief` bodies are generated "
+            "before the iteration's actions execute, a file.write using `content_brief` "
+            "must be the first action in the plan and must rely only on data already "
+            "available in the prompt/observations. If the body depends on shell/tool "
+            "output, gather that data first and write the file in a later iteration. "
             "Prefer typed git capabilities (foundation.git.*) for repository "
             "inspection and staging. "
             "The git.commit capability requires approval and never stages implicitly. "
@@ -316,7 +328,10 @@ class PlannerService:
             "and pass each argument as a separate string. For example, for "
             "`gh api users/x --jq '.name'` use "
             '`command="gh", args=["api", "users/x", "--jq", ".name"]` — '
-            "no surrounding quotes on the jq expression. "
+            "no surrounding quotes on the jq expression. Shell actions are independent: "
+            "stdout from one shell action is not piped into later shell actions. If a "
+            "pipeline is truly needed, use one explicit shell action such as "
+            '`command="bash", args=["-c", "cmd1 | cmd2"]`, or gather output and replan. '
             "Do not assume command or tool output before execution. "
             "If verification (tests, type checks, linters) fails, diagnose the error and issue "
             "repair actions in the next iteration. "
@@ -405,6 +420,24 @@ class PlannerService:
             return stripped[len(_CONTENT_BRIEF_PREFIX) :].strip()
         return stripped
 
+    @staticmethod
+    def _plan_with_executable_prefix(plan: AssistantPlan) -> AssistantPlan | None:
+        for action_index, action in enumerate(plan.actions):
+            if action_index == 0:
+                continue
+            if action.kind is not ActionKind.TOOL_CALL or action.tool_call is None:
+                continue
+            if action.tool_call.capability_id != "foundation.file.write":
+                continue
+            arguments = action.tool_call.arguments
+            has_content = "content" in arguments
+            has_brief = "content_brief" in arguments
+            body_is_generated_too_early = has_brief and not has_content
+            body_is_missing = not has_content and not has_brief
+            if body_is_generated_too_early or body_is_missing:
+                return plan.model_copy(update={"actions": plan.actions[:action_index]})
+        return None
+
     def _repair_messages(
         self,
         validation_feedback: str,
@@ -449,7 +482,7 @@ class PlannerService:
                 "approval and git context still shows staged changes. Plan "
                 "foundation.git.commit with requires_approval=true."
             )
-        for action in plan.actions:
+        for action_index, action in enumerate(plan.actions):
             if action.kind is ActionKind.SHELL:
                 assert action.shell is not None
                 if any(character.isspace() for character in action.shell.command):
@@ -475,6 +508,17 @@ class PlannerService:
                     )
             if action.kind is ActionKind.TOOL_CALL:
                 assert action.tool_call is not None
+                if (
+                    action.tool_call.capability_id == "foundation.file.write"
+                    and bool(action.tool_call.arguments.get("content_brief"))
+                    and action_index > 0
+                ):
+                    raise PlanningError(
+                        "foundation.file.write with content_brief cannot follow earlier "
+                        "actions in the same plan because the body is generated before "
+                        "actions run. First run data-gathering actions, then write in "
+                        "the next iteration using observations."
+                    )
                 if (
                     action.tool_call.capability_id == "foundation.git.commit"
                     and not action.requires_approval
@@ -557,11 +601,15 @@ class PlannerService:
             ShellAction.model_validate(arguments)
             return
         if endpoint == "builtin.file.write":
-            has_content = bool(arguments.get("content"))
-            has_brief = bool(arguments.get("content_brief"))
+            has_content = "content" in arguments
+            has_brief = "content_brief" in arguments
             if has_content and has_brief:
                 raise PlanningError(
                     "foundation.file.write must provide either content or content_brief, not both."
+                )
+            if not has_content and not has_brief:
+                raise PlanningError(
+                    "foundation.file.write must provide either content or content_brief."
                 )
             if has_brief:
                 FileWriteBriefRequest.model_validate(arguments)

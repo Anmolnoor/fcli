@@ -422,6 +422,207 @@ def test_orchestrator_materializes_content_brief_via_text_call(
     assert any(r.status is ExecutionStatus.EXECUTED for r in result.execution_results)
 
 
+def test_content_brief_after_prior_action_is_replanned_before_body_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Fetch then write.",
+                    "actions": [
+                        {
+                            "id": "fetch",
+                            "kind": "shell",
+                            "summary": "Fetch source data",
+                            "shell": {"command": "fetch-data", "args": []},
+                        },
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write the report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "content_brief": "a report based on fetched data",
+                                },
+                            },
+                        },
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Writing report.",
+                    "actions": [
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write the report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "content": "# Report from SOURCE-DATA\n",
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Done.", "actions": []}),
+        ]
+    )
+    orchestrator, runtime, _workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        scripts={"fetch-data": "print('SOURCE-DATA')"},
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="fetch data and write report"))
+
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert runtime.calls == 1
+    assert provider.calls[1].response_format is ProviderResponseFormat.JSON_OBJECT
+    assert all(call.response_format is not ProviderResponseFormat.TEXT for call in provider.calls)
+    assert [action.id for action in result.iterations[0].plan.actions] == ["fetch"]
+    assert (_workspace_root / "report.md").read_text(encoding="utf-8") == (
+        "# Report from SOURCE-DATA\n"
+    )
+
+
+def test_file_write_without_content_after_prior_action_keeps_valid_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Fetch then write.",
+                    "actions": [
+                        {
+                            "id": "fetch",
+                            "kind": "shell",
+                            "summary": "Fetch source data",
+                            "shell": {"command": "fetch-data", "args": []},
+                        },
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "overwrite": True,
+                                },
+                            },
+                        },
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Writing report.",
+                    "actions": [
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "overwrite": True,
+                                    "content": "# Report from SOURCE-DATA\n",
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Done.", "actions": []}),
+        ]
+    )
+    orchestrator, runtime, workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        scripts={"fetch-data": "print('SOURCE-DATA')"},
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="fetch data and write report"))
+
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert runtime.calls == 1
+    assert [action.id for action in result.iterations[0].plan.actions] == ["fetch"]
+    assert (workspace_root / "report.md").read_text(encoding="utf-8") == (
+        "# Report from SOURCE-DATA\n"
+    )
+
+
+def test_file_write_without_content_is_replanned_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing empty by mistake.",
+                    "actions": [
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "overwrite": True,
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Writing report.",
+                    "actions": [
+                        {
+                            "id": "write_report",
+                            "kind": "tool_call",
+                            "summary": "Write report",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "report.md",
+                                    "overwrite": True,
+                                    "content": "# Report\n",
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Done.", "actions": []}),
+        ]
+    )
+    orchestrator, _runtime, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="write a report"))
+
+    assert result.iterations[0].plan.assistant_message == "Writing report."
+    assert (workspace_root / "report.md").read_text(encoding="utf-8") == "# Report\n"
+    repair_text = "\n".join(message.content for message in provider.calls[1].messages)
+    assert "content or content_brief" in repair_text
+
+
 def test_orchestrator_recovers_file_write_note_as_content_brief(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

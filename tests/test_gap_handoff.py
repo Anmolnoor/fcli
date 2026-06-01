@@ -118,6 +118,19 @@ def test_path_not_found_extracts_path() -> None:
     assert handoff.report.detail == "config/app.toml"
 
 
+def test_file_service_not_found_error_extracts_path() -> None:
+    handoff = build_gap_handoff(
+        request="read generated README list",
+        stop_reason=LoopStopReason.NO_PROGRESS,
+        results=[_failed("File does not exist: res/github-readme-list.md.")],
+        iteration=2,
+        had_cumulative_changes=False,
+    )
+    assert handoff is not None
+    assert handoff.kind is CapabilityGapKind.PATH_NOT_FOUND
+    assert handoff.report.detail == "res/github-readme-list.md"
+
+
 def test_command_unavailable_classification() -> None:
     handoff = build_gap_handoff(
         request="run the linter",
