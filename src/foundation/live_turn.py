@@ -49,8 +49,6 @@ _DISABLE_ENV = "FOUNDATION_DISABLE_LIVE_UX"
 _REFRESH_PER_SECOND = 8
 _MAX_COMPLETED_DETAIL = 12
 _TOGGLE_KEY = "?"
-_SOFT_STALE_SECONDS = 15.0
-_HARD_STALE_SECONDS = 60.0
 
 
 class LivePhase(enum.Enum):
@@ -231,29 +229,6 @@ def _truncate(value: str, *, limit: int) -> str:
     return value[: max(limit - 1, 1)] + "…"
 
 
-def _stale_status(state: TurnLiveState, *, now: float) -> Text | None:
-    if state.last_event_at <= 0:
-        return None
-    if state.phase in {
-        LivePhase.WAITING_APPROVAL,
-        LivePhase.WAITING_USER,
-        LivePhase.COMPLETED,
-        LivePhase.FAILED,
-        LivePhase.CANCELLED,
-    }:
-        return None
-    age = max(now - state.last_event_at, 0.0)
-    if age >= _HARD_STALE_SECONDS:
-        return Text(
-            f"No live events for {_format_duration(age)} · model may still be running · "
-            "Ctrl-C to cancel",
-            style="yellow",
-        )
-    if age >= _SOFT_STALE_SECONDS:
-        return Text(f"Still waiting on model · no events for {_format_duration(age)}", style="cyan")
-    return None
-
-
 def render_status_line(
     state: TurnLiveState,
     *,
@@ -261,7 +236,6 @@ def render_status_line(
     now: float | None = None,
 ) -> RenderableType:
     """One-line status (collapsed mode)."""
-    now_value = time.monotonic() if now is None else now
     if state.finished or state.phase in {
         LivePhase.COMPLETED,
         LivePhase.FAILED,
@@ -270,51 +244,19 @@ def render_status_line(
         verb = state.final_status or "done"
         style = "red" if state.phase is LivePhase.FAILED else "green"
         return Text(f"✓ {verb} · {_format_duration(elapsed_seconds)}", style=style)
-    stale = _stale_status(state, now=now_value)
-    if stale is not None:
-        return stale
     if state.awaiting_approval or state.phase is LivePhase.WAITING_APPROVAL:
-        text = Text("Waiting for approval", style="yellow")
-        if state.approval_summary:
-            text.append(f" · {state.approval_summary}", style="yellow")
-        return text
+        return Text("Approval needed", style="yellow")
     if state.awaiting_input or state.phase is LivePhase.WAITING_USER:
-        text = Text("Waiting for your answer", style="yellow")
-        if state.question_summary:
-            text.append(f" · {state.question_summary}", style="yellow")
-        return text
+        return Text("Answer needed", style="yellow")
     if state.current_action_id is not None or state.phase is LivePhase.RUNNING_TOOL:
-        action_elapsed = (
-            now_value - state.current_action_started_at
-            if state.current_action_started_at is not None
-            else 0.0
-        )
-        descriptor = state.current_action_tool or "tool"
-        return Text(
-            f"Running {descriptor} · iter {state.iteration} · {_format_duration(action_elapsed)}",
-            style="cyan",
-        )
+        return Text("Working", style="cyan")
     if state.planning_started_at is not None or state.phase is LivePhase.PLANNING:
-        plan_elapsed = (
-            now_value - state.planning_started_at
-            if state.planning_started_at is not None
-            else elapsed_seconds
-        )
-        return Text(
-            f"planning iteration {state.iteration} · {_format_duration(plan_elapsed)}",
-            style="cyan",
-        )
+        return Text("Planning", style="cyan")
     if state.phase is LivePhase.OBSERVING:
-        return Text(
-            f"Observing result · iter {state.iteration} · {_format_duration(elapsed_seconds)}",
-            style="cyan",
-        )
-    if state.iteration > 0:
-        return Text(
-            f"Thinking · iteration {state.iteration} · {_format_duration(elapsed_seconds)}",
-            style="cyan",
-        )
-    return Text("Starting turn", style="cyan")
+        return Text("Checking", style="cyan")
+    if state.phase is LivePhase.THINKING or state.iteration > 0:
+        return Text("Thinking", style="cyan")
+    return Text("Starting", style="cyan")
 
 
 def render_detail_panel(state: TurnLiveState, *, elapsed_seconds: float) -> RenderableType:
