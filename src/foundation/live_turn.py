@@ -361,11 +361,19 @@ def render_detail_panel(state: TurnLiveState, *, elapsed_seconds: float) -> Rend
     return Panel(table, border_style="cyan", title="foundation · live turn", title_align="left")
 
 
-def render_collapsed(state: TurnLiveState, *, elapsed_seconds: float) -> RenderableType:
+def render_collapsed(
+    state: TurnLiveState,
+    *,
+    elapsed_seconds: float,
+    spinner: Spinner | None = None,
+) -> RenderableType:
     status = render_status_line(state, elapsed_seconds=elapsed_seconds)
     if state.finished:
         return status
-    spinner = Spinner("dots", text=status, style="cyan")
+    if spinner is None:
+        spinner = Spinner("dots", text=status, style="cyan")
+    else:
+        spinner.update(text=status, style="cyan")
     return Group(
         spinner,
         Text("press ? for detail · Ctrl-C to cancel", style="dim"),
@@ -410,6 +418,7 @@ class LiveTurnRenderer:
         self._expanded = False
         self._started_at = 0.0
         self._live: Live | None = None
+        self._spinner = Spinner("dots", style="cyan")
         self._keypress_thread: threading.Thread | None = None
         self._keypress_stop = threading.Event()
         self._old_termios: Any = None
@@ -528,7 +537,7 @@ class LiveTurnRenderer:
         state_copy = self.state
         if self._expanded:
             return render_detail_panel(state_copy, elapsed_seconds=elapsed)
-        return render_collapsed(state_copy, elapsed_seconds=elapsed)
+        return render_collapsed(state_copy, elapsed_seconds=elapsed, spinner=self._spinner)
 
     # --- keypress handling ------------------------------------------------
 
