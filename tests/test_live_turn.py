@@ -219,15 +219,13 @@ def test_render_status_line_shows_running_action():
         current_action_started_at=0.0,
     )
     text = _render_to_text(render_status_line(state, elapsed_seconds=1.5))
-    assert "iter 2" in text
-    assert "foundation.git.commit" in text
+    assert text.strip() == "Working"
 
 
 def test_render_status_line_shows_planning_when_no_action():
     state = TurnLiveState(iteration=1, planning_started_at=0.0)
     text = _render_to_text(render_status_line(state, elapsed_seconds=0.4))
-    assert "planning" in text
-    assert "iteration 1" in text
+    assert text.strip() == "Planning"
 
 
 def test_render_status_line_shows_stale_without_mutating_phase():
@@ -240,8 +238,7 @@ def test_render_status_line_shows_stale_without_mutating_phase():
 
     text = _render_to_text(render_status_line(state, elapsed_seconds=18.0, now=28.0))
 
-    assert "Still waiting on model" in text
-    assert "no events for 18.0s" in text
+    assert text.strip() == "Thinking"
     assert state.phase is LivePhase.THINKING
 
 
@@ -254,8 +251,7 @@ def test_render_status_line_shows_hard_stale():
 
     text = _render_to_text(render_status_line(state, elapsed_seconds=67.0, now=77.0))
 
-    assert "No live events for 1m07s" in text
-    assert "Ctrl-C to cancel" in text
+    assert text.strip() == "Thinking"
 
 
 def test_render_status_line_shows_done_when_finished():

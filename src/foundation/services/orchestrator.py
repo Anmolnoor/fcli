@@ -95,6 +95,12 @@ _FATAL_ERROR_PATTERNS = frozenset(
         "no such file or directory",
     }
 )
+_TERMINAL_BLOCKED_ERROR_PATTERNS = frozenset(
+    {
+        "denied by the user",
+        "not approved",
+    }
+)
 
 # Heuristic intent markers used by the commit-approval runtime invariant.
 # When the user's message contains "commit" as a whole word, or names any of
@@ -189,6 +195,7 @@ _STOP_REASON_SUFFIXES = {
     LoopStopReason.AWAITING_USER_INPUT: (
         "\n\n[Loop stopped: waiting for your answer to a question before continuing.]"
     ),
+    LoopStopReason.BLOCKED: ("\n\n[Loop stopped: an action was blocked before continuing.]"),
     LoopStopReason.FATAL_EXECUTION_FAILURE: (
         "\n\n[Loop stopped: a fatal execution failure occurred.]"
     ),
@@ -1003,12 +1010,13 @@ class RequestOrchestrator:
                     iteration=iteration_index,
                 )
             )
-            total_actions_executed += len(actions_to_execute)
+            attempted_actions = actions_to_execute[: len(execution_results)]
+            total_actions_executed += len(attempted_actions)
             prev_last_step_id = last_step_id
 
             # 6. Track mutations and verification
             iter_changed, iter_code_change, iter_outcome, iter_verify_cmds = self._classify_results(
-                execution_results, actions_to_execute
+                execution_results, attempted_actions
             )
             had_code_changes = had_code_changes or iter_code_change
             verification_outcome = _worst_verification_outcome(
@@ -1027,7 +1035,7 @@ class RequestOrchestrator:
             # tool calls (file writes, git mutations) so the planner sees
             # them and won't re-issue.
             for action, result in zip(
-                actions_to_execute,
+                attempted_actions,
                 execution_results,
                 strict=True,
             ):
@@ -1055,12 +1063,17 @@ class RequestOrchestrator:
             has_awaiting_input = any(
                 r.status is ExecutionStatus.AWAITING_INPUT for r in execution_results
             )
+            has_terminal_blocked = any(
+                self._is_terminal_blocked_result(r) for r in execution_results
+            )
             has_fatal = any(self._is_fatal_result(r) for r in execution_results)
 
             if has_pending:
                 stop_reason = LoopStopReason.PENDING_APPROVAL
             elif has_awaiting_input:
                 stop_reason = LoopStopReason.AWAITING_USER_INPUT
+            elif has_terminal_blocked:
+                stop_reason = LoopStopReason.BLOCKED
             elif has_fatal:
                 stop_reason = LoopStopReason.FATAL_EXECUTION_FAILURE
             elif total_actions_executed >= _MAX_TOTAL_ACTIONS:
@@ -1072,7 +1085,7 @@ class RequestOrchestrator:
             observation = self._build_observation(
                 iteration_index,
                 execution_results,
-                actions_to_execute,
+                attempted_actions,
                 iter_changed,
                 remaining_iterations=_MAX_LOOP_ITERATIONS - iteration_index,
                 remaining_actions=_MAX_TOTAL_ACTIONS - total_actions_executed,
@@ -1348,6 +1361,17 @@ class RequestOrchestrator:
                 iteration=iteration,
             )
             prior_step_id = last_step_id
+            result = execution.execution_result
+            if (
+                result.status
+                in {
+                    ExecutionStatus.PENDING_APPROVAL,
+                    ExecutionStatus.AWAITING_INPUT,
+                }
+                or self._is_terminal_blocked_result(result)
+                or self._is_fatal_result(result)
+            ):
+                break
 
         return execution_results, decisions, evaluations, last_step_id
 
@@ -1531,6 +1555,15 @@ class RequestOrchestrator:
                     iter_outcome = _worst_verification_outcome(iter_outcome, cmd_outcome)
 
         return changed_paths, had_code_changes, iter_outcome, verify_cmds
+
+    @staticmethod
+    def _is_terminal_blocked_result(result: ExecutionResult) -> bool:
+        if result.status is not ExecutionStatus.BLOCKED:
+            return False
+        if result.error is None:
+            return False
+        error_lower = result.error.lower()
+        return any(p in error_lower for p in _TERMINAL_BLOCKED_ERROR_PATTERNS)
 
     @staticmethod
     def _is_fatal_result(result: ExecutionResult) -> bool:
@@ -1758,6 +1791,8 @@ class RequestOrchestrator:
             # Stopped to ask the user something we couldn't prompt for inline
             # (non-interactive run, or the user dismissed the prompt).
             return SessionStatus.COMPLETED_INCONCLUSIVE
+        if stop_reason is LoopStopReason.BLOCKED:
+            return SessionStatus.FAILED
         if stop_reason is LoopStopReason.FATAL_EXECUTION_FAILURE:
             return SessionStatus.FAILED
         if stop_reason is LoopStopReason.ZERO_ACTION_PLAN:
