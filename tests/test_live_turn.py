@@ -199,6 +199,18 @@ def _render_to_text(renderable) -> str:
     return console.export_text()
 
 
+def _render_to_text_at(renderable, now: float) -> str:
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=False,
+        width=80,
+        record=True,
+        get_time=lambda: now,
+    )
+    console.print(renderable)
+    return console.export_text()
+
+
 def test_render_status_line_shows_running_action():
     state = TurnLiveState(
         iteration=2,
@@ -256,6 +268,19 @@ def test_render_collapsed_includes_help_hint():
     state = TurnLiveState(iteration=1, planning_started_at=0.0)
     text = _render_to_text(render_collapsed(state, elapsed_seconds=0.2))
     assert "?" in text
+
+
+def test_renderer_reuses_spinner_across_collapsed_refreshes():
+    renderer = LiveTurnRenderer(
+        console=Console(file=io.StringIO(), force_terminal=False, width=80),
+        enable_keypress=False,
+    )
+    renderer.on_event(EVENT_SESSION_START, {"request_id": "r"})
+
+    first = _render_to_text_at(renderer._render(), now=0.0)
+    second = _render_to_text_at(renderer._render(), now=0.5)
+
+    assert first[0] != second[0]
 
 
 def test_render_detail_panel_lists_completed_steps():
