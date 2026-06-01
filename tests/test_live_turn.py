@@ -8,6 +8,7 @@ from typing import Any
 from rich.console import Console
 
 from foundation.live_turn import (
+    LivePhase,
     LiveTurnRenderer,
     TurnLiveState,
     render_collapsed,
@@ -22,6 +23,7 @@ from foundation.observability import (
     EVENT_PLAN_FINISHED,
     EVENT_PLAN_STARTED,
     EVENT_SESSION_END,
+    EVENT_SESSION_START,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
@@ -141,6 +143,23 @@ def test_state_reducer_happy_path():
     ]
 
 
+def test_state_tracks_phase_and_last_event():
+    state = TurnLiveState()
+
+    state.fold(EVENT_SESSION_START, {"request_id": "r"})
+    assert state.phase is LivePhase.THINKING
+    assert state.last_event_name == EVENT_SESSION_START
+
+    state.fold(EVENT_PLAN_STARTED, {})
+    assert state.phase is LivePhase.PLANNING
+    planning_started = state.phase_started_at
+
+    state.fold(EVENT_TOOL_CALL_STARTED, {"action_id": "a1", "tool": "foundation.file.read"})
+    assert state.phase is LivePhase.RUNNING_TOOL
+    assert state.phase_started_at >= planning_started
+    assert state.last_event_name == EVENT_TOOL_CALL_STARTED
+
+
 def test_state_reducer_failure_path():
     state = TurnLiveState()
     _drive(
@@ -199,6 +218,34 @@ def test_render_status_line_shows_planning_when_no_action():
     assert "iteration 1" in text
 
 
+def test_render_status_line_shows_stale_without_mutating_phase():
+    state = TurnLiveState(
+        phase=LivePhase.THINKING,
+        phase_started_at=5.0,
+        last_event_at=10.0,
+        last_event_name=EVENT_PLAN_FINISHED,
+    )
+
+    text = _render_to_text(render_status_line(state, elapsed_seconds=18.0, now=28.0))
+
+    assert "Still waiting on model" in text
+    assert "no events for 18.0s" in text
+    assert state.phase is LivePhase.THINKING
+
+
+def test_render_status_line_shows_hard_stale():
+    state = TurnLiveState(
+        phase=LivePhase.THINKING,
+        last_event_at=10.0,
+        last_event_name=EVENT_PLAN_FINISHED,
+    )
+
+    text = _render_to_text(render_status_line(state, elapsed_seconds=67.0, now=77.0))
+
+    assert "No live events for 1m07s" in text
+    assert "Ctrl-C to cancel" in text
+
+
 def test_render_status_line_shows_done_when_finished():
     state = TurnLiveState(finished=True, final_status="completed")
     text = _render_to_text(render_status_line(state, elapsed_seconds=2.1))
@@ -215,6 +262,10 @@ def test_render_detail_panel_lists_completed_steps():
     state = TurnLiveState(
         iteration=1,
         request_text="implement feature X",
+        phase=LivePhase.OBSERVING,
+        phase_started_at=1.0,
+        last_event_at=2.0,
+        last_event_name=EVENT_TOOL_CALL_FINISHED,
         success_count=1,
         failure_count=0,
     )
@@ -222,6 +273,8 @@ def test_render_detail_panel_lists_completed_steps():
     state.fold(EVENT_TOOL_CALL_FINISHED, {"action_id": "a1", "tool": "foundation.file.read"})
     text = _render_to_text(render_detail_panel(state, elapsed_seconds=0.5))
     assert "implement feature X" in text
+    assert "observing" in text
+    assert EVENT_TOOL_CALL_FINISHED in text
     assert "foundation.file.read" in text
 
 

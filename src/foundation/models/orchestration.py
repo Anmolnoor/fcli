@@ -401,6 +401,64 @@ class GovernanceNotice(StrictModel):
     staged_paths: list[str] = Field(default_factory=list)
 
 
+class CapabilityGapKind(StrEnum):
+    """Why the agent could not complete a structurally-stuck request."""
+
+    MISSING_CAPABILITY = "missing_capability"
+    PATH_NOT_FOUND = "path_not_found"
+    COMMAND_UNAVAILABLE = "command_unavailable"
+    STUCK_NO_PROGRESS = "stuck_no_progress"
+    UNKNOWN = "unknown"
+
+
+class GapOptionKind(StrEnum):
+    """What choosing a handoff option does."""
+
+    ALTERNATIVE = "alternative"
+    REPORT = "report"
+    STOP = "stop"
+
+
+class CapabilityGapOption(StrictModel):
+    """One choice offered to the user when the agent is stuck."""
+
+    label: str = Field(min_length=1)
+    kind: GapOptionKind
+    # For ALTERNATIVE options: the request to resubmit as the next turn. None
+    # means "let the user describe how to proceed in their own words".
+    follow_up_request: str | None = None
+
+
+class CapabilityGapReport(StrictModel):
+    """Maintainer-actionable record of what the agent could not do.
+
+    Persisted to the trace + event log even though the chat surface shows only
+    the friendly handoff message — the failure is reframed, never discarded.
+    """
+
+    request: str = Field(min_length=1)
+    gap_kind: CapabilityGapKind
+    stop_reason: LoopStopReason
+    detail: str = Field(default="")
+    last_error: str | None = None
+    iteration: int = Field(ge=1)
+
+
+class CapabilityGapHandoff(StrictModel):
+    """Graceful handoff shown instead of a raw failure when the loop is stuck.
+
+    The orchestrator attaches this to the result when the bounded replan loop
+    stops on a structurally-stuck condition (a missing capability, a bad path,
+    or no progress). The CLI renders ``message`` and lets the user pick an
+    ``option`` rather than ever seeing the underlying error.
+    """
+
+    kind: CapabilityGapKind
+    message: str = Field(min_length=1)
+    options: list[CapabilityGapOption] = Field(min_length=1)
+    report: CapabilityGapReport
+
+
 class OrchestrationSummary(StrictModel):
     """High-level summary of what the orchestrator did."""
 
@@ -445,3 +503,4 @@ class OrchestrationResult(StrictModel):
     stop_reason: LoopStopReason | None = None
     verification_notice: VerificationNotice | None = None
     governance_notice: GovernanceNotice | None = None
+    gap_handoff: CapabilityGapHandoff | None = None

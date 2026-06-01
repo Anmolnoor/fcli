@@ -2040,9 +2040,7 @@ def test_prompt_for_question_selects_option_by_number(
     from foundation.models import QuestionAction
 
     monkeypatch.setattr(_typer, "prompt", lambda *_a, **_k: "2")
-    answer = _prompt_for_question(
-        QuestionAction(prompt="Which format?", options=["json", "yaml"])
-    )
+    answer = _prompt_for_question(QuestionAction(prompt="Which format?", options=["json", "yaml"]))
     assert answer == "yaml"
 
 

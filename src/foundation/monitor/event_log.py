@@ -20,6 +20,7 @@ import threading
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
+from types import TracebackType
 from typing import Any, BinaryIO
 
 from foundation.monitor.protocol import build_envelope, encode_envelope
@@ -88,7 +89,12 @@ class EventLogWriter:
             self._install_handlers()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self._restore_signal_handlers()
         self.close(status="interrupted" if exc is not None else None)
 

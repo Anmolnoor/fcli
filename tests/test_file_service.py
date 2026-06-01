@@ -715,9 +715,7 @@ def test_read_grant_allows_out_of_scope_read_only(tmp_path: Path) -> None:
 
     grants = ScopeGrantStore()
     grants.grant(outside)
-    service = FileService(
-        workspace_root=workspace, state_dir=state_dir, read_grant_store=grants
-    )
+    service = FileService(workspace_root=workspace, state_dir=state_dir, read_grant_store=grants)
 
     # Granted out-of-scope read succeeds.
     assert service.read(FileReadRequest(path=str(secret))).content == "hi\n"

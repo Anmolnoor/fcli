@@ -557,8 +557,7 @@ class CapabilityPolicyEngine:
                 return CapabilityPolicyVerdict(
                     outcome=CapabilityPolicyOutcome.REQUIRE_APPROVAL,
                     summary=(
-                        "Requested path is outside the workspace; reading it needs "
-                        "your approval."
+                        "Requested path is outside the workspace; reading it needs your approval."
                     ),
                     reason_codes=[PolicyReasonCode.SCOPE_ESCALATION],
                     constraints=policy_input.constraints.model_copy(deep=True),

@@ -703,6 +703,9 @@ class OllamaChatAdapter:
                 f" prompt_eval_count={prompt_eval_count},"
                 f"{msg_detail})."
             )
+            # The model reasoned but ignored the schema — re-sending the same
+            # prompt tends to reproduce it, so don't retry this one.
+            retryable = False
         else:
             error_msg = (
                 f"Provider returned an empty chat response"
@@ -711,9 +714,14 @@ class OllamaChatAdapter:
                 f" prompt_eval_count={prompt_eval_count},"
                 f"{msg_detail})."
             )
+            # A wholly empty completion (no content, no thinking) is almost
+            # always a transient server-side hiccup — a cold model load or a
+            # worker glitch. Retrying the same prompt usually succeeds.
+            retryable = True
         raise ProviderError(
             error_msg,
             code=ProviderErrorCode.INVALID_RESPONSE,
+            retryable=retryable,
             response_text=json.dumps(payload, default=str)[:2000],
         )
 

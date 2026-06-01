@@ -301,6 +301,71 @@ def test_ollama_adapter_rejects_thinking_only_response_for_json_calls() -> None:
     assert "thinking tokens" in str(excinfo.value)
 
 
+def test_ollama_adapter_retries_empty_chat_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient empty completion (no content, no thinking) is retried."""
+    monkeypatch.setattr("foundation.services.provider.time.sleep", lambda *_args: None)
+    transport = FakeTransport(
+        [
+            {
+                "model": "qwen3.5:397b-cloud",
+                "message": {"role": "assistant", "content": "", "thinking": None},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 15120,
+                "eval_count": 1,
+            },
+            {
+                "model": "qwen3.5:397b-cloud",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"assistant_message":"ok","actions":[]}',
+                },
+                "prompt_eval_count": 15120,
+                "eval_count": 9,
+            },
+        ]
+    )
+    adapter = OllamaChatAdapter(
+        model="qwen3.5:397b-cloud",
+        base_url="https://ollama.com/api",
+        transport=transport,
+    )
+
+    response = adapter.complete(_structured_prompt())
+
+    assert response.structured_output == {"assistant_message": "ok", "actions": []}
+    assert response.metadata.attempts == 2
+    assert len(transport.calls) == 2
+
+
+def test_ollama_adapter_gives_up_on_persistent_empty_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If every attempt is empty, it raises after exhausting retries."""
+    monkeypatch.setattr("foundation.services.provider.time.sleep", lambda *_args: None)
+    empty = {
+        "model": "qwen3.5:397b-cloud",
+        "message": {"role": "assistant", "content": "", "thinking": None},
+        "done": True,
+        "done_reason": "stop",
+        "eval_count": 1,
+    }
+    transport = FakeTransport([dict(empty), dict(empty), dict(empty)])
+    adapter = OllamaChatAdapter(
+        model="qwen3.5:397b-cloud",
+        base_url="https://ollama.com/api",
+        transport=transport,
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        adapter.complete(_structured_prompt())
+
+    assert excinfo.value.code is ProviderErrorCode.INVALID_RESPONSE
+    assert len(transport.calls) == 3  # max_attempts default
+
+
 def test_ollama_adapter_sends_think_true_for_qwen3_structured_output() -> None:
     """Qwen 3.x needs think=true with format to reason about the JSON schema."""
     transport = FakeTransport(
