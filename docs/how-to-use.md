@@ -67,6 +67,36 @@ Then verify the setup:
 
 You want to see `Provider: ollama`, `Base URL: https://ollama.com/api`, and a secret lookup line saying credentials resolved from `$OLLAMA_API_KEY`.
 
+## OpenAI
+
+To use OpenAI instead, use this provider config:
+
+```bash
+cat > "$HOME/Library/Application Support/foundation/config.toml" <<'EOF'
+[provider]
+name = "openai"
+model = "gpt-5-mini"
+request_timeout_seconds = 180
+api_key_env_var = "OPENAI_API_KEY"
+EOF
+```
+
+Add your OpenAI API key to the paired env file:
+
+```bash
+cat > "$HOME/Library/Application Support/foundation/foundation.env" <<'EOF'
+OPENAI_API_KEY=your-openai-api-key
+EOF
+```
+
+Then verify with:
+
+```bash
+./scripts/uv run foundation doctor
+```
+
+You want to see `Provider: openai`, `Base URL: https://api.openai.com/v1`, and a secret lookup line saying credentials resolved from `$OPENAI_API_KEY`.
+
 ## 4. Start Foundation
 
 ```bash
