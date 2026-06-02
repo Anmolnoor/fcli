@@ -917,8 +917,134 @@ def test_orchestrator_out_of_scope_write_stays_blocked(
 
     # Writes are never escalated: no prompt, blocked, nothing written.
     assert prompts == []
+    assert result.stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK
+    assert len(result.iterations) == 1
     assert any(r.status is ExecutionStatus.BLOCKED for r in result.execution_results)
+    assert result.summary.blocked_actions == 1
+    assert "outside the workspace" in result.assistant_message.content
+    assert "open" in result.assistant_message.content.lower()
     assert not target.exists()
+
+
+def test_terminal_policy_block_message_is_model_phrased(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "evil.md"
+    phrased = (
+        "I did not write outside the workspace root. Open fcli in that directory "
+        "or use it as the workspace root, then ask again."
+    )
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing outside the workspace.",
+                    "actions": [
+                        {
+                            "id": "write_evil",
+                            "kind": "tool_call",
+                            "summary": "Write outside the workspace",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {"path": str(target), "content": "x"},
+                            },
+                        }
+                    ],
+                }
+            ),
+            _text_response(phrased),
+        ]
+    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="write outside"))
+
+    assert result.stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK
+    assert result.assistant_message.content == phrased
+    assert not target.exists()
+
+
+def test_out_of_scope_shell_write_is_terminal_policy_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside-shell-dir"
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Creating the directory.",
+                    "actions": [
+                        {
+                            "id": "mkdir_outside",
+                            "kind": "shell",
+                            "summary": "Create an outside directory",
+                            "shell": {"command": "mkdir", "args": [str(outside)]},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    orchestrator, runtime, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message=f"make {outside}"))
+
+    assert result.stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK
+    assert runtime.calls == 0
+    assert result.summary.blocked_actions == 1
+    assert not outside.exists()
+
+
+def test_zero_action_file_creation_claim_is_not_reported_as_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "outside" / "cheatsheet.md"
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": f"Done, I created {target}.",
+                    "actions": [],
+                }
+            )
+        ]
+    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message=f"create a file at {target}"))
+
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert result.summary.executed_actions == 0
+    assert "created" not in result.assistant_message.content.lower()
+    assert "no actions were executed" in result.assistant_message.content.lower()
+    assert not target.exists()
+
+
+def test_zero_action_non_file_generation_claim_is_left_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Generated a short reminder: run git status first.",
+                    "actions": [],
+                }
+            )
+        ]
+    )
+    orchestrator, _, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="generate a git reminder"))
+
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert result.assistant_message.content == "Generated a short reminder: run git status first."
 
 
 def test_orchestrator_retries_shell_cat_plan_without_executing_it(

@@ -108,6 +108,7 @@ class LoopStopReason(StrEnum):
     MAX_ITERATIONS = "max_iterations"
     MAX_ACTIONS = "max_actions"
     NO_PROGRESS = "no_progress"
+    TERMINAL_POLICY_BLOCK = "terminal_policy_block"
 
 
 class VerificationOutcome(StrEnum):
