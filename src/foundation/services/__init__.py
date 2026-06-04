@@ -24,6 +24,7 @@ from foundation.services.orchestrator import (
 )
 from foundation.services.planner import PlannerService, PlanningError
 from foundation.services.provider import (
+    CodexExecAdapter,
     OllamaChatAdapter,
     OpenAIResponsesAdapter,
     ProviderAdapter,
@@ -79,6 +80,7 @@ __all__ = [
     "CapabilityResolver",
     "CapabilityStore",
     "CapabilityPolicyEngine",
+    "CodexExecAdapter",
     "ConversationCompactor",
     "ExecutionMode",
     "FileService",

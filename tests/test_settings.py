@@ -200,6 +200,29 @@ def test_ollama_provider_uses_provider_specific_defaults(
     assert settings.provider.credentials_required() is False
 
 
+def test_codex_provider_uses_chatgpt_managed_auth(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[provider]",
+                'name = "codex"',
+                'model = "gpt-5.5"',
+                'base_url = "https://api.openai.com/v1"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_path=config_path)
+
+    assert settings.provider.effective_base_url() == "codex://local"
+    assert settings.provider.credential_source_order() == ["codex:chatgpt-login"]
+    assert settings.provider.credentials_required() is False
+
+
 def test_load_settings_rejects_invalid_toml(tmp_path: Path) -> None:
     config_path = tmp_path / "invalid.toml"
     config_path.write_text('[app\nworkspace_root = "/tmp"\n', encoding="utf-8")

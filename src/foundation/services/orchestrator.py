@@ -2053,6 +2053,16 @@ class RequestOrchestrator:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _action_count(count: int, label: str) -> str:
+        suffix = "" if count == 1 else "s"
+        return f"{count} {label}{suffix}"
+
+    @staticmethod
+    def _approval_count(count: int) -> str:
+        suffix = "" if count == 1 else "s"
+        return f"{count} pending approval{suffix}"
+
+    @staticmethod
     def _build_summary(
         iterations: list[OrchestrationIteration],
         execution_results: list[ExecutionResult],
@@ -2075,17 +2085,33 @@ class RequestOrchestrator:
                 "was requested."
             )
         else:
-            parts = [f"Executed {executed} action(s)"]
+            stop_parts: list[str] = []
             if pending:
-                parts.append(f"{pending} pending approval")
+                stop_parts.append(RequestOrchestrator._approval_count(pending))
             if failed:
-                parts.append(f"{failed} failed")
+                stop_parts.append(f"{failed} failed")
             if blocked:
-                parts.append(f"{blocked} blocked")
+                stop_parts.append(f"{blocked} blocked by policy")
             if skipped:
-                parts.append(f"{skipped} skipped")
-            text = ", ".join(parts) + "."
-            if len(iterations) > 1:
+                stop_parts.append(f"{skipped} skipped")
+
+            if blocked or failed:
+                if executed:
+                    text = (
+                        "Stopped after "
+                        f"{RequestOrchestrator._action_count(executed, 'completed action')}; "
+                        f"{', '.join(stop_parts)}."
+                    )
+                else:
+                    text = f"Stopped: {', '.join(stop_parts)}."
+            else:
+                parts = [f"Executed {RequestOrchestrator._action_count(executed, 'action')}"]
+                if pending:
+                    parts.append(RequestOrchestrator._approval_count(pending))
+                if skipped:
+                    parts.append(f"{skipped} skipped")
+                text = ", ".join(parts) + "."
+            if len(iterations) > 1 and not (blocked or failed):
                 text += f" ({len(iterations)} iterations)"
 
         return OrchestrationSummary(
