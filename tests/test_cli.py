@@ -2147,6 +2147,51 @@ def test_iteration_changed_files_notice_empty() -> None:
     assert _iteration_changed_files_notice(result) is None
 
 
+def test_denied_stop_notice_offers_recovery_after_changed_file() -> None:
+    from foundation.cli_rendering import _build_chat_turn_presentation
+    from foundation.models import ChatSurfacePolicy, ShellAction
+
+    result = _iteration_result_for_notices(
+        changed_paths=["tasks.md"],
+        stop_reason=LoopStopReason.BLOCKED,
+    )
+    audit_action = PlannedAction(
+        id="audit",
+        kind=ActionKind.SHELL,
+        summary="Run npm audit",
+        shell=ShellAction(command="npm", args=["audit"]),
+    )
+    audit_result = ExecutionResult(
+        action_id="audit",
+        status=ExecutionStatus.BLOCKED,
+        summary="Denied by the user at the prompt.",
+        error="Denied by the user at the prompt.",
+    )
+    result.iterations[0].plan.actions.append(audit_action)
+    result.iterations[0].execution_results.append(audit_result)
+    result.execution_results.append(audit_result)
+    result.summary = result.summary.model_copy(
+        update={
+            "blocked_actions": 1,
+            "text": "Changed tasks.md, then stopped: user denied approval for `npm audit`.",
+        }
+    )
+
+    presentation = _build_chat_turn_presentation(
+        result,
+        policy=ChatSurfacePolicy(render_mode=RenderMode.CONCISE),
+        interactive=False,
+    )
+    notice_texts = [notice.text for notice in presentation.notices]
+
+    changed_index = next(i for i, text in enumerate(notice_texts) if "Changed file" in text)
+    recovery_index = next(i for i, text in enumerate(notice_texts) if "Next:" in text)
+    assert changed_index < recovery_index
+    assert "continue with read-only analysis" in notice_texts[recovery_index]
+    assert "retry with approval" in notice_texts[recovery_index]
+    assert "stop" in notice_texts[recovery_index]
+
+
 def test_awaiting_input_notice_surfaces_question() -> None:
     from foundation.cli_rendering import _awaiting_input_notice
     from foundation.models import LoopStopReason
@@ -2197,6 +2242,39 @@ def test_prompt_for_question_accepts_free_text(
     monkeypatch.setattr(_typer, "prompt", lambda *_a, **_k: "  use msgpack  ")
     answer = _prompt_for_question(QuestionAction(prompt="Which format?"))
     assert answer == "use msgpack"
+
+
+def test_prompt_for_approval_warns_for_package_manager_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import typer as _typer
+
+    from foundation.cli_runtime import _prompt_for_approval
+    from foundation.models import CapabilityApprovalRequest
+
+    buffer = StringIO()
+    test_console = Console(file=buffer, force_terminal=False, color_system=None, width=140)
+    monkeypatch.setattr("foundation.cli_runtime.console", test_console)
+    monkeypatch.setattr(_typer, "confirm", lambda *_args, **_kwargs: False)
+
+    _prompt_for_approval(
+        CapabilityApprovalRequest(
+            action_id="audit",
+            capability_id="foundation.shell.command",
+            capability_version="1.0.0",
+            summary="Run npm audit",
+            reason="Networked package-manager command requires approval.",
+            command_preview="npm audit",
+            cwd="/tmp/workspace",
+            network_hosts=["*"],
+            requested_side_effects=["network", "workspace_write"],
+        )
+    )
+
+    output = buffer.getvalue()
+    assert "Package manager warning:" in output
+    assert "network" in output
+    assert "lockfiles" in output
 
 
 def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:

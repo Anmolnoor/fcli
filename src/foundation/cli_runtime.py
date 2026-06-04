@@ -54,6 +54,7 @@ from foundation.services.gap_handoff import build_issue_url, write_gap_report
 from foundation.settings import ApprovalMode, AppSettings
 
 _REPL_SESSION_DB_FILENAME = "chat-sessions.sqlite3"
+_PACKAGE_MANAGER_COMMANDS = frozenset({"npm", "pnpm", "yarn", "pip", "uv"})
 
 
 def _build_shell_runtime(settings: AppSettings) -> ShellRuntime:
@@ -135,6 +136,9 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
         lines.append(
             f"Side effects: [yellow]{escape(', '.join(request.requested_side_effects))}[/yellow]"
         )
+    package_warning = _package_manager_warning(request)
+    if package_warning:
+        lines.append(f"Package manager warning: [yellow]{escape(package_warning)}[/yellow]")
     if request.reason_codes:
         reason_text = ", ".join(code.value for code in request.reason_codes)
         lines.append(f"Policy reasons: [magenta]{escape(reason_text)}[/magenta]")
@@ -159,6 +163,23 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
     finally:
         if renderer is not None:
             renderer.resume()
+
+
+def _package_manager_warning(request: ApprovalRequest) -> str | None:
+    command_preview = request.command_preview
+    if not command_preview:
+        return None
+    try:
+        parts = shlex.split(command_preview)
+    except ValueError:
+        parts = command_preview.split()
+    command = parts[0].split("/")[-1] if parts else ""
+    if command not in _PACKAGE_MANAGER_COMMANDS:
+        return None
+    return (
+        "package-manager commands may use the network, run package scripts, "
+        "and modify package metadata or lockfiles."
+    )
 
 
 def _prompt_for_question(question: QuestionAction) -> str | None:

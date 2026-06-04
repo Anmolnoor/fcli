@@ -26,6 +26,10 @@ from foundation.models import (
     TraceQuery,
     UserRequest,
 )
+from foundation.observability import (
+    EVENT_SHELL_EXECUTION_FINISHED,
+    EVENT_SHELL_EXECUTION_STARTED,
+)
 from foundation.services import ApprovalService, HistoryStore, LocalToolService, ShellRuntime
 from foundation.services.orchestrator import (
     NoProgressDetector,
@@ -256,6 +260,51 @@ def test_orchestrator_executes_shell_runtime_capability(
     assert result.execution_results[0].artifact_type.value == "shell"
     assert result.execution_results[0].artifact is not None
     assert result.execution_results[0].artifact["stdout"] == f"{workspace_root}\n"
+
+
+def test_orchestrator_emits_shell_activity_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Showing the current directory through the shell runtime.",
+                    "actions": [
+                        {
+                            "id": "show_cwd",
+                            "kind": "shell",
+                            "summary": "Show the current directory",
+                            "shell": {
+                                "command": "pwd",
+                            },
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    orchestrator, _runtime, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+    events: list[tuple[str, dict[str, Any]]] = []
+    orchestrator.set_event_sink(lambda name, payload: events.append((name, dict(payload))))
+
+    orchestrator.orchestrate(UserRequest(message="where am I"))
+
+    shell_events = [
+        (name, payload)
+        for name, payload in events
+        if name in {EVENT_SHELL_EXECUTION_STARTED, EVENT_SHELL_EXECUTION_FINISHED}
+    ]
+    assert [name for name, _payload in shell_events] == [
+        EVENT_SHELL_EXECUTION_STARTED,
+        EVENT_SHELL_EXECUTION_FINISHED,
+    ]
+    assert shell_events[0][1]["action_id"] == "show_cwd"
+    assert shell_events[0][1]["command_preview"] == "pwd"
+    assert shell_events[1][1]["action_id"] == "show_cwd"
+    assert shell_events[1][1]["command_preview"] == "pwd"
+    assert shell_events[1][1]["stdout_preview"] == str(workspace_root)
 
 
 def test_orchestrator_retries_invalid_plans_without_duplicate_shell_execution(
@@ -1053,7 +1102,66 @@ def test_terminal_policy_block_summary_reads_as_stopped_not_success_accounting(
     assert runtime.calls == 1
     assert result.summary.executed_actions == 1
     assert result.summary.blocked_actions == 1
-    assert result.summary.text == "Stopped after 1 completed action; 1 blocked by policy."
+    assert (
+        result.summary.text
+        == "Stopped after 1 completed action: policy blocked the requested action."
+    )
+
+
+def test_user_denied_after_file_write_reports_completed_change_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing a task list, then checking npm audit.",
+                    "actions": [
+                        {
+                            "id": "write_tasks",
+                            "kind": "tool_call",
+                            "summary": "Write the task list",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "tasks.md",
+                                    "content": "# Tasks\n",
+                                },
+                            },
+                        },
+                        {
+                            "id": "audit",
+                            "kind": "shell",
+                            "summary": "Run npm audit",
+                            "shell": {"command": "npm", "args": ["audit"]},
+                        },
+                    ],
+                }
+            )
+        ]
+    )
+    approval_service = ApprovalService(
+        mode=ApprovalMode.PROMPT,
+        prompt_callback=lambda request: request.action_id != "audit",
+    )
+    orchestrator, runtime, workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        approval_service=approval_service,
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="write tasks and run npm audit"))
+
+    assert (workspace_root / "tasks.md").read_text(encoding="utf-8") == "# Tasks\n"
+    assert runtime.calls == 0
+    assert result.stop_reason is LoopStopReason.BLOCKED
+    assert result.summary.executed_actions == 1
+    assert result.summary.blocked_actions == 1
+    assert result.summary.text.startswith("Changed tasks.md, then stopped")
+    assert "user denied approval" in result.summary.text
+    assert "npm audit" in result.summary.text
 
 
 def test_planner_rejects_relative_parent_directory_write_for_developer_request(

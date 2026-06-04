@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -56,6 +57,9 @@ from foundation.observability import (
     EVENT_APPROVAL_RESOLVED,
     EVENT_QUESTION_ANSWERED,
     EVENT_QUESTION_ASKED,
+    EVENT_SHELL_EXECUTION_FAILED,
+    EVENT_SHELL_EXECUTION_FINISHED,
+    EVENT_SHELL_EXECUTION_STARTED,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
@@ -74,6 +78,7 @@ from foundation.services.shell import (
     ExecutionMode,
     OutputCallback,
     ShellCommandRequest,
+    ShellCommandResult,
     ShellExecutionCancelled,
     ShellExecutionSpawnError,
     ShellExecutionTimeout,
@@ -93,9 +98,44 @@ from foundation.services.tools import (
     ToolExecutionError,
 )
 
+_SHELL_OUTPUT_PREVIEW_LIMIT = 240
+
 
 def _utcnow() -> str:
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _preview_output(text: str, *, limit: int = _SHELL_OUTPUT_PREVIEW_LIMIT) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            text = stripped
+            break
+    else:
+        text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)] + "…"
+
+
+def _shell_result_event_payload(
+    *,
+    action_id: str,
+    request_id: str,
+    command_preview: str,
+    result: ShellCommandResult,
+) -> dict[str, object]:
+    return {
+        "request_id": request_id,
+        "action_id": action_id,
+        "command_preview": command_preview,
+        "exit_code": result.exit_code,
+        "duration_seconds": result.duration_seconds,
+        "stdout_preview": _preview_output(result.stdout),
+        "stderr_preview": _preview_output(result.stderr),
+        "stdout_truncated": result.stdout_truncated,
+        "stderr_truncated": result.stderr_truncated,
+    }
 
 
 @dataclass(slots=True)
@@ -479,6 +519,7 @@ class ActionExecutor:
                 policy_evaluation=policy_evaluation,
                 request_cwd=request_cwd,
                 request_id=request_id,
+                session_id=session_id,
             ),
             approval_request,
             approval_resolution,
@@ -647,6 +688,7 @@ class ActionExecutor:
                     policy_evaluation=policy_evaluation,
                     request_cwd=request_cwd,
                     request_id=request_id,
+                    session_id=session_id,
                 )
             else:
                 raise ValueError(
@@ -815,10 +857,12 @@ class ActionExecutor:
         policy_evaluation: PolicyEvaluationRecord | None,
         request_cwd: Path,
         request_id: str,
+        session_id: str | None,
     ) -> ExecutionResult:
         assert action.shell is not None
         shell_action = action.shell
         shell_cwd = request_cwd if shell_action.cwd is None else Path(shell_action.cwd)
+        command_preview = shlex.join([shell_action.command, *shell_action.args])
         effective_timeout = shell_action.timeout_seconds
         effective_capture_limit_kb: int | None = None
         if policy_evaluation is not None:
@@ -829,6 +873,17 @@ class ActionExecutor:
                 effective_capture_limit_kb = budget.output_limit_kb
                 if budget.timeout_seconds is not None and effective_timeout is not None:
                     effective_timeout = min(effective_timeout, budget.timeout_seconds)
+        self._observer.emit(
+            EVENT_SHELL_EXECUTION_STARTED,
+            payload={
+                "request_id": request_id,
+                "action_id": action.id,
+                "command_preview": command_preview,
+                "cwd": str(shell_cwd),
+            },
+            session_id=session_id,
+            logger_name="foundation.services.orchestrator",
+        )
         try:
             result = self._shell_runtime.execute(
                 ShellCommandRequest(
@@ -847,6 +902,13 @@ class ActionExecutor:
                 on_event=self._shell_output_callback,
             )
         except ValueError as exc:
+            self._emit_shell_failed(
+                action_id=action.id,
+                request_id=request_id,
+                session_id=session_id,
+                command_preview=command_preview,
+                error=str(exc),
+            )
             return ExecutionResult(
                 action_id=action.id,
                 status=ExecutionStatus.FAILED,
@@ -854,6 +916,13 @@ class ActionExecutor:
                 error=str(exc),
             )
         except ShellExecutionSpawnError as exc:
+            self._emit_shell_failed(
+                action_id=action.id,
+                request_id=request_id,
+                session_id=session_id,
+                command_preview=command_preview,
+                error=str(exc),
+            )
             return ExecutionResult(
                 action_id=action.id,
                 status=ExecutionStatus.FAILED,
@@ -862,6 +931,14 @@ class ActionExecutor:
             )
         except ShellExecutionTimeout as exc:
             artifact = exc.result.model_dump(mode="json") if exc.result is not None else None
+            self._emit_shell_failed(
+                action_id=action.id,
+                request_id=request_id,
+                session_id=session_id,
+                command_preview=command_preview,
+                error=str(exc),
+                result=exc.result,
+            )
             return ExecutionResult(
                 action_id=action.id,
                 status=ExecutionStatus.FAILED,
@@ -872,6 +949,14 @@ class ActionExecutor:
             )
         except ShellExecutionCancelled as exc:
             artifact = exc.result.model_dump(mode="json") if exc.result is not None else None
+            self._emit_shell_failed(
+                action_id=action.id,
+                request_id=request_id,
+                session_id=session_id,
+                command_preview=command_preview,
+                error=str(exc),
+                result=exc.result,
+            )
             return ExecutionResult(
                 action_id=action.id,
                 status=ExecutionStatus.FAILED,
@@ -882,6 +967,29 @@ class ActionExecutor:
             )
 
         status = ExecutionStatus.EXECUTED if result.ok else ExecutionStatus.FAILED
+        payload = _shell_result_event_payload(
+            action_id=action.id,
+            request_id=request_id,
+            command_preview=command_preview,
+            result=result,
+        )
+        if result.ok:
+            self._observer.emit(
+                EVENT_SHELL_EXECUTION_FINISHED,
+                payload=payload,
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
+        else:
+            self._observer.emit(
+                EVENT_SHELL_EXECUTION_FAILED,
+                payload={
+                    **payload,
+                    "error": result.stderr or f"Exit code {result.exit_code}",
+                },
+                session_id=session_id,
+                logger_name="foundation.services.orchestrator",
+            )
         return ExecutionResult(
             action_id=action.id,
             status=status,
@@ -889,4 +997,37 @@ class ActionExecutor:
             artifact_type=ExecutionArtifactType.SHELL,
             artifact=result.model_dump(mode="json"),
             error=None if result.ok else result.stderr or f"Exit code {result.exit_code}",
+        )
+
+    def _emit_shell_failed(
+        self,
+        *,
+        action_id: str,
+        request_id: str,
+        session_id: str | None,
+        command_preview: str,
+        error: str,
+        result: ShellCommandResult | None = None,
+    ) -> None:
+        payload: dict[str, object] = {
+            "request_id": request_id,
+            "action_id": action_id,
+            "command_preview": command_preview,
+            "error": error,
+        }
+        if result is not None:
+            payload.update(
+                _shell_result_event_payload(
+                    action_id=action_id,
+                    request_id=request_id,
+                    command_preview=command_preview,
+                    result=result,
+                )
+            )
+            payload["error"] = error
+        self._observer.emit(
+            EVENT_SHELL_EXECUTION_FAILED,
+            payload=payload,
+            session_id=session_id,
+            logger_name="foundation.services.orchestrator",
         )

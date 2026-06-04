@@ -24,6 +24,8 @@ from foundation.observability import (
     EVENT_PLAN_STARTED,
     EVENT_SESSION_END,
     EVENT_SESSION_START,
+    EVENT_SHELL_EXECUTION_FINISHED,
+    EVENT_SHELL_EXECUTION_STARTED,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
@@ -264,6 +266,35 @@ def test_render_collapsed_includes_help_hint():
     state = TurnLiveState(iteration=1, planning_started_at=0.0)
     text = _render_to_text(render_collapsed(state, elapsed_seconds=0.2))
     assert "?" in text
+
+
+def test_render_collapsed_includes_recent_activity_lines():
+    state = TurnLiveState()
+    _drive(
+        state,
+        [
+            (EVENT_PLAN_STARTED, {}),
+            (EVENT_PLAN_FINISHED, {"action_count": 2}),
+            (EVENT_TOOL_CALL_STARTED, {"action_id": "read", "tool": "foundation.file.read"}),
+            (EVENT_TOOL_CALL_FINISHED, {"action_id": "read", "tool": "foundation.file.read"}),
+            (EVENT_SHELL_EXECUTION_STARTED, {"action_id": "test", "command_preview": "pytest -q"}),
+            (
+                EVENT_SHELL_EXECUTION_FINISHED,
+                {
+                    "action_id": "test",
+                    "command_preview": "pytest -q",
+                    "stdout_preview": "1 passed",
+                },
+            ),
+        ],
+    )
+
+    text = _render_to_text(render_collapsed(state, elapsed_seconds=0.2))
+
+    assert "done: planned 2 actions" in text
+    assert "done: foundation.file.read" in text
+    assert "run: pytest -q" in text
+    assert "output: 1 passed" in text
 
 
 def test_renderer_reuses_spinner_across_collapsed_refreshes():

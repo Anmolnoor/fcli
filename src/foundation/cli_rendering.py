@@ -533,6 +533,25 @@ def _approval_required_notice(
     )
 
 
+def _denied_recovery_notice(
+    result: OrchestrationResult,
+) -> ChatNotice | None:
+    """Offer recovery choices when the user denied an approval prompt."""
+    if result.stop_reason is not LoopStopReason.BLOCKED:
+        return None
+    if not any(
+        item.status is ExecutionStatus.BLOCKED
+        and item.error is not None
+        and "denied by the user" in item.error.lower()
+        for item in result.execution_results
+    ):
+        return None
+    return ChatNotice(
+        level=PresentationNoticeLevel.WARNING,
+        text=("Next: continue with read-only analysis, retry with approval, or stop."),
+    )
+
+
 def _awaiting_input_notice(
     result: OrchestrationResult,
 ) -> ChatNotice | None:
@@ -593,6 +612,7 @@ def _build_chat_turn_presentation(
 
     for iteration_notice in (
         _iteration_changed_files_notice(result),
+        _denied_recovery_notice(result),
         _iteration_commands_notice(result),
         _verification_outcome_notice(result),
         _approval_required_notice(result),

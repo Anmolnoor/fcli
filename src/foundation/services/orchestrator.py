@@ -2076,6 +2076,14 @@ class RequestOrchestrator:
         failed = sum(r.status is ExecutionStatus.FAILED for r in execution_results)
         skipped = sum(r.status is ExecutionStatus.NOT_EXECUTED for r in execution_results)
         total_planned = sum(len(it.plan.actions) for it in iterations)
+        actions_by_id = {
+            action.id: action for iteration in iterations for action in iteration.plan.actions
+        }
+        workspace_root = Path(iterations[-1].context.workspace_root) if iterations else None
+        changed_paths = RequestOrchestrator._changed_paths_for_summary(
+            execution_results,
+            workspace_root=workspace_root,
+        )
 
         if not any(it.plan.actions for it in iterations):
             text = "No actions were needed for this request."
@@ -2096,14 +2104,23 @@ class RequestOrchestrator:
                 stop_parts.append(f"{skipped} skipped")
 
             if blocked or failed:
+                cause = RequestOrchestrator._stop_cause_summary(
+                    execution_results,
+                    actions_by_id,
+                    stop_reason=stop_reason,
+                )
                 if executed:
-                    text = (
-                        "Stopped after "
-                        f"{RequestOrchestrator._action_count(executed, 'completed action')}; "
-                        f"{', '.join(stop_parts)}."
-                    )
+                    prefix = RequestOrchestrator._changed_prefix(changed_paths)
+                    if prefix:
+                        text = f"{prefix}, then stopped: {cause}."
+                    else:
+                        text = (
+                            "Stopped after "
+                            f"{RequestOrchestrator._action_count(executed, 'completed action')}: "
+                            f"{cause}."
+                        )
                 else:
-                    text = f"Stopped: {', '.join(stop_parts)}."
+                    text = f"Stopped: {cause or ', '.join(stop_parts)}."
             else:
                 parts = [f"Executed {RequestOrchestrator._action_count(executed, 'action')}"]
                 if pending:
@@ -2125,6 +2142,95 @@ class RequestOrchestrator:
             text=text,
         )
 
+    @staticmethod
+    def _changed_paths_for_summary(
+        execution_results: list[ExecutionResult],
+        *,
+        workspace_root: Path | None,
+    ) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for result in execution_results:
+            if result.status is not ExecutionStatus.EXECUTED:
+                continue
+            if result.artifact_type not in _CODE_CHANGING_ARTIFACT_TYPES:
+                continue
+            if result.artifact is None:
+                continue
+            path = result.artifact.get("path")
+            if not isinstance(path, str) or not path or path in seen:
+                continue
+            display_path = RequestOrchestrator._display_path(path, workspace_root=workspace_root)
+            if display_path in seen:
+                continue
+            seen.add(display_path)
+            paths.append(display_path)
+        return paths
+
+    @staticmethod
+    def _display_path(path: str, *, workspace_root: Path | None) -> str:
+        if workspace_root is None:
+            return path
+        candidate = Path(path)
+        try:
+            resolved = candidate if candidate.is_absolute() else workspace_root / candidate
+            return str(resolved.resolve().relative_to(workspace_root.resolve()))
+        except ValueError:
+            return path
+
+    @staticmethod
+    def _changed_prefix(paths: list[str]) -> str:
+        if not paths:
+            return ""
+        if len(paths) == 1:
+            return f"Changed {paths[0]}"
+        shown = ", ".join(paths[:3])
+        if len(paths) > 3:
+            shown += f", +{len(paths) - 3} more"
+        return f"Changed {len(paths)} files ({shown})"
+
+    @staticmethod
+    def _stop_cause_summary(
+        execution_results: list[ExecutionResult],
+        actions_by_id: dict[str, PlannedAction],
+        *,
+        stop_reason: LoopStopReason,
+    ) -> str:
+        for result in execution_results:
+            if result.status is ExecutionStatus.BLOCKED and _is_user_denied_text(result.error):
+                action_detail = RequestOrchestrator._action_detail(
+                    actions_by_id.get(result.action_id)
+                )
+                suffix = f" for `{action_detail}`" if action_detail else ""
+                return f"user denied approval{suffix}"
+        if stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK:
+            return "policy blocked the requested action"
+        for result in execution_results:
+            if result.status is ExecutionStatus.BLOCKED:
+                action_detail = RequestOrchestrator._action_detail(
+                    actions_by_id.get(result.action_id)
+                )
+                suffix = f" for `{action_detail}`" if action_detail else ""
+                return f"policy blocked the action{suffix}"
+        for result in execution_results:
+            if result.status is ExecutionStatus.FAILED:
+                action_detail = RequestOrchestrator._action_detail(
+                    actions_by_id.get(result.action_id)
+                )
+                suffix = f" in `{action_detail}`" if action_detail else ""
+                return f"tool failed{suffix}"
+        return "the run could not continue"
+
+    @staticmethod
+    def _action_detail(action: PlannedAction | None) -> str:
+        if action is None:
+            return ""
+        if action.kind is ActionKind.SHELL and action.shell is not None:
+            return shlex.join([action.shell.command, *action.shell.args])
+        if action.kind is ActionKind.TOOL_CALL and action.tool_call is not None:
+            return action.tool_call.capability_id
+        return action.summary
+
 
 # ------------------------------------------------------------------
 # Module-level helpers
@@ -2143,3 +2249,9 @@ def _truncate_preview(text: str) -> str | None:
         text = encoded[:_OBSERVATION_MAX_BYTES].decode("utf-8", errors="ignore")
         text += "\n... (truncated)"
     return text if text else None
+
+
+def _is_user_denied_text(text: str | None) -> bool:
+    if text is None:
+        return False
+    return "denied by the user" in text.lower()

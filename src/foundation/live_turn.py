@@ -39,6 +39,9 @@ from foundation.observability import (
     EVENT_QUESTION_ASKED,
     EVENT_SESSION_END,
     EVENT_SESSION_START,
+    EVENT_SHELL_EXECUTION_FAILED,
+    EVENT_SHELL_EXECUTION_FINISHED,
+    EVENT_SHELL_EXECUTION_STARTED,
     EVENT_TOOL_CALL_FAILED,
     EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
@@ -48,6 +51,7 @@ from foundation.observability import (
 _DISABLE_ENV = "FOUNDATION_DISABLE_LIVE_UX"
 _REFRESH_PER_SECOND = 8
 _MAX_COMPLETED_DETAIL = 12
+_MAX_ACTIVITY_LINES = 5
 _TOGGLE_KEY = "?"
 
 
@@ -97,6 +101,7 @@ class TurnLiveState:
     approval_summary: str | None = None
     awaiting_input: bool = False
     question_summary: str | None = None
+    activity_lines: list[str] = field(default_factory=list)
     finished: bool = False
     final_status: str | None = None
 
@@ -122,6 +127,7 @@ class TurnLiveState:
             return
         if event_name == EVENT_PLAN_STARTED:
             self.planning_started_at = now
+            self._push_activity("next: planning actions")
             self._set_phase(LivePhase.PLANNING, now)
             return
         if event_name == EVENT_PLAN_FINISHED:
@@ -129,23 +135,66 @@ class TurnLiveState:
             count = payload.get("action_count")
             if isinstance(count, int):
                 self.planning_action_count = count
+                noun = "action" if count == 1 else "actions"
+                self._push_activity(f"done: planned {count} {noun}")
+            else:
+                self._push_activity("done: planned actions")
             self._set_phase(LivePhase.THINKING, now)
             return
         if event_name == EVENT_TOOL_CALL_STARTED:
             self.current_action_id = str(payload.get("action_id") or "")
             self.current_action_tool = str(payload.get("tool") or "")
             self.current_action_started_at = now
+            if self.current_action_tool:
+                self._push_activity(f"next: {self.current_action_tool}")
             self._set_phase(LivePhase.RUNNING_TOOL, now)
             return
         if event_name == EVENT_TOOL_CALL_FINISHED:
+            tool = str(payload.get("tool") or self.current_action_tool or "")
             self._close_current(now, outcome="ok")
             self.success_count += 1
+            if tool:
+                self._push_activity(f"done: {tool}")
             self._set_phase(LivePhase.OBSERVING, now)
             return
         if event_name == EVENT_TOOL_CALL_FAILED:
             error = payload.get("error")
+            tool = str(payload.get("tool") or self.current_action_tool or "")
             self._close_current(now, outcome="failed", error=str(error) if error else None)
             self.failure_count += 1
+            if tool:
+                self._push_activity(f"failed: {tool}")
+            self._set_phase(LivePhase.OBSERVING, now)
+            return
+        if event_name == EVENT_SHELL_EXECUTION_STARTED:
+            command = _payload_text(payload, "command_preview")
+            self.current_action_id = str(payload.get("action_id") or "")
+            self.current_action_tool = "shell"
+            self.current_action_started_at = now
+            if command:
+                self._push_activity(f"run: {command}")
+            self._set_phase(LivePhase.RUNNING_TOOL, now)
+            return
+        if event_name == EVENT_SHELL_EXECUTION_FINISHED:
+            stdout = _preview_line(_payload_text(payload, "stdout_preview"))
+            stderr = _preview_line(_payload_text(payload, "stderr_preview"))
+            self._close_current(now, outcome="ok")
+            self.success_count += 1
+            if stdout:
+                self._push_activity(f"output: {stdout}")
+            elif stderr:
+                self._push_activity(f"stderr: {stderr}")
+            self._set_phase(LivePhase.OBSERVING, now)
+            return
+        if event_name == EVENT_SHELL_EXECUTION_FAILED:
+            error = _payload_text(payload, "error")
+            stderr = _preview_line(_payload_text(payload, "stderr_preview"))
+            self._close_current(now, outcome="failed", error=error or stderr or None)
+            self.failure_count += 1
+            if stderr:
+                self._push_activity(f"stderr: {stderr}")
+            elif error:
+                self._push_activity(f"failed: {error}")
             self._set_phase(LivePhase.OBSERVING, now)
             return
         if event_name == EVENT_APPROVAL_REQUESTED:
@@ -187,6 +236,23 @@ class TurnLiveState:
         self.phase = phase
         self.phase_started_at = now
 
+    def _push_activity(self, line: str) -> None:
+        line = _truncate(" ".join(line.split()), limit=96)
+        if not line:
+            return
+        if self.activity_lines and self.activity_lines[-1] == line:
+            return
+        if (
+            self.activity_lines
+            and line.startswith(("output: ", "stderr: "))
+            and self.activity_lines[-1].startswith(("output: ", "stderr: "))
+        ):
+            self.activity_lines[-1] = line
+            return
+        self.activity_lines.append(line)
+        if len(self.activity_lines) > _MAX_ACTIVITY_LINES:
+            del self.activity_lines[: len(self.activity_lines) - _MAX_ACTIVITY_LINES]
+
     def _close_current(self, now: float, *, outcome: str, error: str | None = None) -> None:
         if self.current_action_id is None:
             return
@@ -227,6 +293,19 @@ def _truncate(value: str, *, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: max(limit - 1, 1)] + "…"
+
+
+def _payload_text(payload: Mapping[str, Any], key: str) -> str:
+    value = payload.get(key)
+    return str(value or "")
+
+
+def _preview_line(value: str) -> str:
+    for line in value.splitlines():
+        line = line.strip()
+        if line:
+            return _truncate(line, limit=96)
+    return _truncate(value.strip(), limit=96)
 
 
 def render_status_line(
@@ -316,10 +395,10 @@ def render_collapsed(
         spinner = Spinner("dots", text=status, style="cyan")
     else:
         spinner.update(text=status, style="cyan")
-    return Group(
-        spinner,
-        Text("press ? for detail · Ctrl-C to cancel", style="dim"),
-    )
+    lines: list[RenderableType] = [spinner]
+    lines.extend(Text(line, style="dim") for line in state.activity_lines)
+    lines.append(Text("press ? for detail · Ctrl-C to cancel", style="dim"))
+    return Group(*lines)
 
 
 _active_renderer_lock = threading.Lock()
