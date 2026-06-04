@@ -36,7 +36,7 @@ If any of that is a dealbreaker, that's totally fair — come back in a few mont
 ./scripts/uv run foundation
 ```
 
-You'll need Python 3.12 and an API key for either OpenAI or Ollama. On a fresh Mac, start with the macOS walkthrough in [`docs/how-to-use.md`](docs/how-to-use.md). See [`docs/TECHNICAL.md`](docs/TECHNICAL.md) for the full configuration surface, CLI commands, and architecture notes.
+You'll need Python 3.12 and a provider. The Codex provider can reuse your ChatGPT login; OpenAI and Ollama Cloud use API keys. On a fresh Mac, start with the macOS walkthrough in [`docs/how-to-use.md`](docs/how-to-use.md). See [`docs/TECHNICAL.md`](docs/TECHNICAL.md) for the full configuration surface, CLI commands, and architecture notes.
 
 ## Where things live
 
