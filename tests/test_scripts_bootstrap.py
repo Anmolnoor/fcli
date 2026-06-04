@@ -26,6 +26,9 @@ def test_bootstrap_prints_homebrew_python312_hint_when_requested_python_is_missi
     brew_bin = bin_dir / "brew"
     brew_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     brew_bin.chmod(0o755)
+    uname_bin = bin_dir / "uname"
+    uname_bin.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
+    uname_bin.chmod(0o755)
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
