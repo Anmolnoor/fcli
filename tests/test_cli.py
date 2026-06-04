@@ -20,11 +20,13 @@ from foundation.cli import (
     AgentInvocationMode,
     CLIRequestRoute,
     FoundationGroup,
+    app,
+)
+from foundation.cli_interactive import (
     InteractiveChatState,
     _build_chat_prompt_session,
     _chat_prompt,
     _render_interactive_chat_help,
-    app,
 )
 from foundation.models import (
     ActionKind,
@@ -670,7 +672,7 @@ def test_chat_emits_json_for_one_shot_orchestration(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -721,7 +723,7 @@ def test_chat_one_shot_defaults_to_concise_rendering(
             return _chat_result_with_details(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -750,7 +752,7 @@ def test_chat_one_shot_accepts_no_live_flag(
             return _chat_result_with_details(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -811,7 +813,7 @@ def test_chat_one_shot_writes_event_log_by_default(
             return _chat_result_with_details(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -845,7 +847,7 @@ def test_chat_one_shot_no_monitor_writes_no_event_log(
             return _chat_result_with_details(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -884,7 +886,7 @@ def test_chat_one_shot_verbose_rendering_shows_internal_detail(
             return _chat_result_with_details(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -917,7 +919,7 @@ def test_chat_without_request_starts_interactive_session(
     requests: list[UserRequest] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
 
     class StubOrchestrator:
@@ -926,7 +928,7 @@ def test_chat_without_request_starts_interactive_session(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -951,10 +953,10 @@ def test_chat_interactive_shell_prefix_routes_to_direct_shell_execution(
     captured_commands: list[str] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
     monkeypatch.setattr(
-        "foundation.cli._execute_repl_shell_command",
+        "foundation.cli_interactive._execute_repl_shell_command",
         lambda **kwargs: captured_commands.append(kwargs["raw_command"]),
     )
 
@@ -973,7 +975,7 @@ def test_chat_interactive_can_override_approval_mode(
     captured_modes: list[ApprovalMode | None] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
 
     class StubOrchestrator:
@@ -984,7 +986,7 @@ def test_chat_interactive_can_override_approval_mode(
         captured_modes.append(kwargs.get("approval_mode"))  # type: ignore[arg-type]
         return StubOrchestrator()
 
-    monkeypatch.setattr("foundation.cli._build_orchestrator", _stub_build_orchestrator)
+    monkeypatch.setattr("foundation.cli_runtime._build_orchestrator", _stub_build_orchestrator)
 
     result = runner.invoke(app, ["--config", str(config_path), "chat"])
 
@@ -1004,7 +1006,7 @@ def test_chat_interactive_persists_transcript_across_turns_and_restarts(
     requests: list[UserRequest] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_sessions.pop(0),
     )
 
@@ -1014,7 +1016,7 @@ def test_chat_interactive_persists_transcript_across_turns_and_restarts(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1051,7 +1053,7 @@ def test_chat_interactive_detail_commands_render_last_result(
     )
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
 
     class StubOrchestrator:
@@ -1059,7 +1061,7 @@ def test_chat_interactive_detail_commands_render_last_result(
             return _chat_result_with_details(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1080,7 +1082,7 @@ def test_chat_interactive_detail_commands_require_a_prior_result(
     prompt_session = FakePromptSession(["/summary", "/exit"])
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
 
     result = runner.invoke(app, ["--config", str(config_path), "chat"])
@@ -1101,7 +1103,7 @@ def test_chat_interactive_reset_clears_persisted_transcript(
     requests: list[UserRequest] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_sessions.pop(0),
     )
 
@@ -1111,7 +1113,7 @@ def test_chat_interactive_reset_clears_persisted_transcript(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1135,7 +1137,7 @@ def test_chat_interactive_persists_shell_turns_into_transcript(
     requests: list[UserRequest] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_sessions.pop(0),
     )
 
@@ -1145,7 +1147,7 @@ def test_chat_interactive_persists_shell_turns_into_transcript(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1171,7 +1173,7 @@ def test_chat_interactive_manual_approval_history_stays_pending(
     prompt_session = FakePromptSession(["!touch manual.txt", "/exit"])
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_session,
     )
 
@@ -1198,7 +1200,7 @@ def test_chat_recovery_notice_does_not_replay_full_interrupted_request(
     prompt_session = FakePromptSession(["/exit"])
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_session,
     )
     settings = load_settings(config_path=config_path)
@@ -1297,7 +1299,7 @@ def test_chat_interactive_memory_command_updates_project_memory(
     )
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_session,
     )
 
@@ -1319,7 +1321,7 @@ def test_chat_interactive_model_command_updates_subsequent_request(
     captured_models: list[str] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_session,
     )
 
@@ -1337,7 +1339,10 @@ def test_chat_interactive_model_command_updates_subsequent_request(
         captured_models.append(cast(Any, settings).provider.model)
         return _chat_result(message)
 
-    monkeypatch.setattr("foundation.cli._execute_chat_request", _stub_execute_chat_request)
+    monkeypatch.setattr(
+        "foundation.cli_interactive._execute_chat_request",
+        _stub_execute_chat_request,
+    )
 
     result = runner.invoke(app, ["--config", str(config_path), "chat"])
 
@@ -1358,7 +1363,7 @@ def test_chat_interactive_can_resume_specific_persistent_session(
     requests: list[UserRequest] = []
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session",
+        "foundation.cli_interactive._build_chat_prompt_session",
         lambda _settings: prompt_sessions.pop(0),
     )
 
@@ -1383,7 +1388,10 @@ def test_chat_interactive_can_resume_specific_persistent_session(
         )
         return _chat_result(message)
 
-    monkeypatch.setattr("foundation.cli._execute_chat_request", _stub_execute_chat_request)
+    monkeypatch.setattr(
+        "foundation.cli_interactive._execute_chat_request",
+        _stub_execute_chat_request,
+    )
 
     first_result = runner.invoke(app, ["--config", str(config_path), "chat", "--new"])
     second_result = runner.invoke(app, ["--config", str(config_path), "chat", "--new"])
@@ -1548,7 +1556,7 @@ def test_render_interactive_chat_help_preserves_argument_placeholders(
 ) -> None:
     buffer = StringIO()
     test_console = Console(file=buffer, force_terminal=False, color_system=None, width=140)
-    monkeypatch.setattr("foundation.cli.console", test_console)
+    monkeypatch.setattr("foundation.cli_interactive.console", test_console)
 
     _render_interactive_chat_help()
 
@@ -1667,7 +1675,7 @@ def test_bare_foundation_starts_interactive_session(
     prompt_session = FakePromptSession(["/exit"])
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
 
     result = runner.invoke(app, ["--config", str(config_path)])
@@ -1691,7 +1699,7 @@ def test_bare_foundation_one_shot_routes_to_agent(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1720,7 +1728,7 @@ def test_bare_foundation_one_shot_quoted_request(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1807,7 +1815,7 @@ def test_quoted_run_tests_routes_to_agent(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1830,7 +1838,7 @@ def test_chat_alias_parity_interactive(
     prompt_session = FakePromptSession(["/exit"])
     monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
     monkeypatch.setattr(
-        "foundation.cli._build_chat_prompt_session", lambda _settings: prompt_session
+        "foundation.cli_interactive._build_chat_prompt_session", lambda _settings: prompt_session
     )
 
     result = runner.invoke(app, ["--config", str(config_path), "chat"])
@@ -1854,7 +1862,7 @@ def test_chat_alias_parity_one_shot(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -1916,7 +1924,7 @@ def test_global_flags_not_swallowed_as_request(
             return _chat_result(request.message)
 
     monkeypatch.setattr(
-        "foundation.cli._build_orchestrator",
+        "foundation.cli_runtime._build_orchestrator",
         lambda _settings, **_kwargs: StubOrchestrator(),
     )
 
@@ -2071,12 +2079,12 @@ def _iteration_result_for_notices(
 def test_interactive_concise_chat_turn_indents_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from foundation.cli import _render_concise_chat_turn
+    from foundation.cli_rendering import _render_concise_chat_turn
     from foundation.models import ChatSurfacePolicy
 
     buffer = StringIO()
     test_console = Console(file=buffer, force_terminal=False, color_system=None, width=140)
-    monkeypatch.setattr("foundation.cli.console", test_console)
+    monkeypatch.setattr("foundation.cli_rendering.console", test_console)
     result = _iteration_result_for_notices(
         stop_reason=LoopStopReason.PENDING_APPROVAL,
         pending_approval_actions=1,
@@ -2095,7 +2103,7 @@ def test_interactive_concise_chat_turn_indents_output(
 
 
 def test_iteration_changed_files_notice_lists_paths() -> None:
-    from foundation.cli import _iteration_changed_files_notice
+    from foundation.cli_rendering import _iteration_changed_files_notice
 
     result = _iteration_result_for_notices(
         changed_paths=["src/a.py", "src/b.py"],
@@ -2108,7 +2116,7 @@ def test_iteration_changed_files_notice_lists_paths() -> None:
 
 
 def test_iteration_changed_files_notice_dedups_and_caps() -> None:
-    from foundation.cli import _iteration_changed_files_notice
+    from foundation.cli_rendering import _iteration_changed_files_notice
 
     # Build a result with execution_results spanning 10 unique writes plus a
     # duplicate, without tripping the per-plan 5-action cap.  The notice
@@ -2133,14 +2141,14 @@ def test_iteration_changed_files_notice_dedups_and_caps() -> None:
 
 
 def test_iteration_changed_files_notice_empty() -> None:
-    from foundation.cli import _iteration_changed_files_notice
+    from foundation.cli_rendering import _iteration_changed_files_notice
 
     result = _iteration_result_for_notices()
     assert _iteration_changed_files_notice(result) is None
 
 
 def test_awaiting_input_notice_surfaces_question() -> None:
-    from foundation.cli import _awaiting_input_notice
+    from foundation.cli_rendering import _awaiting_input_notice
     from foundation.models import LoopStopReason
 
     result = _iteration_result_for_notices(stop_reason=LoopStopReason.AWAITING_USER_INPUT)
@@ -2159,7 +2167,7 @@ def test_awaiting_input_notice_surfaces_question() -> None:
 
 
 def test_awaiting_input_notice_none_without_stop_reason() -> None:
-    from foundation.cli import _awaiting_input_notice
+    from foundation.cli_rendering import _awaiting_input_notice
 
     result = _iteration_result_for_notices()
     assert _awaiting_input_notice(result) is None
@@ -2170,7 +2178,7 @@ def test_prompt_for_question_selects_option_by_number(
 ) -> None:
     import typer as _typer
 
-    from foundation.cli import _prompt_for_question
+    from foundation.cli_runtime import _prompt_for_question
     from foundation.models import QuestionAction
 
     monkeypatch.setattr(_typer, "prompt", lambda *_a, **_k: "2")
@@ -2183,7 +2191,7 @@ def test_prompt_for_question_accepts_free_text(
 ) -> None:
     import typer as _typer
 
-    from foundation.cli import _prompt_for_question
+    from foundation.cli_runtime import _prompt_for_question
     from foundation.models import QuestionAction
 
     monkeypatch.setattr(_typer, "prompt", lambda *_a, **_k: "  use msgpack  ")
@@ -2192,7 +2200,7 @@ def test_prompt_for_question_accepts_free_text(
 
 
 def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:
-    from foundation.cli import _iteration_commands_notice
+    from foundation.cli_rendering import _iteration_commands_notice
 
     result = _iteration_result_for_notices(
         shell_commands=[
@@ -2208,7 +2216,7 @@ def test_iteration_commands_notice_lists_and_dedups_consecutive() -> None:
 
 
 def test_verification_outcome_notice_covers_all_outcomes() -> None:
-    from foundation.cli import _verification_outcome_notice
+    from foundation.cli_rendering import _verification_outcome_notice
     from foundation.models import VerificationOutcome
 
     passed = _iteration_result_for_notices(
@@ -2254,7 +2262,7 @@ def test_verification_outcome_notice_covers_all_outcomes() -> None:
 
 
 def test_approval_required_notice_fires_only_for_pending_approval_stop() -> None:
-    from foundation.cli import _approval_required_notice
+    from foundation.cli_rendering import _approval_required_notice
     from foundation.models import LoopStopReason
 
     pending = _iteration_result_for_notices(

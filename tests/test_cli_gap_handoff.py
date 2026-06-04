@@ -37,14 +37,14 @@ def test_handle_gap_handoff_report_writes_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from foundation import cli
+    from foundation import cli_runtime
 
     settings = load_settings(config_path=_write_stage_2_config(tmp_path))
     handoff = _missing_capability_handoff()
     report_option = next(o for o in handoff.options if o.kind is GapOptionKind.REPORT)
-    monkeypatch.setattr(cli, "_prompt_gap_option", lambda _h: report_option)
+    monkeypatch.setattr(cli_runtime, "_prompt_gap_option", lambda _h: report_option)
 
-    follow_up = cli._handle_gap_handoff(handoff, settings=settings)
+    follow_up = cli_runtime._handle_gap_handoff(handoff, settings=settings)
 
     assert follow_up is None  # reporting does not resume work
     gaps_dir = settings.app.state_dir / "gaps"
@@ -56,14 +56,14 @@ def test_handle_gap_handoff_alternative_returns_follow_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from foundation import cli
+    from foundation import cli_runtime
 
     settings = load_settings(config_path=_write_stage_2_config(tmp_path))
     handoff = _missing_capability_handoff()
     alt_option = next(o for o in handoff.options if o.kind is GapOptionKind.ALTERNATIVE)
-    monkeypatch.setattr(cli, "_prompt_gap_option", lambda _h: alt_option)
+    monkeypatch.setattr(cli_runtime, "_prompt_gap_option", lambda _h: alt_option)
 
-    follow_up = cli._handle_gap_handoff(handoff, settings=settings)
+    follow_up = cli_runtime._handle_gap_handoff(handoff, settings=settings)
 
     assert follow_up == alt_option.follow_up_request
     assert "store this in a database" in follow_up
@@ -73,10 +73,10 @@ def test_handle_gap_handoff_declined_returns_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from foundation import cli
+    from foundation import cli_runtime
 
     settings = load_settings(config_path=_write_stage_2_config(tmp_path))
     handoff = _missing_capability_handoff()
-    monkeypatch.setattr(cli, "_prompt_gap_option", lambda _h: None)
+    monkeypatch.setattr(cli_runtime, "_prompt_gap_option", lambda _h: None)
 
-    assert cli._handle_gap_handoff(handoff, settings=settings) is None
+    assert cli_runtime._handle_gap_handoff(handoff, settings=settings) is None
