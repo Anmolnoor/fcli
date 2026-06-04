@@ -61,6 +61,17 @@ class StubProvider:
         self.calls: list[ProviderPrompt] = []
 
     def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
+        if prompt.schema_name == "assistant_plan_review" and not (
+            self._responses
+            and isinstance(self._responses[0].structured_output, dict)
+            and "decision" in self._responses[0].structured_output
+        ):
+            return _provider_response(
+                {
+                    "decision": "accept",
+                    "reason": "Stub preflight accepted the candidate plan.",
+                }
+            )
         self.calls.append(prompt)
         if not self._responses:
             return _provider_response(
@@ -699,7 +710,14 @@ def test_orchestrator_deferred_write_failure_degrades_to_failed_action(
             self.calls.append(prompt)
             if len(self.calls) == 1:
                 return plan
-            if len(self.calls) == 2:
+            if prompt.schema_name == "assistant_plan_review":
+                return _provider_response(
+                    {
+                        "decision": "accept",
+                        "reason": "Candidate plan is safe to execute.",
+                    }
+                )
+            if len(self.calls) == 3:
                 raise ProviderError("body truncated", code=ProviderErrorCode.TRUNCATED)
             return _provider_response({"assistant_message": "Done.", "actions": []})
 
@@ -997,6 +1015,138 @@ def test_out_of_scope_shell_write_is_terminal_policy_block(
     assert runtime.calls == 0
     assert result.summary.blocked_actions == 1
     assert not outside.exists()
+
+
+def test_planner_rejects_relative_parent_directory_write_for_developer_request(
+    tmp_path: Path,
+) -> None:
+    developer_root = tmp_path / "Developer"
+    workspace_root = developer_root / "fcli"
+    workspace_root.mkdir(parents=True)
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Creating the Developer directory and cheat sheet.",
+                    "actions": [
+                        {
+                            "id": "make_developer",
+                            "kind": "shell",
+                            "summary": "Create the developer directory",
+                            "shell": {"command": "mkdir", "args": ["developer"]},
+                        },
+                        {
+                            "id": "write_cheatsheet",
+                            "kind": "tool_call",
+                            "summary": "Write the GitHub cheat sheet",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "developer/github-cheatsheet.md",
+                                    "content": "# GitHub\n",
+                                },
+                            },
+                        },
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": (
+                        "I cannot write into the Developer directory from this "
+                        "workspace. Open fcli in that directory or use it as the "
+                        "workspace root, then ask again."
+                    ),
+                    "actions": [],
+                }
+            ),
+        ]
+    )
+    runtime = CountingShellRuntime(workspace_root=workspace_root)
+    tool_service = LocalToolService(
+        workspace_root=workspace_root,
+        default_timeout_seconds=5,
+        capture_limit_kb=64,
+    )
+    orchestrator = RequestOrchestrator(
+        workspace_root=workspace_root,
+        approval_mode=ApprovalMode.AUTO,
+        provider=provider,
+        shell_runtime=runtime,
+        tool_service=tool_service,
+        approval_service=ApprovalService(mode=ApprovalMode.AUTO),
+    )
+
+    result = orchestrator.orchestrate(
+        UserRequest(message="create a github cheat sheet in the Developer dir")
+    )
+
+    assert len(provider.calls) == 2
+    assert runtime.calls == 0
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert result.summary.executed_actions == 0
+    assert not (workspace_root / "developer").exists()
+
+
+def test_preflight_plan_review_repairs_mutating_plan_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Writing the requested note.",
+                    "actions": [
+                        {
+                            "id": "write_wrong",
+                            "kind": "tool_call",
+                            "summary": "Write the note",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "wrong.md",
+                                    "content": "wrong\n",
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "decision": "repair",
+                    "reason": "The plan writes wrong.md, but the user asked for note.md.",
+                    "repaired_plan": {
+                        "assistant_message": "Writing note.md instead.",
+                        "actions": [
+                            {
+                                "id": "write_note",
+                                "kind": "tool_call",
+                                "summary": "Write the requested note",
+                                "tool_call": {
+                                    "capability_id": "foundation.file.write",
+                                    "arguments": {
+                                        "path": "note.md",
+                                        "content": "correct\n",
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                }
+            ),
+            _provider_response({"assistant_message": "Done.", "actions": []}),
+        ]
+    )
+    orchestrator, _, workspace_root = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message="create note.md with correct"))
+
+    assert result.stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+    assert provider.calls[1].schema_name == "assistant_plan_review"
+    assert (workspace_root / "note.md").read_text(encoding="utf-8") == "correct\n"
+    assert not (workspace_root / "wrong.md").exists()
 
 
 def test_zero_action_file_creation_claim_is_not_reported_as_done(
