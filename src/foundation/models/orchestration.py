@@ -104,6 +104,7 @@ class LoopStopReason(StrEnum):
     ZERO_ACTION_PLAN = "zero_action_plan"
     PENDING_APPROVAL = "pending_approval"
     AWAITING_USER_INPUT = "awaiting_user_input"
+    BLOCKED = "blocked"
     FATAL_EXECUTION_FAILURE = "fatal_execution_failure"
     MAX_ITERATIONS = "max_iterations"
     MAX_ACTIONS = "max_actions"

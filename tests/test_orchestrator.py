@@ -1360,6 +1360,82 @@ def test_orchestrator_blocks_risky_shell_commands_when_prompt_is_denied(
     assert not (workspace_root / "denied.txt").exists()
 
 
+def test_orchestrator_stops_after_denied_approval_without_replanning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "I can create that file after approval.",
+                    "actions": [
+                        {
+                            "id": "create_file",
+                            "kind": "shell",
+                            "summary": "Create a file in the workspace",
+                            "shell": {
+                                "command": "touch",
+                                "args": ["denied.txt"],
+                            },
+                        },
+                        {
+                            "id": "write_retry",
+                            "kind": "tool_call",
+                            "summary": "Write retry marker",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "retry.txt",
+                                    "content": "should not happen\n",
+                                },
+                            },
+                        },
+                    ],
+                }
+            ),
+            _provider_response(
+                {
+                    "assistant_message": "Trying a different path.",
+                    "actions": [
+                        {
+                            "id": "write_second_plan",
+                            "kind": "tool_call",
+                            "summary": "Write second-plan marker",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "second-plan.txt",
+                                    "content": "should not happen either\n",
+                                },
+                            },
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    orchestrator, runtime, workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+        approval_service=ApprovalService(
+            mode=ApprovalMode.PROMPT,
+            prompt_callback=lambda _request: False,
+        ),
+    )
+
+    result = orchestrator.orchestrate(UserRequest(message="create denied.txt"))
+
+    assert len(provider.calls) == 1
+    assert runtime.calls == 0
+    assert result.stop_reason is LoopStopReason.BLOCKED
+    assert result.execution_results[0].status is ExecutionStatus.BLOCKED
+    assert not (workspace_root / "denied.txt").exists()
+    assert not (workspace_root / "retry.txt").exists()
+    assert not (workspace_root / "second-plan.txt").exists()
+
+
 def test_orchestrator_persists_sessions_commands_and_summaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
