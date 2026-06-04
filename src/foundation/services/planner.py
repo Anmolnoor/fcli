@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from foundation.models import (
     ActionKind,
@@ -60,10 +60,72 @@ _SHELL_EQUIVALENT_COMMANDS = {
 _FILE_WRITE_NOTE_KEY = "_file_write_note"
 _CONTENT_BRIEF_PREFIX = "content_brief:"
 _GH_API_UNSUPPORTED_FLAGS = frozenset({"-r"})
+_FILE_MUTATION_CAPABILITY_IDS = frozenset(
+    {
+        "foundation.file.write",
+        "foundation.file.edit",
+        "foundation.file.apply_diff",
+    }
+)
+_RELATIVE_PATH_MUTATION_COMMANDS = frozenset(
+    {
+        "cp",
+        "mkdir",
+        "mv",
+        "rm",
+        "rmdir",
+        "sed",
+        "tee",
+        "touch",
+    }
+)
+_DIRECTORY_TARGET_RE = re.compile(r"\b(dir|directory|folder|path)\b", re.IGNORECASE)
+_GIT_MUTATION_CAPABILITY_IDS = frozenset(
+    {
+        "foundation.git.stage",
+        "foundation.git.unstage",
+        "foundation.git.commit",
+    }
+)
+_SHELL_MUTATION_COMMANDS = frozenset({*_RELATIVE_PATH_MUTATION_COMMANDS, "git"})
+_GIT_MUTATION_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "apply",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "merge",
+        "mv",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "stash",
+        "switch",
+        "tag",
+    }
+)
 
 
 class PlanningError(RuntimeError):
     """Raised when the planner cannot produce a valid bounded plan."""
+
+
+class PlanReview(BaseModel):
+    """Structured preflight review for a candidate plan before execution."""
+
+    decision: Literal["accept", "repair", "reject"]
+    reason: str = Field(min_length=1)
+    repaired_plan: AssistantPlan | None = None
+
+    @model_validator(mode="after")
+    def _validate_repair_payload(self) -> PlanReview:
+        if self.decision == "repair" and self.repaired_plan is None:
+            raise ValueError("repair decisions must include repaired_plan")
+        return self
 
 
 class PlannerService:
@@ -198,12 +260,35 @@ class PlannerService:
                 plan = AssistantPlan.model_validate(structured_output)
                 prefix_plan = self._plan_with_executable_prefix(plan)
                 if prefix_plan is not None:
+                    candidate = prefix_plan
                     self._validate_supported_actions(
-                        prefix_plan,
+                        candidate,
                         request=request,
                         context=context,
                     )
-                    return prefix_plan, response.metadata
+                    candidate = self._preflight_review_plan(
+                        candidate,
+                        request=request,
+                        context=context,
+                        observation_text=observation_text,
+                    )
+                    self._validate_supported_actions(
+                        candidate,
+                        request=request,
+                        context=context,
+                    )
+                    return candidate, response.metadata
+                self._validate_supported_actions(
+                    plan,
+                    request=request,
+                    context=context,
+                )
+                plan = self._preflight_review_plan(
+                    plan,
+                    request=request,
+                    context=context,
+                    observation_text=observation_text,
+                )
                 self._validate_supported_actions(
                     plan,
                     request=request,
@@ -327,6 +412,10 @@ class PlannerService:
             "be approved from inside this workspace. If the user asks for that, "
             "return zero actions and explain that they should open fcli in the "
             "target directory or use that directory as the workspace root. "
+            "Do not reinterpret a user-named ancestor directory as a relative "
+            "workspace child. For example, if the workspace is `~/Developer/fcli` "
+            "and the user asks for the `Developer` directory, do not use "
+            "`developer/...`; that points inside the current workspace. "
             "Shell args are passed directly to the target binary via execve, "
             "NOT interpreted by a shell. Do NOT wrap args in single or double "
             "quotes, do NOT expect glob expansion or variable substitution, "
@@ -468,6 +557,96 @@ class PlannerService:
         )
         return messages
 
+    def _preflight_review_plan(
+        self,
+        plan: AssistantPlan,
+        *,
+        request: UserRequest,
+        context: ContextSnapshot,
+        observation_text: str | None,
+    ) -> AssistantPlan:
+        if not self._plan_needs_preflight_review(plan):
+            return plan
+        response = self._provider.complete(
+            ProviderPrompt(
+                messages=self._preflight_review_messages(
+                    plan,
+                    request=request,
+                    context=context,
+                    observation_text=observation_text,
+                ),
+                response_format=ProviderResponseFormat.JSON_OBJECT,
+                schema_name="assistant_plan_review",
+                output_schema=PlanReview.model_json_schema(),
+            )
+        )
+        if response.structured_output is None:
+            raise PlanningError("Preflight plan review did not return structured output.")
+        review = PlanReview.model_validate(response.structured_output)
+        if review.decision == "accept":
+            return plan
+        if review.decision == "repair":
+            assert review.repaired_plan is not None
+            return review.repaired_plan
+        return AssistantPlan(assistant_message=review.reason, actions=[])
+
+    @staticmethod
+    def _preflight_review_messages(
+        plan: AssistantPlan,
+        *,
+        request: UserRequest,
+        context: ContextSnapshot,
+        observation_text: str | None,
+    ) -> list[ProviderMessage]:
+        developer = (
+            "You are the preflight plan reviewer for Foundation CLI. Review the "
+            "candidate plan before any action executes. Return JSON only. "
+            "Accept plans that faithfully satisfy the user request and stay within "
+            "the workspace/policy constraints. Repair only when the corrected plan "
+            "is obvious from the request and context. Reject by returning a "
+            "zero-action repaired_plan or decision=reject when execution should not "
+            "proceed. Check path intent, workspace root, request cwd, outside-write "
+            "policy, missing prerequisites, repeated actions, typed-tool usage, and "
+            "whether code-changing plans include a plausible verification path."
+        )
+        review_context = {
+            "request": request.message,
+            "context": context.model_dump(mode="json", exclude={"available_capabilities"}),
+            "candidate_plan": plan.model_dump(mode="json"),
+        }
+        if observation_text:
+            review_context["observations"] = observation_text
+        user = (
+            "Review this candidate plan and return one of:\n"
+            "- accept: keep the candidate plan unchanged\n"
+            "- repair: include repaired_plan with the corrected AssistantPlan\n"
+            "- reject: no action should execute; reason becomes the user-facing answer\n\n"
+            f"{json.dumps(review_context, indent=2)}"
+        )
+        return [
+            ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=developer),
+            ProviderMessage(role=ProviderMessageRole.USER, content=user),
+        ]
+
+    @staticmethod
+    def _plan_needs_preflight_review(plan: AssistantPlan) -> bool:
+        for action in plan.actions:
+            if action.kind is ActionKind.TOOL_CALL and action.tool_call is not None:
+                capability_id = action.tool_call.capability_id
+                if (
+                    capability_id in _FILE_MUTATION_CAPABILITY_IDS
+                    or capability_id in _GIT_MUTATION_CAPABILITY_IDS
+                ):
+                    return True
+            if action.kind is ActionKind.SHELL and action.shell is not None:
+                command = action.shell.command.split("/")[-1]
+                if command in _SHELL_MUTATION_COMMANDS:
+                    if command != "git":
+                        return True
+                    if action.shell.args and action.shell.args[0] in _GIT_MUTATION_SUBCOMMANDS:
+                        return True
+        return False
+
     def _validate_supported_actions(
         self,
         plan: AssistantPlan,
@@ -487,6 +666,7 @@ class PlannerService:
                 "approval and git context still shows staged changes. Plan "
                 "foundation.git.commit with requires_approval=true."
             )
+        named_ancestors = self._named_workspace_ancestors(request.message, context)
         for action_index, action in enumerate(plan.actions):
             if action.kind is ActionKind.SHELL:
                 assert action.shell is not None
@@ -511,6 +691,12 @@ class PlannerService:
                         f"Shell action {action.id!r} uses `{shell_command}`, but "
                         f"the typed capability equivalent {equivalent} must be used."
                     )
+                for raw_path in self._shell_mutation_path_args(shell_command, action.shell.args):
+                    self._reject_ambiguous_ancestor_relative_path(
+                        action_id=action.id,
+                        raw_path=raw_path,
+                        named_ancestors=named_ancestors,
+                    )
             if action.kind is ActionKind.TOOL_CALL:
                 assert action.tool_call is not None
                 if (
@@ -532,11 +718,68 @@ class PlannerService:
                         "foundation.git.commit must set requires_approval=true "
                         "and provide approval_reason."
                     )
+                if action.tool_call.capability_id in _FILE_MUTATION_CAPABILITY_IDS:
+                    self._reject_ambiguous_ancestor_relative_path(
+                        action_id=action.id,
+                        raw_path=action.tool_call.arguments.get("path"),
+                        named_ancestors=named_ancestors,
+                    )
                 self._validated_tool_request(
                     action.tool_call.capability_id,
                     action.tool_call.version,
                     action.tool_call.arguments,
                 )
+
+    @staticmethod
+    def _named_workspace_ancestors(
+        message: str,
+        context: ContextSnapshot,
+    ) -> dict[str, str]:
+        if not _DIRECTORY_TARGET_RE.search(message):
+            return {}
+        message_lower = message.lower()
+        workspace_root = Path(context.workspace_root).expanduser().resolve()
+        ancestors: dict[str, str] = {}
+        for ancestor in workspace_root.parents:
+            name = ancestor.name
+            if len(name) < 3:
+                continue
+            name_lower = name.lower()
+            if re.search(rf"\b{re.escape(name_lower)}\b", message_lower):
+                ancestors[name_lower] = name
+        return ancestors
+
+    @staticmethod
+    def _shell_mutation_path_args(command: str, args: list[str]) -> list[str]:
+        if command not in _RELATIVE_PATH_MUTATION_COMMANDS:
+            return []
+        return [arg for arg in args if arg and not arg.startswith("-")]
+
+    @staticmethod
+    def _reject_ambiguous_ancestor_relative_path(
+        *,
+        action_id: str,
+        raw_path: object,
+        named_ancestors: dict[str, str],
+    ) -> None:
+        if not named_ancestors or not isinstance(raw_path, str):
+            return
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            return
+        parts = [part for part in candidate.parts if part not in {"", "."}]
+        if not parts:
+            return
+        ancestor_name = named_ancestors.get(parts[0].lower())
+        if ancestor_name is None:
+            return
+        raise PlanningError(
+            f"Action {action_id!r} uses relative path {raw_path!r} after the "
+            f"user named the outside-workspace ancestor directory {ancestor_name!r}. "
+            "Do not create a same-named directory inside the workspace; return "
+            "zero actions explaining that outside-workspace writes are blocked, "
+            "or ask a question if the target is ambiguous."
+        )
 
     @staticmethod
     def _has_commit_intent(message: str) -> bool:

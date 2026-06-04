@@ -48,7 +48,14 @@ class _StubProvider:
     def __init__(self, responses: list[ProviderResponse]) -> None:
         self._responses = list(responses)
 
-    def complete(self, _prompt: ProviderPrompt) -> ProviderResponse:
+    def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
+        if prompt.schema_name == "assistant_plan_review":
+            return _provider_response(
+                {
+                    "decision": "accept",
+                    "reason": "Stub preflight accepted the candidate plan.",
+                }
+            )
         if not self._responses:
             return _provider_response({"assistant_message": "Done.", "actions": []})
         return self._responses.pop(0)
