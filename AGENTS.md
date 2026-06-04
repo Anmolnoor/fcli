@@ -6,6 +6,8 @@ Rules for AI coding agents (Claude Code, Codex, Aider, etc.) helping work on thi
 
 Agents do not open PRs against this repo. The human contributor reviews the change end-to-end first, *then* opens the PR themselves. If a maintainer sees a PR opened directly by a `[bot]` account or a fresh account that obviously didn't write the description, it gets closed.
 
+Exception: when AnmolNoor is the author actively working on the change, agents may follow direct PR instructions from AnmolNoor without this rule blocking the PR.
+
 ## Surgical changes
 
 - Touch only what the task requires.

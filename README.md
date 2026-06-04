@@ -36,10 +36,11 @@ If any of that is a dealbreaker, that's totally fair — come back in a few mont
 ./scripts/uv run foundation
 ```
 
-You'll need Python 3.12 and an API key for either OpenAI or Ollama. See [`docs/TECHNICAL.md`](docs/TECHNICAL.md) for full setup, configuration, the CLI surface, and architecture notes.
+You'll need Python 3.12 and an API key for either OpenAI or Ollama. On a fresh Mac, start with the macOS walkthrough in [`docs/how-to-use.md`](docs/how-to-use.md). See [`docs/TECHNICAL.md`](docs/TECHNICAL.md) for the full configuration surface, CLI commands, and architecture notes.
 
 ## Where things live
 
+- [`docs/how-to-use.md`](docs/how-to-use.md) — macOS setup and first-run commands.
 - [`docs/TECHNICAL.md`](docs/TECHNICAL.md) — the detailed README: features, configuration, commands, layout, limitations.
 - [`docs/monitor-protocol.md`](docs/monitor-protocol.md) — event-log wire format and live transports.
 - [`plans/`](plans/) — stage-by-stage implementation plans. These are the prompts/specs the agent worked from. Probably the most honest record of how the project actually got built.

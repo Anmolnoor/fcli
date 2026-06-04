@@ -33,6 +33,7 @@ from foundation.models import (
     PolicyDecision,
     PolicyDecisionType,
     PolicyEvaluationRecord,
+    PolicyReasonCode,
     ProviderMessage,
     ProviderMessageRole,
     ProviderPrompt,
@@ -200,6 +201,9 @@ _STOP_REASON_SUFFIXES = {
         "\n\n[Loop stopped: a fatal execution failure occurred.]"
     ),
     LoopStopReason.NO_PROGRESS: ("\n\n[Loop stopped: no progress detected across iterations.]"),
+    LoopStopReason.TERMINAL_POLICY_BLOCK: (
+        "\n\n[Loop stopped: terminal policy block. Work was not performed.]"
+    ),
 }
 
 # v4 stage 03 — soft-completion notice when NO_PROGRESS fires *after* the
@@ -218,6 +222,23 @@ _SIDE_EFFECTING_CAPABILITY_PREFIXES: tuple[str, ...] = (
     "foundation.git.commit",
 )
 
+_FILE_MUTATION_CAPABILITY_IDS = frozenset(
+    {
+        "foundation.file.write",
+        "foundation.file.edit",
+        "foundation.file.apply_diff",
+    }
+)
+
+_FINAL_MUTATION_CLAIM_RE = re.compile(
+    r"\b(created|wrote|written|saved|updated|edited|modified|generated)\b",
+    re.IGNORECASE,
+)
+_FILESYSTEM_CLAIM_RE = re.compile(
+    r"\b(file|files|folder|folders|directory|directories|path|workspace)\b|[/\\][^\s]+|\.[A-Za-z0-9]{1,8}\b",
+    re.IGNORECASE,
+)
+
 
 def _is_side_effecting_capability(capability_id: str | None) -> bool:
     if not capability_id:
@@ -225,6 +246,14 @@ def _is_side_effecting_capability(capability_id: str | None) -> bool:
     return any(
         capability_id == prefix or capability_id.startswith(prefix + ".")
         for prefix in _SIDE_EFFECTING_CAPABILITY_PREFIXES
+    )
+
+
+def _is_file_mutation_action(action: PlannedAction) -> bool:
+    return (
+        action.kind is ActionKind.TOOL_CALL
+        and action.tool_call is not None
+        and action.tool_call.capability_id in _FILE_MUTATION_CAPABILITY_IDS
     )
 
 
@@ -1067,8 +1096,14 @@ class RequestOrchestrator:
                 self._is_terminal_blocked_result(r) for r in execution_results
             )
             has_fatal = any(self._is_fatal_result(r) for r in execution_results)
+            has_terminal_policy_block = self._has_terminal_policy_block(
+                actions_to_execute,
+                decisions,
+            )
 
-            if has_pending:
+            if has_terminal_policy_block:
+                stop_reason = LoopStopReason.TERMINAL_POLICY_BLOCK
+            elif has_pending:
                 stop_reason = LoopStopReason.PENDING_APPROVAL
             elif has_awaiting_input:
                 stop_reason = LoopStopReason.AWAITING_USER_INPUT
@@ -1178,47 +1213,59 @@ class RequestOrchestrator:
 
         had_fatal_failure = any(self._is_fatal_result(r) for r in all_results)
 
-        # When the loop is structurally stuck (missing capability, bad path, or
-        # no progress), reframe the raw failure as a graceful capability-gap
-        # handoff: the chat surface shows a plain-language message and options
-        # instead of an error. The underlying failure stays in execution_results
-        # and is recorded to the trace + event log via EVENT_CAPABILITY_GAP.
-        gap_handoff = build_gap_handoff(
-            request=request.message,
-            stop_reason=stop_reason,
-            results=all_results,
-            iteration=len(iterations),
-            had_cumulative_changes=bool(cumulative_changed_paths),
-            phraser=make_provider_phraser(self._provider),
-        )
-        if gap_handoff is not None:
-            msg_content = gap_handoff.message
-            self._observer.emit(
-                EVENT_CAPABILITY_GAP,
-                payload=gap_handoff.report.model_dump(mode="json"),
-                session_id=session_id,
-                logger_name="foundation.services.orchestrator",
-                level=logging.WARNING,
+        if stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK:
+            gap_handoff = None
+            msg_content = self._terminal_policy_block_message(
+                request=request,
+                decisions=all_decisions,
             )
         else:
-            command_error_message = (
-                self._command_usage_failure_message(
-                    terminal_plan.assistant_message,
-                    iterations,
-                )
-                if stop_reason is LoopStopReason.NO_PROGRESS
-                else None
+            # When the loop is structurally stuck (missing capability, bad path, or
+            # no progress), reframe the raw failure as a graceful capability-gap
+            # handoff: the chat surface shows a plain-language message and options
+            # instead of an error. The underlying failure stays in execution_results
+            # and is recorded to the trace + event log via EVENT_CAPABILITY_GAP.
+            gap_handoff = build_gap_handoff(
+                request=request.message,
+                stop_reason=stop_reason,
+                results=all_results,
+                iteration=len(iterations),
+                had_cumulative_changes=bool(cumulative_changed_paths),
+                phraser=make_provider_phraser(self._provider),
             )
-            msg_content = (
-                command_error_message
-                if command_error_message is not None
-                else self._augment_message_with_stop_reason(
-                    terminal_plan.assistant_message,
-                    stop_reason,
-                    cumulative_changed_paths=cumulative_changed_paths,
-                    had_fatal=had_fatal_failure,
+            if gap_handoff is not None:
+                msg_content = gap_handoff.message
+                self._observer.emit(
+                    EVENT_CAPABILITY_GAP,
+                    payload=gap_handoff.report.model_dump(mode="json"),
+                    session_id=session_id,
+                    logger_name="foundation.services.orchestrator",
+                    level=logging.WARNING,
                 )
-            )
+            else:
+                command_error_message = (
+                    self._command_usage_failure_message(
+                        terminal_plan.assistant_message,
+                        iterations,
+                    )
+                    if stop_reason is LoopStopReason.NO_PROGRESS
+                    else None
+                )
+                msg_content = (
+                    command_error_message
+                    if command_error_message is not None
+                    else self._augment_message_with_stop_reason(
+                        terminal_plan.assistant_message,
+                        stop_reason,
+                        cumulative_changed_paths=cumulative_changed_paths,
+                        had_fatal=had_fatal_failure,
+                    )
+                )
+        msg_content = self._guard_unverified_final_message(
+            msg_content,
+            stop_reason=stop_reason,
+            results=all_results,
+        )
         assistant_message = AssistantMessage(content=msg_content)
 
         verification_notice = self._build_verification_notice(
@@ -1600,6 +1647,140 @@ class RequestOrchestrator:
         )
 
     @staticmethod
+    def _has_terminal_policy_block(
+        actions: list[PlannedAction],
+        decisions: list[PolicyDecision],
+    ) -> bool:
+        for action, decision in zip(actions, decisions, strict=True):
+            if decision.decision is not PolicyDecisionType.BLOCK:
+                continue
+            if PolicyReasonCode.PATH_OUT_OF_SCOPE not in decision.reason_codes:
+                continue
+            if "workspace_write" in decision.risk_categories:
+                return True
+            if _is_file_mutation_action(action):
+                return True
+        return False
+
+    def _terminal_policy_block_message(
+        self,
+        *,
+        request: UserRequest,
+        decisions: list[PolicyDecision],
+    ) -> str:
+        paths = self._terminal_policy_block_paths(decisions)
+        target = ", ".join(paths) if paths else "the requested path"
+        fallback = (
+            f"I did not write to {target} because it is outside the workspace root. "
+            "This is a terminal policy block: outside-workspace writes stay blocked "
+            "for safety. To perform this, open fcli in that directory or start a "
+            "workspace rooted at that path, then ask again."
+        )
+        phrased = self._phrase_terminal_policy_block(
+            request=request.message,
+            target=target,
+            fallback=fallback,
+        )
+        return phrased or fallback
+
+    @staticmethod
+    def _terminal_policy_block_paths(decisions: list[PolicyDecision]) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for decision in decisions:
+            if decision.decision is not PolicyDecisionType.BLOCK:
+                continue
+            if PolicyReasonCode.PATH_OUT_OF_SCOPE not in decision.reason_codes:
+                continue
+            if "workspace_write" not in decision.risk_categories:
+                continue
+            for path in decision.paths:
+                if path in seen:
+                    continue
+                seen.add(path)
+                paths.append(path)
+        return paths
+
+    def _phrase_terminal_policy_block(
+        self,
+        *,
+        request: str,
+        target: str,
+        fallback: str,
+    ) -> str | None:
+        developer = (
+            "You are fcli, a local coding-agent CLI. The runtime verified that "
+            "an outside-workspace write was blocked and no such write was "
+            "performed. Explain this in one short, calm paragraph. Keep these "
+            "facts: the path is outside the active workspace, fcli did not do "
+            "the write, the block is for safety, and the user can retry by "
+            "opening fcli in that directory or using that directory as the "
+            "workspace root. Do NOT claim the task was completed. Output only prose."
+        )
+        user = (
+            f"Original request: {request}\n"
+            f"Blocked target: {target}\n\n"
+            f"Fallback wording to preserve: {fallback}"
+        )
+        try:
+            response = self._provider.complete(
+                ProviderPrompt(
+                    messages=[
+                        ProviderMessage(role=ProviderMessageRole.DEVELOPER, content=developer),
+                        ProviderMessage(role=ProviderMessageRole.USER, content=user),
+                    ],
+                    response_format=ProviderResponseFormat.TEXT,
+                )
+            )
+        except ProviderError:
+            return None
+        except Exception:  # pragma: no cover - defensive on a terminal message path
+            logger.debug("terminal policy block phrasing failed", exc_info=True)
+            return None
+        return self._sanitize_terminal_policy_block_message(response.content)
+
+    @staticmethod
+    def _sanitize_terminal_policy_block_message(content: str | None) -> str | None:
+        text = (content or "").strip()
+        if not text:
+            return None
+        if text[0] in "{[" or text.startswith("```"):
+            return None
+        if '"actions"' in text or '"assistant_message"' in text:
+            return None
+        text = " ".join(text.split())
+        lower = text.lower()
+        if "outside" not in lower or "workspace" not in lower:
+            return None
+        if "open" not in lower and "workspace root" not in lower:
+            return None
+        if _FINAL_MUTATION_CLAIM_RE.search(text):
+            return None
+        if len(text) > 500:
+            text = text[:500].rsplit(" ", 1)[0].rstrip() + "..."
+        return text
+
+    @staticmethod
+    def _guard_unverified_final_message(
+        message: str,
+        *,
+        stop_reason: LoopStopReason,
+        results: list[ExecutionResult],
+    ) -> str:
+        if stop_reason is not LoopStopReason.ZERO_ACTION_PLAN:
+            return message
+        if results:
+            return message
+        if not _FINAL_MUTATION_CLAIM_RE.search(message):
+            return message
+        if not _FILESYSTEM_CLAIM_RE.search(message):
+            return message
+        return (
+            "I did not create or modify any files because no actions were executed. "
+            "I can only report filesystem changes after a successful write or edit action."
+        )
+
+    @staticmethod
     def _augment_message_with_stop_reason(
         message: str,
         stop_reason: LoopStopReason,
@@ -1790,6 +1971,8 @@ class RequestOrchestrator:
         if stop_reason is LoopStopReason.AWAITING_USER_INPUT:
             # Stopped to ask the user something we couldn't prompt for inline
             # (non-interactive run, or the user dismissed the prompt).
+            return SessionStatus.COMPLETED_INCONCLUSIVE
+        if stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK:
             return SessionStatus.COMPLETED_INCONCLUSIVE
         if stop_reason is LoopStopReason.BLOCKED:
             return SessionStatus.FAILED
