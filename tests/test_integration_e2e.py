@@ -336,7 +336,7 @@ def test_e2e_concise_and_verbose_presenter_parity_on_happy_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Happy path renders concise notices + verbose retains full detail."""
-    from foundation.cli import _build_chat_turn_presentation
+    from foundation.cli_rendering import _build_chat_turn_presentation
     from foundation.models import ChatSurfacePolicy, RenderMode
 
     workspace = _git_workspace(tmp_path)
