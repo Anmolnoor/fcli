@@ -67,6 +67,37 @@ Then verify the setup:
 
 You want to see `Provider: ollama`, `Base URL: https://ollama.com/api`, and a secret lookup line saying credentials resolved from `$OLLAMA_API_KEY`.
 
+## Codex / ChatGPT subscription
+
+To use your ChatGPT/Codex subscription instead of an OpenAI API key, sign in to
+the Codex CLI with your ChatGPT account, then use the `codex` provider:
+
+```bash
+codex
+```
+
+Choose ChatGPT sign-in when Codex prompts for authentication. Then configure
+Foundation:
+
+```bash
+cat > "$HOME/Library/Application Support/foundation/config.toml" <<'EOF'
+[provider]
+name = "codex"
+model = "gpt-5.5"
+request_timeout_seconds = 180
+EOF
+```
+
+Verify with:
+
+```bash
+./scripts/uv run foundation doctor
+```
+
+You want to see `Provider: codex`, `Base URL: codex://local`, and a secret
+lookup line saying the provider uses local Codex ChatGPT login. This route does
+not use `OPENAI_API_KEY`.
+
 ## OpenAI
 
 To use OpenAI instead, use this provider config:

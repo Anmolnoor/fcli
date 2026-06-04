@@ -6,6 +6,7 @@ import enum
 import logging
 import os
 import shlex
+import textwrap
 import threading
 import uuid
 from contextlib import suppress
@@ -230,6 +231,9 @@ _REPL_HISTORY_FILENAME = "repl-history.txt"
 _REPL_SESSION_DB_FILENAME = "chat-sessions.sqlite3"
 _REPL_TRANSCRIPT_OUTPUT_PREVIEW_CHARACTERS = 1200
 _REPL_SHELL_PREFIX = "!"
+_RECOVERED_TURN_PREVIEW_WIDTH = 80
+_REPL_PROMPT_STYLE = "#22c7d6 bold"
+_INTERACTIVE_CONCISE_OUTPUT_PADDING = "  "
 _REPL_COMMAND_COMPLETIONS: dict[str, Any] = {
     "/actions": None,
     "/approval": {
@@ -650,6 +654,14 @@ def _chat_history_path(settings: AppSettings) -> Path:
     return history_path
 
 
+def _display_cwd(settings: AppSettings, state: InteractiveChatState) -> str:
+    try:
+        relative = state.current_cwd.relative_to(settings.workspace_root)
+    except ValueError:
+        return str(state.current_cwd)
+    return "." if str(relative) == "." else str(relative)
+
+
 def _settings_for_interactive_session(
     settings: AppSettings,
     state: InteractiveChatState,
@@ -727,13 +739,23 @@ def _format_repl_cwd(workspace_root: Path, cwd: Path) -> str:
     return "." if str(relative) == "." else str(relative)
 
 
-def _chat_prompt(state: InteractiveChatState, *, settings: AppSettings, plan_only: bool) -> str:
-    mode_suffix = " plan-only" if plan_only else ""
-    session_id = state.session_id[:8]
-    return (
-        f"foundation[{session_id} {_format_repl_cwd(settings.workspace_root, state.current_cwd)} "
-        f"{state.approval_mode.value} {state.model}{mode_suffix}]> "
-    )
+def _chat_prompt(
+    state: InteractiveChatState,
+    *,
+    settings: AppSettings,
+    plan_only: bool,
+) -> list[tuple[str, str]]:
+    cwd = _format_repl_cwd(settings.workspace_root, state.current_cwd)
+    cwd_suffix = "" if cwd == "." else f" {cwd}"
+    mode_suffix = " plan" if plan_only else ""
+    prompt: list[tuple[str, str]] = [
+        ("", "\n  "),
+        (_REPL_PROMPT_STYLE, "fcli"),
+    ]
+    if cwd_suffix or mode_suffix:
+        prompt.append(("", f"{cwd_suffix}{mode_suffix}"))
+    prompt.append((_REPL_PROMPT_STYLE, "> "))
+    return prompt
 
 
 def _render_interactive_chat_help() -> None:
@@ -801,28 +823,28 @@ def _render_interactive_chat_welcome(
     loaded_memories = ", ".join(_loaded_memory_labels(memory_envelope)) or "none"
     console.print(
         Panel.fit(
-            f"Session: [cyan]{escape(state.session_id)}[/cyan]\n"
-            f"Workspace root: [cyan]{escape(str(settings.workspace_root))}[/cyan]\n"
-            f"Request cwd: [cyan]{escape(str(state.current_cwd))}[/cyan]\n"
-            f"Approval mode: [cyan]{state.approval_mode.value}[/cyan]\n"
-            f"Provider: [cyan]{escape(state.provider_name)}[/cyan]\n"
-            f"Model: [cyan]{escape(state.model)}[/cyan]\n"
-            f"Render mode: [cyan]{render_mode.value}[/cyan]\n"
-            f"Plan-only default: [cyan]{plan_only_text}[/cyan]\n"
-            f"Loaded memory: [cyan]{escape(loaded_memories)}[/cyan]\n"
-            f"Prompt history: [cyan]{escape(str(_chat_history_path(settings)))}[/cyan]\n\n"
-            "Enter a request to use the planner, prefix with `!` for a direct shell command, "
-            "or use `/plan`, `/actions`, `/summary`, or `/help` for session commands.",
+            f"Session: [cyan]{escape(state.session_id[:8])}[/cyan] | "
+            f"cwd: [cyan]{escape(_display_cwd(settings, state))}[/cyan]\n"
+            f"Model: [cyan]{escape(state.provider_name)}/{escape(state.model)}[/cyan] | "
+            f"approval: [cyan]{state.approval_mode.value}[/cyan] | "
+            f"render: [cyan]{render_mode.value}[/cyan] | "
+            f"plan-only: [cyan]{plan_only_text}[/cyan]\n"
+            f"Memory: [cyan]{escape(loaded_memories)}[/cyan]\n"
+            "Commands: `!` shell | `/plan` `/actions` `/summary` details | `/help`",
             title="Interactive Chat",
         )
     )
     if state.recovered_from_interruption:
-        interrupted_turn = state.interrupted_turn or "unknown input"
+        interrupted_turn = textwrap.shorten(
+            state.interrupted_turn or "unknown input",
+            width=_RECOVERED_TURN_PREVIEW_WIDTH,
+            placeholder="...",
+        )
         console.print(
             Text(
                 (
-                    "Recovered the last clean checkpoint after an interrupted turn: "
-                    f"{interrupted_turn}"
+                    "Recovered after an interrupted turn; unfinished request was not rerun.\n"
+                    f'Unfinished: "{interrupted_turn}"'
                 ),
                 style="yellow",
             )
@@ -2484,6 +2506,13 @@ def _render_orchestration_summary(result: OrchestrationResult) -> None:
     )
 
 
+def _format_interactive_concise_text(text: str) -> str:
+    return "\n".join(
+        f"{_INTERACTIVE_CONCISE_OUTPUT_PADDING}{line}" if line else line
+        for line in text.splitlines()
+    )
+
+
 def _render_concise_chat_turn(
     result: OrchestrationResult,
     *,
@@ -2495,7 +2524,10 @@ def _render_concise_chat_turn(
         policy=policy,
         interactive=interactive,
     )
-    console.print(presentation.primary_text)
+    primary_text = presentation.primary_text
+    if interactive:
+        primary_text = _format_interactive_concise_text(primary_text)
+    console.print(primary_text)
     style_map = {
         PresentationNoticeLevel.INFO: "cyan",
         PresentationNoticeLevel.WARNING: "yellow",
@@ -2503,7 +2535,10 @@ def _render_concise_chat_turn(
         PresentationNoticeLevel.DIM: "dim",
     }
     for notice in presentation.notices:
-        console.print(Text(notice.text, style=style_map[notice.level]))
+        notice_text = notice.text
+        if interactive:
+            notice_text = _format_interactive_concise_text(notice_text)
+        console.print(Text(notice_text, style=style_map[notice.level]))
 
 
 def _render_verbose_chat_turn(

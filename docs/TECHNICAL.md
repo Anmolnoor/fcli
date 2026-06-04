@@ -141,6 +141,7 @@ Provider selection does not need to live in environment variables. Persist `prov
 `provider.model`, `provider.base_url`, and `provider.request_timeout_seconds` in the TOML config,
 or override them per invocation with `--provider`, `--model`, `--base-url`, and
 `--provider-timeout`. Foundation CLI currently supports:
+- `codex` via `codex exec`, reusing the local Codex ChatGPT login rather than an OpenAI API key
 - `openai` via the OpenAI Responses API
 - `ollama` via the Ollama Chat API, including local Ollama at `http://localhost:11434/api` and Ollama Cloud at `https://ollama.com/api`
 
@@ -173,6 +174,19 @@ max_timeout_seconds = 3600
 [approval]
 mode = "prompt"
 ```
+
+Example Codex / ChatGPT subscription config:
+
+```toml
+[provider]
+name = "codex"
+model = "gpt-5.5"
+request_timeout_seconds = 180
+```
+
+This route shells out to `codex exec --json` in a read-only sandbox and reuses
+the local Codex ChatGPT login. It does not read `OPENAI_API_KEY`; use the
+`openai` provider only when you want direct OpenAI Platform API billing.
 
 Example Ollama Cloud config:
 

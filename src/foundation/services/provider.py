@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
+import tempfile
 import time
 from collections.abc import Mapping
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Protocol
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -84,6 +87,20 @@ class JsonTransport(Protocol):
         timeout_seconds: int,
     ) -> dict[str, Any]:
         """POST a JSON payload and return a decoded JSON object."""
+
+
+class CodexRunner(Protocol):
+    """Minimal process runner contract for Codex CLI execution."""
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        input_text: str,
+        timeout_seconds: int,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run Codex and return its completed process result."""
 
 
 class UrllibJsonTransport:
@@ -164,6 +181,28 @@ class UrllibJsonTransport:
                 response_text=body,
             )
         return decoded
+
+
+class SubprocessCodexRunner:
+    """Subprocess-backed runner for `codex exec`."""
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        input_text: str,
+        timeout_seconds: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
 
 
 def _provider_error_message(body: str) -> str | None:
@@ -424,6 +463,171 @@ class OpenAIResponsesAdapter:
         if not isinstance(payload, dict):
             raise ProviderError(
                 "Provider returned structured output that was not a JSON object. "
+                f"Raw (first 300 chars): {text[:300]!r}",
+                code=ProviderErrorCode.INVALID_RESPONSE,
+                response_text=text,
+            )
+        return payload
+
+
+class CodexExecAdapter:
+    """Codex CLI adapter that reuses local ChatGPT/Codex authentication."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        workspace_root: Path,
+        timeout_seconds: int = 60,
+        sandbox: str = "read-only",
+        runner: CodexRunner | None = None,
+    ) -> None:
+        self._model = model
+        self._workspace_root = workspace_root
+        self._timeout_seconds = timeout_seconds
+        self._sandbox = sandbox
+        self._runner = runner or SubprocessCodexRunner()
+
+    def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
+        started_at = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="foundation-codex-") as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            output_path = temp_dir / "final-message.txt"
+            args = [
+                "codex",
+                "exec",
+                "--json",
+                "--ephemeral",
+                "--sandbox",
+                self._sandbox,
+                "--model",
+                self._model,
+                "--output-last-message",
+                str(output_path),
+            ]
+            prompt_schema: Mapping[str, Any] | None = None
+            if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
+                assert prompt.output_schema is not None
+                if _codex_supports_output_schema(prompt.output_schema):
+                    schema_path = temp_dir / "schema.json"
+                    schema_path.write_text(
+                        json.dumps(_codex_strict_schema(prompt.output_schema)),
+                        encoding="utf-8",
+                    )
+                    args.extend(["--output-schema", str(schema_path)])
+                else:
+                    prompt_schema = prompt.output_schema
+            input_text = self._render_prompt(prompt, prompt_schema=prompt_schema)
+            args.append("-")
+
+            try:
+                completed = self._runner.run(
+                    args,
+                    cwd=self._workspace_root,
+                    input_text=input_text,
+                    timeout_seconds=self._timeout_seconds,
+                )
+            except FileNotFoundError as exc:
+                raise ProviderError(
+                    "Codex CLI was not found on PATH. Install Codex and sign in with ChatGPT.",
+                    code=ProviderErrorCode.BAD_REQUEST,
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError(
+                    f"Codex CLI request timed out after {self._timeout_seconds}s.",
+                    code=ProviderErrorCode.NETWORK,
+                    retryable=True,
+                ) from exc
+            except OSError as exc:
+                raise ProviderError(
+                    f"Codex CLI request failed to start: {exc}",
+                    code=ProviderErrorCode.NETWORK,
+                    retryable=True,
+                ) from exc
+
+            if completed.returncode != 0:
+                raise _codex_process_error(completed)
+
+            content = self._read_final_message(output_path, completed.stdout)
+            structured_output: dict[str, Any] | None = None
+            if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
+                structured_output = self._parse_json_object(content)
+
+            return ProviderResponse(
+                content=content,
+                structured_output=structured_output,
+                metadata=ProviderResponseMetadata(
+                    provider="codex",
+                    model=self._model,
+                    response_id=_extract_codex_thread_id(completed.stdout),
+                    latency_seconds=time.monotonic() - started_at,
+                    attempts=1,
+                    usage=_parse_codex_usage(completed.stdout),
+                ),
+            )
+
+    def _render_prompt(
+        self,
+        prompt: ProviderPrompt,
+        *,
+        prompt_schema: Mapping[str, Any] | None = None,
+    ) -> str:
+        lines = [
+            "You are acting as a model provider adapter for Foundation CLI.",
+            "Answer the conversation below without editing files or running commands.",
+        ]
+        if prompt.response_format is ProviderResponseFormat.JSON_OBJECT:
+            if prompt_schema is None:
+                lines.append(
+                    "The final response must be a JSON object that matches the supplied schema."
+                )
+            else:
+                lines.extend(
+                    [
+                        "The final response must be a JSON object that matches this JSON Schema:",
+                        json.dumps(prompt_schema, indent=2),
+                    ]
+                )
+        lines.append("")
+        for message in prompt.messages:
+            lines.extend(
+                [
+                    f"<{message.role.value}>",
+                    message.content,
+                    f"</{message.role.value}>",
+                    "",
+                ]
+            )
+        return "\n".join(lines).strip()
+
+    def _read_final_message(self, output_path: Path, stdout: str) -> str:
+        if output_path.exists():
+            content = output_path.read_text(encoding="utf-8").strip()
+            if content:
+                return content
+        fallback_content = _extract_codex_agent_message(stdout)
+        if fallback_content:
+            return fallback_content
+        raise ProviderError(
+            "Codex CLI returned no final assistant message.",
+            code=ProviderErrorCode.INVALID_RESPONSE,
+            response_text=stdout,
+        )
+
+    def _parse_json_object(self, text: str) -> dict[str, Any]:
+        cleaned = _try_extract_json(text)
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                "Codex CLI returned invalid JSON for a structured response. "
+                f"Raw (first 300 chars): {text[:300]!r}",
+                code=ProviderErrorCode.INVALID_RESPONSE,
+                response_text=text,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ProviderError(
+                "Codex CLI returned structured output that was not a JSON object. "
                 f"Raw (first 300 chars): {text[:300]!r}",
                 code=ProviderErrorCode.INVALID_RESPONSE,
                 response_text=text,
@@ -787,6 +991,130 @@ def _coerce_optional_string(value: object) -> str | None:
     return str(value)
 
 
+def _codex_process_error(
+    completed: subprocess.CompletedProcess[str],
+) -> ProviderError:
+    stderr = (completed.stderr or "").strip()
+    stdout = (completed.stdout or "").strip()
+    codex_error = _extract_codex_error_message(stdout)
+    detail = (
+        codex_error or stderr or stdout or f"Codex CLI exited with status {completed.returncode}."
+    )
+    lowered = detail.lower()
+    if any(token in lowered for token in ("auth", "login", "sign in", "unauthorized", "401")):
+        code = ProviderErrorCode.AUTHENTICATION
+        retryable = False
+    elif any(token in lowered for token in ("rate limit", "usage limit", "quota", "429")):
+        code = ProviderErrorCode.RATE_LIMIT
+        retryable = True
+    else:
+        code = ProviderErrorCode.SERVER_ERROR
+        retryable = completed.returncode >= 2
+    return ProviderError(
+        detail,
+        code=code,
+        retryable=retryable,
+        response_text="\n".join(part for part in (stdout, stderr) if part),
+    )
+
+
+def _iter_codex_events(stdout: str) -> list[Mapping[str, Any]]:
+    events: list[Mapping[str, Any]] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, Mapping):
+            events.append(payload)
+    return events
+
+
+def _codex_strict_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    def strict_copy(value: object) -> object:
+        if isinstance(value, Mapping):
+            copied = {
+                str(key): strict_copy(item) for key, item in value.items() if str(key) != "default"
+            }
+            if copied.get("type") == "object" or isinstance(copied.get("properties"), Mapping):
+                copied.setdefault("additionalProperties", False)
+                properties = copied.get("properties")
+                if isinstance(properties, Mapping):
+                    copied["required"] = list(properties.keys())
+            return copied
+        if isinstance(value, list):
+            return [strict_copy(item) for item in value]
+        return value
+
+    copied_schema = strict_copy(schema)
+    assert isinstance(copied_schema, dict)
+    return copied_schema
+
+
+def _codex_supports_output_schema(schema: Mapping[str, Any]) -> bool:
+    def supports(value: object) -> bool:
+        if isinstance(value, Mapping):
+            additional_properties = value.get("additionalProperties")
+            if additional_properties not in (None, False):
+                return False
+            return all(supports(item) for item in value.values())
+        if isinstance(value, list):
+            return all(supports(item) for item in value)
+        return True
+
+    return supports(schema)
+
+
+def _extract_codex_thread_id(stdout: str) -> str | None:
+    for event in _iter_codex_events(stdout):
+        thread_id = event.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return None
+
+
+def _extract_codex_agent_message(stdout: str) -> str | None:
+    for event in reversed(_iter_codex_events(stdout)):
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, Mapping) or item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
+
+
+def _extract_codex_error_message(stdout: str) -> str | None:
+    for event in reversed(_iter_codex_events(stdout)):
+        event_type = event.get("type")
+        if event_type == "error":
+            message = event.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        if event_type == "turn.failed":
+            error_payload = event.get("error")
+            if isinstance(error_payload, Mapping):
+                message = error_payload.get("message")
+                if isinstance(message, str) and message.strip():
+                    return message.strip()
+    return None
+
+
+def _parse_codex_usage(stdout: str) -> ProviderUsage | None:
+    for event in reversed(_iter_codex_events(stdout)):
+        if event.get("type") != "turn.completed":
+            continue
+        usage = _parse_usage(event.get("usage"))
+        if usage is not None:
+            return usage
+    return None
+
+
 def _parse_usage(value: object) -> ProviderUsage | None:
     if not isinstance(value, Mapping):
         return None
@@ -832,13 +1160,20 @@ def build_provider_adapter(
 ) -> ProviderAdapter:
     """Build the configured provider adapter for Stage 5."""
     provider_name = settings.provider.normalized_name()
-    if provider_name not in {"openai", "ollama"}:
+    if provider_name not in {"codex", "openai", "ollama"}:
         raise ProviderError(
             (
                 f"Provider {settings.provider.name!r} is not supported in Foundation CLI v0.1. "
-                "Supported providers: openai, ollama."
+                "Supported providers: codex, openai, ollama."
             ),
             code=ProviderErrorCode.UNSUPPORTED_PROVIDER,
+        )
+
+    if provider_name == "codex":
+        return CodexExecAdapter(
+            model=settings.provider.model,
+            workspace_root=settings.workspace_root,
+            timeout_seconds=settings.provider.request_timeout_seconds,
         )
 
     resolution = settings.provider.resolve_api_key(
