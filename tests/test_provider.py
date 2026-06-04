@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,12 +15,15 @@ from foundation.models import (
     ProviderResponseFormat,
 )
 from foundation.services.provider import (
+    CodexExecAdapter,
     OllamaChatAdapter,
     OpenAIResponsesAdapter,
     ProviderError,
     ProviderErrorCode,
     _try_extract_json,
+    build_provider_adapter,
 )
+from foundation.settings import AppSettings
 
 
 class FakeTransport:
@@ -47,6 +53,42 @@ class FakeTransport:
         return response
 
 
+class FakeCodexRunner:
+    def __init__(self, final_message: str) -> None:
+        self.final_message = final_message
+        self.calls: list[dict[str, Any]] = []
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        input_text: str,
+        timeout_seconds: int,
+    ) -> subprocess.CompletedProcess[str]:
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        schema = None
+        if "--output-schema" in args:
+            schema_path = Path(args[args.index("--output-schema") + 1])
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.calls.append(
+            {
+                "args": list(args),
+                "cwd": cwd,
+                "input_text": input_text,
+                "timeout_seconds": timeout_seconds,
+                "schema": schema,
+            }
+        )
+        output_path.write_text(self.final_message, encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout='{"type":"thread.started"}\n{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}\n',
+            stderr="",
+        )
+
+
 def _structured_prompt() -> ProviderPrompt:
     return ProviderPrompt(
         messages=[
@@ -59,6 +101,126 @@ def _structured_prompt() -> ProviderPrompt:
         schema_name="assistant_plan",
         output_schema={"type": "object"},
     )
+
+
+def test_codex_adapter_runs_codex_exec_with_chatgpt_managed_auth(
+    tmp_path: Path,
+) -> None:
+    runner = FakeCodexRunner('{"assistant_message":"hello","actions":[]}')
+    adapter = CodexExecAdapter(
+        model="gpt-5.5",
+        workspace_root=tmp_path,
+        timeout_seconds=90,
+        runner=runner,
+    )
+    prompt = ProviderPrompt(
+        messages=[
+            ProviderMessage(
+                role=ProviderMessageRole.USER,
+                content="Plan this request.",
+            )
+        ],
+        response_format=ProviderResponseFormat.JSON_OBJECT,
+        schema_name="assistant_plan",
+        output_schema={
+            "type": "object",
+            "properties": {
+                "assistant_message": {"type": "string"},
+                "actions": {"type": "array"},
+                "mode": {"$ref": "#/$defs/Mode", "default": "auto"},
+                "arguments": {"properties": {"path": {"type": "string"}}},
+            },
+            "$defs": {"Mode": {"type": "string", "enum": ["auto", "manual"]}},
+        },
+    )
+
+    response = adapter.complete(prompt)
+
+    assert response.structured_output == {"assistant_message": "hello", "actions": []}
+    assert response.metadata.provider == "codex"
+    assert response.metadata.model == "gpt-5.5"
+    assert response.metadata.usage is not None
+    assert response.metadata.usage.total_tokens == 15
+    assert runner.calls[0]["cwd"] == tmp_path
+    assert runner.calls[0]["timeout_seconds"] == 90
+    assert "<user>\nPlan this request.\n</user>" in runner.calls[0]["input_text"]
+    assert runner.calls[0]["schema"] == {
+        "type": "object",
+        "properties": {
+            "assistant_message": {"type": "string"},
+            "actions": {"type": "array"},
+            "mode": {"$ref": "#/$defs/Mode"},
+            "arguments": {
+                "properties": {"path": {"type": "string"}},
+                "additionalProperties": False,
+                "required": ["path"],
+            },
+        },
+        "$defs": {"Mode": {"type": "string", "enum": ["auto", "manual"]}},
+        "additionalProperties": False,
+        "required": ["assistant_message", "actions", "mode", "arguments"],
+    }
+    assert runner.calls[0]["args"][-1] == "-"
+    assert runner.calls[0]["args"][:8] == [
+        "codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--sandbox",
+        "read-only",
+        "--model",
+        "gpt-5.5",
+    ]
+
+
+def test_build_provider_adapter_selects_codex_without_openai_api_key(
+    tmp_path: Path,
+) -> None:
+    settings = AppSettings(
+        app={"workspace_root": tmp_path},
+        provider={"name": "codex", "model": "gpt-5.5"},
+    )
+
+    adapter = build_provider_adapter(settings)
+
+    assert isinstance(adapter, CodexExecAdapter)
+
+
+def test_codex_adapter_omits_output_schema_for_open_ended_json_schema(
+    tmp_path: Path,
+) -> None:
+    runner = FakeCodexRunner('{"arguments":{"path":"README.md"}}')
+    adapter = CodexExecAdapter(
+        model="gpt-5.5",
+        workspace_root=tmp_path,
+        runner=runner,
+    )
+    prompt = ProviderPrompt(
+        messages=[
+            ProviderMessage(
+                role=ProviderMessageRole.USER,
+                content="Plan this request.",
+            )
+        ],
+        response_format=ProviderResponseFormat.JSON_OBJECT,
+        schema_name="assistant_plan",
+        output_schema={
+            "type": "object",
+            "properties": {
+                "arguments": {
+                    "type": "object",
+                    "additionalProperties": True,
+                }
+            },
+        },
+    )
+
+    response = adapter.complete(prompt)
+
+    assert response.structured_output == {"arguments": {"path": "README.md"}}
+    assert "--output-schema" not in runner.calls[0]["args"]
+    assert runner.calls[0]["schema"] is None
+    assert '"additionalProperties": true' in runner.calls[0]["input_text"]
 
 
 def test_openai_adapter_parses_structured_output_and_usage() -> None:

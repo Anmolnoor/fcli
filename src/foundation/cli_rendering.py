@@ -56,6 +56,16 @@ stderr_console = Console(stderr=True)
 _REPL_TRANSCRIPT_OUTPUT_PREVIEW_CHARACTERS = 1200
 
 
+_INTERACTIVE_CONCISE_OUTPUT_PADDING = "  "
+
+
+def _format_interactive_concise_text(text: str) -> str:
+    return "\n".join(
+        f"{_INTERACTIVE_CONCISE_OUTPUT_PADDING}{line}" if line else line
+        for line in text.splitlines()
+    )
+
+
 def _render_placeholder(command_name: str, detail: str, settings: AppSettings) -> None:
     console.print(
         Panel.fit(
@@ -756,7 +766,10 @@ def _render_concise_chat_turn(
         policy=policy,
         interactive=interactive,
     )
-    console.print(presentation.primary_text)
+    primary_text = presentation.primary_text
+    if interactive:
+        primary_text = _format_interactive_concise_text(primary_text)
+    console.print(primary_text)
     style_map = {
         PresentationNoticeLevel.INFO: "cyan",
         PresentationNoticeLevel.WARNING: "yellow",
@@ -764,7 +777,10 @@ def _render_concise_chat_turn(
         PresentationNoticeLevel.DIM: "dim",
     }
     for notice in presentation.notices:
-        console.print(Text(notice.text, style=style_map[notice.level]))
+        notice_text = notice.text
+        if interactive:
+            notice_text = _format_interactive_concise_text(notice_text)
+        console.print(Text(notice_text, style=style_map[notice.level]))
 
 
 def _render_verbose_chat_turn(

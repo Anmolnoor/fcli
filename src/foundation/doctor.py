@@ -159,12 +159,12 @@ def _provider_readiness_check(settings: AppSettings) -> DoctorCheck:
             summary="Provider name is missing.",
             detail="Set [provider].name to a supported provider.",
         )
-    if provider_name not in {"openai", "ollama"}:
+    if provider_name not in {"codex", "openai", "ollama"}:
         return DoctorCheck(
             name="Provider readiness",
             status=DoctorStatus.FAIL,
             summary=f"Provider {settings.provider.name!r} is not supported.",
-            detail="Supported providers: openai, ollama.",
+            detail="Supported providers: codex, openai, ollama.",
         )
     if not settings.provider.model.strip():
         return DoctorCheck(
@@ -335,6 +335,14 @@ def _secret_lookup_check(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> DoctorCheck:
+    if settings.provider.normalized_name() == "codex":
+        return DoctorCheck(
+            name="Secret lookup health",
+            status=DoctorStatus.PASS,
+            summary="Provider uses local Codex ChatGPT login; no OpenAI API key is required.",
+            detail="Credential sources: codex:chatgpt-login",
+        )
+
     resolution = settings.provider.resolve_api_key(
         environment=settings.provider_environment(environment),
     )

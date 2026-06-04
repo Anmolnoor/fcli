@@ -1017,6 +1017,45 @@ def test_out_of_scope_shell_write_is_terminal_policy_block(
     assert not outside.exists()
 
 
+def test_terminal_policy_block_summary_reads_as_stopped_not_success_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside-shell-dir"
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Checking cwd before creating the directory.",
+                    "actions": [
+                        {
+                            "id": "show_cwd",
+                            "kind": "shell",
+                            "summary": "Show the current directory",
+                            "shell": {"command": "pwd", "args": []},
+                        },
+                        {
+                            "id": "mkdir_outside",
+                            "kind": "shell",
+                            "summary": "Create an outside directory",
+                            "shell": {"command": "mkdir", "args": [str(outside)]},
+                        },
+                    ],
+                }
+            )
+        ]
+    )
+    orchestrator, runtime, _ = _orchestrator(tmp_path, monkeypatch, provider)
+
+    result = orchestrator.orchestrate(UserRequest(message=f"check cwd then make {outside}"))
+
+    assert result.stop_reason is LoopStopReason.TERMINAL_POLICY_BLOCK
+    assert runtime.calls == 1
+    assert result.summary.executed_actions == 1
+    assert result.summary.blocked_actions == 1
+    assert result.summary.text == "Stopped after 1 completed action; 1 blocked by policy."
+
+
 def test_planner_rejects_relative_parent_directory_write_for_developer_request(
     tmp_path: Path,
 ) -> None:
@@ -1846,6 +1885,33 @@ def test_zero_action_first_iteration_explanation_only(
     assert result.verification_notice is None
     assert result.summary.total_iterations == 1
     assert result.summary.executed_actions == 0
+
+
+def test_planner_prompt_discourages_mirroring_casual_address(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Ready when you are.",
+                    "actions": [],
+                }
+            ),
+        ]
+    )
+    orchestrator, _, _workspace_root = _orchestrator(
+        tmp_path,
+        monkeypatch,
+        provider,
+    )
+
+    orchestrator.orchestrate(UserRequest(message="hew how you doing ? buddy"))
+
+    prompt_text = provider.calls[0].messages[0].content
+    assert "Do not mirror casual address terms from the user" in prompt_text
+    assert "buddy" in prompt_text
 
 
 def test_pending_approval_stops_loop(

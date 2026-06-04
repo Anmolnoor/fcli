@@ -23,24 +23,29 @@ from foundation.cli import (
     app,
 )
 from foundation.cli_interactive import (
+    InteractiveChatState,
     _build_chat_prompt_session,
+    _chat_prompt,
     _render_interactive_chat_help,
 )
 from foundation.models import (
     ActionKind,
     AssistantMessage,
     AssistantPlan,
+    BrainSession,
     ContextSnapshot,
     ExecutionArtifactType,
     ExecutionResult,
     ExecutionStatus,
     ExecutionStep,
+    LoopStopReason,
     OrchestrationResult,
     OrchestrationSummary,
     PlannedAction,
     PlanningStep,
     ProviderMessageRole,
     ProviderResponseMetadata,
+    RenderMode,
     SelectionReason,
     SessionKind,
     SessionStatus,
@@ -292,9 +297,9 @@ def _seed_trace_session(config_path: Path) -> str:
 class FakePromptSession:
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
-        self.prompts: list[str] = []
+        self.prompts: list[Any] = []
 
-    def prompt(self, message: str) -> str:
+    def prompt(self, message: Any) -> str:
         self.prompts.append(message)
         if not self._responses:
             raise EOFError
@@ -486,6 +491,29 @@ def test_doctor_allows_local_ollama_without_credentials(
     assert "Base URL: http://localhost:11434/api" in result.stdout
     assert "Credentials required: no" in result.stdout
     assert "Provider credentials are optional" in result.stdout
+
+
+def test_doctor_allows_codex_chatgpt_login_without_openai_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '\n[provider]\nname = "codex"\nmodel = "gpt-5.5"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+
+    result = runner.invoke(app, ["--config", str(config_path), "doctor"])
+
+    assert result.exit_code == 0
+    assert "Provider: codex" in result.stdout
+    assert "Model: gpt-5.5" in result.stdout
+    assert "Base URL: codex://local" in result.stdout
+    assert "Credentials required: no" in result.stdout
+    assert "local Codex ChatGPT login" in result.stdout
+    assert "API key is required" in result.stdout
 
 
 def test_doctor_reads_ollama_cloud_credentials_from_paired_env_file(
@@ -912,6 +940,8 @@ def test_chat_without_request_starts_interactive_session(
     assert requests[0].conversation_history == []
     assert requests[0].cwd == (tmp_path / "workspace")
     assert "Interactive Chat" in result.stdout
+    assert "Commands:" in result.stdout
+    assert "Prompt history:" not in result.stdout
 
 
 def test_chat_interactive_shell_prefix_routes_to_direct_shell_execution(
@@ -1160,6 +1190,47 @@ def test_chat_interactive_manual_approval_history_stays_pending(
     payload = json.loads(history_result.stdout)
     assert payload[0]["status"] == SessionStatus.PENDING_APPROVAL.value
     assert payload[0]["pending_approval_actions"] == 1
+
+
+def test_chat_recovery_notice_does_not_replay_full_interrupted_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    prompt_session = FakePromptSession(["/exit"])
+    monkeypatch.setattr("foundation.settings.keyring.get_password", lambda *_args: None)
+    monkeypatch.setattr(
+        "foundation.cli_interactive._build_chat_prompt_session",
+        lambda _settings: prompt_session,
+    )
+    settings = load_settings(config_path=config_path)
+    session_manager = SessionManager(
+        database_path=settings.app.state_dir / "chat-sessions.sqlite3",
+        workspace_root=settings.workspace_root,
+        config_dir=settings.config_path.parent,
+        provider_name=settings.provider.name,
+    )
+    session = session_manager.create_session(
+        initial_cwd=settings.workspace_root,
+        approval_mode="prompt",
+        model=settings.provider.model,
+    )
+    interrupted = (
+        "can you help me with learning; i want you to create a github cheat sheet "
+        "in the developer dir with most common 20 commands ;"
+    )
+    session_manager.mark_turn_started(
+        session,
+        turn_kind="chat",
+        user_message=interrupted,
+    )
+
+    result = runner.invoke(app, ["--config", str(config_path), "chat"])
+
+    assert result.exit_code == 0
+    assert "Recovered after an interrupted turn; unfinished request was not rerun." in result.stdout
+    assert "Recovered the last clean checkpoint" not in result.stdout
+    assert interrupted not in result.stdout
 
 
 def test_trace_command_lists_seeded_traces_as_json(
@@ -1441,6 +1512,69 @@ def test_build_chat_prompt_session_enables_multiline(
     newline_buffer = FakeBuffer()
     bindings.handlers[("escape", "enter")](FakeEvent(newline_buffer))
     assert newline_buffer.inserted_text == ["\n"]
+
+
+def test_chat_prompt_is_compact_with_padding_and_line_gap(tmp_path: Path) -> None:
+    config_path = _write_stage_2_config(tmp_path)
+    settings = load_settings(config_path=config_path)
+    session = BrainSession(
+        session_id="ac46fdcd1144487c9013b1262416974e",
+        workspace_root=str(settings.workspace_root),
+        initial_cwd=str(settings.workspace_root),
+        current_cwd=str(settings.workspace_root),
+        approval_mode="prompt",
+        provider_name="ollama",
+        model="glm-5.1:cloud",
+        summary_text="",
+        recent_turns=[],
+        turn_count=0,
+        created_at="2026-06-04T00:00:00Z",
+        updated_at="2026-06-04T00:00:00Z",
+    )
+    state = InteractiveChatState(session=session)
+
+    assert _chat_prompt(state, settings=settings, plan_only=False) == [
+        ("", "\n  "),
+        ("#22c7d6 bold", "fcli"),
+        ("#22c7d6 bold", "> "),
+    ]
+
+    src_dir = settings.workspace_root / "src"
+    src_dir.mkdir()
+    state.current_cwd = src_dir
+
+    assert _chat_prompt(state, settings=settings, plan_only=True) == [
+        ("", "\n  "),
+        ("#22c7d6 bold", "fcli"),
+        ("", " src plan"),
+        ("#22c7d6 bold", "> "),
+    ]
+
+
+def test_interactive_concise_chat_turn_indents_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from foundation.cli_rendering import _render_concise_chat_turn
+    from foundation.models import ChatSurfacePolicy
+
+    buffer = StringIO()
+    test_console = Console(file=buffer, force_terminal=False, color_system=None, width=140)
+    monkeypatch.setattr("foundation.cli_rendering.console", test_console)
+    result = _iteration_result_for_notices(
+        stop_reason=LoopStopReason.PENDING_APPROVAL,
+        pending_approval_actions=1,
+    )
+
+    _render_concise_chat_turn(
+        result,
+        policy=ChatSurfacePolicy(render_mode=RenderMode.CONCISE),
+        interactive=True,
+    )
+
+    output = buffer.getvalue()
+    lines = output.splitlines()
+    assert "  Done." in lines
+    assert any(line.startswith("  Approval required for 1 action.") for line in lines)
 
 
 def test_render_interactive_chat_help_preserves_argument_placeholders(

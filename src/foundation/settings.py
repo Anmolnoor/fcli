@@ -34,6 +34,7 @@ from pydantic_settings import (
 ENV_PREFIX = "FOUNDATION_"
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/api"
+CODEX_DEFAULT_BASE_URL = "codex://local"
 OPENAI_DEFAULT_API_KEY_ENV_VAR = "OPENAI_API_KEY"
 OLLAMA_DEFAULT_API_KEY_ENV_VAR = "OLLAMA_API_KEY"
 DEFAULT_KEYCHAIN_SERVICE = "foundation"
@@ -44,13 +45,17 @@ DEFAULT_ENV_FILE_NAME = "foundation.env"
 
 def _provider_default_base_url(provider_name: str) -> str:
     normalized = provider_name.strip().lower()
+    if normalized == "codex":
+        return CODEX_DEFAULT_BASE_URL
     if normalized == "ollama":
         return OLLAMA_DEFAULT_BASE_URL
     return OPENAI_DEFAULT_BASE_URL
 
 
-def _provider_default_api_key_env_var(provider_name: str) -> str:
+def _provider_default_api_key_env_var(provider_name: str) -> str | None:
     normalized = provider_name.strip().lower()
+    if normalized == "codex":
+        return None
     if normalized == "ollama":
         return OLLAMA_DEFAULT_API_KEY_ENV_VAR
     return OPENAI_DEFAULT_API_KEY_ENV_VAR
@@ -211,10 +216,14 @@ class ProviderSection(BaseModel):
 
     def effective_base_url(self) -> str:
         """Return the provider base URL with the provider default endpoint applied."""
+        if self.normalized_name() == "codex":
+            return CODEX_DEFAULT_BASE_URL
         return str(self.base_url or _provider_default_base_url(self.normalized_name()))
 
     def effective_api_key_env_var(self) -> str | None:
         """Return the provider credential environment variable."""
+        if self.normalized_name() == "codex":
+            return None
         if self.api_key_env_var is None:
             return None
         if (
@@ -226,6 +235,8 @@ class ProviderSection(BaseModel):
 
     def effective_api_key_keychain(self) -> KeychainSecretRef | None:
         """Return the provider credential keychain coordinates."""
+        if self.normalized_name() == "codex":
+            return None
         if self.api_key_keychain is None:
             return None
         if (
@@ -238,12 +249,16 @@ class ProviderSection(BaseModel):
 
     def credentials_required(self) -> bool:
         """Return whether the configured provider requires credentials."""
+        if self.normalized_name() == "codex":
+            return False
         if self.normalized_name() == "ollama":
             return not _is_local_base_url(self.effective_base_url())
         return True
 
     def credential_source_order(self) -> list[str]:
         """Return the configured secret source priority."""
+        if self.normalized_name() == "codex":
+            return ["codex:chatgpt-login"]
         sources: list[str] = []
         keychain_ref = self.effective_api_key_keychain()
         if keychain_ref is not None:
