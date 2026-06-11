@@ -37,10 +37,16 @@ dependencies = [
 dev = [
   "coverage[toml]>=7.6,<8.0",
   "mypy>=1.10,<2.0",
+  # pip and uv must stay declared here: ./scripts/uv requires .venv/bin/uv and
+  # ./scripts/bootstrap.sh requires .venv/bin/pip, but `uv sync` makes the venv
+  # exactly match the lockfile (and recreates it on interpreter upgrades) —
+  # undeclared, both binaries vanish and the bootstrap chain breaks.
+  "pip>=24.0,<26.0",
   "pre-commit>=4.0,<5.0",
   "pytest>=8.3,<9.0",
   "pytest-asyncio>=0.24,<1.0",
   "ruff>=0.6,<1.0",
+  "uv>=0.4,<1.0",
 ]
 
 [project.scripts]
