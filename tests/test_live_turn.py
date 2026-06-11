@@ -504,3 +504,51 @@ def test_detail_panel_request_text_is_not_parsed_as_markup():
     state_malformed = TurnLiveState(request_text="[/bold]oops")
     text = _render_to_text(render_detail_panel(state_malformed, elapsed_seconds=0.1))
     assert "oops" in text
+
+
+def test_pause_releases_stdin_and_resume_reinstalls_keypress_reader(monkeypatch):
+    """Approval prompts and the '?'-toggle reader must not compete for stdin.
+
+    Found live: with the keypress thread still running during pause(), the
+    user's 'y' at the approval prompt was eaten byte-by-byte by the reader
+    and typer.confirm saw only the Enter, resolving to the default 'n'.
+    pause() must fully release stdin (thread stopped, termios restored);
+    resume() must reinstall the reader.
+    """
+    import os
+    import pty
+    import sys
+    import termios
+
+    from foundation import live_turn
+
+    master_fd, slave_fd = pty.openpty()
+
+    class _PtyStdin:
+        def fileno(self) -> int:
+            return slave_fd
+
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _PtyStdin())
+    console = Console(file=io.StringIO(), force_terminal=True, width=80)
+    renderer = live_turn.LiveTurnRenderer(console=console, enable_keypress=True)
+    try:
+        with renderer:
+            assert renderer._keypress_thread is not None
+            running_lflag = termios.tcgetattr(slave_fd)[3]
+            assert not (running_lflag & termios.ICANON)  # cbreak active
+
+            renderer.pause()
+            assert renderer._keypress_thread is None
+            paused_lflag = termios.tcgetattr(slave_fd)[3]
+            assert paused_lflag & termios.ICANON  # canonical mode restored
+
+            renderer.resume()
+            assert renderer._keypress_thread is not None
+            resumed_lflag = termios.tcgetattr(slave_fd)[3]
+            assert not (resumed_lflag & termios.ICANON)  # reader reinstalled
+    finally:
+        os.close(master_fd)
+        os.close(slave_fd)

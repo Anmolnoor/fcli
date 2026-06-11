@@ -52,6 +52,13 @@ that were checked and rejected).
   "Aborted." (exit 1) when the prompt hit EOF; it now resolves as
   PENDING_APPROVAL with the graceful stop notice. A TTY user pressing
   Ctrl-C at the prompt still aborts.
+- Typing "y" at an interactive approval prompt no longer resolves as "n":
+  the live status line's `?`-toggle keypress reader kept reading stdin
+  byte-by-byte during prompts, eating the user's answer so `typer.confirm`
+  saw only the Enter and fell back to the default. `pause()` now stops the
+  reader thread, restores canonical terminal mode, and flushes type-ahead;
+  `resume()` reinstalls the reader. Affected every mid-turn prompt
+  (approvals, agent questions, out-of-scope read grants) on a real TTY.
 - A turn that failed, repaired itself, and completed no longer reports
   "stopped: tool failed"; the summary reads "Executed N actions, recovered
   from M earlier failure(s)". Custom test scripts (any command with "test"
