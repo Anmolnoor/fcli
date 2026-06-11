@@ -248,3 +248,103 @@ def test_schema_v6_migration_keys_assistant_plans_per_iteration(
         assert [row["iteration"] for row in rows] == [1, 2]
     finally:
         connection.close()
+
+
+def _build_v5_database(database_path: Path, *, duplicate_iteration_rows: bool = False) -> None:
+    """Create a v5-shaped DB with the legacy assistant_plans constraint.
+
+    With ``duplicate_iteration_rows`` the table is built without any unique
+    constraint and seeded with two rows sharing (session_id, iteration) — a
+    corrupt shape the v6 rebuild must refuse to destroy (hardening stage 5).
+    """
+    constraint = "" if duplicate_iteration_rows else ", UNIQUE(session_id)"
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.executescript(
+            f"""
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                workspace_root TEXT NOT NULL,
+                request_cwd TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                plan_only INTEGER NOT NULL DEFAULT 0,
+                command_preview TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT
+            );
+            CREATE TABLE assistant_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                iteration INTEGER NOT NULL DEFAULT 1,
+                assistant_message TEXT NOT NULL,
+                context_json TEXT,
+                plan_json TEXT NOT NULL,
+                planning_metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL{constraint}
+            );
+            INSERT INTO sessions (id, kind, status, workspace_root, request_cwd,
+                                  approval_mode, started_at)
+            VALUES ('sess-legacy', 'chat', 'completed', '/ws', '/ws', 'prompt',
+                    '2026-01-01T00:00:00Z');
+            INSERT INTO assistant_plans (
+                session_id, iteration, assistant_message, plan_json,
+                planning_metadata_json, created_at
+            ) VALUES (
+                'sess-legacy', 1, 'iter-1', '{{}}', '{{}}', '2026-01-01T00:00:00Z'
+            );
+            """
+        )
+        if duplicate_iteration_rows:
+            connection.execute(
+                "INSERT INTO assistant_plans (session_id, iteration, "
+                "assistant_message, plan_json, planning_metadata_json, created_at) "
+                "VALUES ('sess-legacy', 1, 'iter-1-dup', '{}', '{}', "
+                "'2026-01-01T00:00:01Z')"
+            )
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_migration_writes_backup_before_running(tmp_path: Path) -> None:
+    """Hardening stage 5: a schema migration backs up the DB file first."""
+    database_path = tmp_path / "history.sqlite3"
+    _build_v5_database(database_path)
+
+    HistoryStore(database_path=database_path)
+
+    backup_path = tmp_path / "history.sqlite3.pre-v6.bak"
+    assert backup_path.exists()
+    backup = sqlite3.connect(backup_path)
+    try:
+        assert backup.execute("PRAGMA user_version").fetchone()[0] == 5
+        count = backup.execute("SELECT COUNT(*) FROM assistant_plans").fetchone()[0]
+        assert count == 1
+    finally:
+        backup.close()
+
+
+def test_sabotaged_v6_rebuild_raises_and_preserves_original(tmp_path: Path) -> None:
+    """Hardening stage 5: a failing rebuild must not destroy history."""
+    import pytest
+
+    from foundation.services.history import HistoryMigrationError
+
+    database_path = tmp_path / "history.sqlite3"
+    _build_v5_database(database_path, duplicate_iteration_rows=True)
+
+    with pytest.raises(HistoryMigrationError, match="pre-v6.bak"):
+        HistoryStore(database_path=database_path)
+
+    # Original database untouched and readable at the old version.
+    connection = sqlite3.connect(database_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        count = connection.execute("SELECT COUNT(*) FROM assistant_plans").fetchone()[0]
+        assert count == 2
+    finally:
+        connection.close()
+    assert (tmp_path / "history.sqlite3.pre-v6.bak").exists()

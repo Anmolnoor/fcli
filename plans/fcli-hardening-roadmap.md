@@ -238,6 +238,16 @@ phrasing fails. Keep the "never break the turn" property; lose the silence.
 
 ## Stage 5: Migration Safety Rails
 
+**Status: shipped 2026-06-10.** Pre-migration file backup
+(`<db>.pre-v<target>.bak`, newest kept, older rotated out), the v6 rebuild
+now validates row counts and raises `HistoryMigrationError` (naming the
+backup) *before* dropping the source table, and any sqlite error during the
+chain rolls back and re-raises as `HistoryMigrationError`. One deliberate
+deviation: the rebuild was switched from `executescript` (which has implicit
+commit semantics) to individual `execute()` calls so validation happens
+inside the transaction — the validate-before-drop ordering, not the
+transaction, is the real guarantee that history survives.
+
 ### Goal
 
 `history.py:1382` (`_migrate_to_v6`) rebuilds `assistant_plans` to change a
