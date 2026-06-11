@@ -144,6 +144,11 @@ PYTHON_BIN="$(find_python_312)"
 
 if [[ ! -d "${VENV_DIR}" ]]; then
   "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+elif [[ ! -x "${PIP_BIN}" && ! -x "${UV_BIN}" ]]; then
+  # A uv-recreated venv (e.g. after a Homebrew Python upgrade) contains
+  # neither pip nor uv; rebuild it so the pip -> uv -> sync chain below works.
+  echo "Existing .venv has neither pip nor uv; rebuilding it." >&2
+  "${PYTHON_BIN}" -m venv --clear "${VENV_DIR}"
 fi
 
 if [[ ! -x "${UV_BIN}" ]]; then
