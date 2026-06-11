@@ -64,7 +64,12 @@ from foundation.services.orchestrator import RequestOrchestrator
 from foundation.services.provider import ProviderAdapter, build_provider_adapter
 from foundation.settings import ApprovalMode, AppSettings
 
-SUPPORTED_CONTRACT_RANGE = ">=0.1,<0.2"
+# Widened for contract v0.2 (additive minor bump: D1 network allowlist, D2 open
+# castes). The worker still implements the `coding` caste; the range just admits
+# v0.2 envelopes so a v0.2 supervisor can dispatch to it without skew rejection.
+SUPPORTED_CONTRACT_RANGE = ">=0.1,<0.3"
+# The single caste this worker implements (contract v0.2 opened the registry, D2).
+WORKER_CASTE = "coding"
 DEFAULT_HEARTBEAT_SECONDS = 10.0
 
 # Exit codes mirror the terminal state (plan Stage 4 relies on this mapping).
@@ -515,6 +520,17 @@ def run_headless_task(
         task = CodingWorkerTask.model_validate(raw)
     except ValidationError as exc:
         return _reject(f"task envelope failed validation: {exc}")
+
+    # Caste routing (contract v0.2, D2): the envelope now admits an open caste
+    # registry, but this worker only implements the `coding` caste. A valid task
+    # for another caste (audit, curator, …) is rejected here — caste-level "I
+    # don't implement this" is distinct from contract-level "this is invalid".
+    if task.worker_kind != WORKER_CASTE:
+        return _reject(
+            f"this worker implements the {WORKER_CASTE!r} caste but the task requests "
+            f"worker_kind {task.worker_kind!r}. Dispatch this caste to the worker that "
+            "implements it (the supervisor's caste→worker registry), not the coding worker."
+        )
 
     workspace = Path(task.workspace).expanduser().resolve()
     metered_provider: _MeteredProvider | None = None
