@@ -803,7 +803,13 @@ class PlannerService:
         version: str | None,
         arguments: dict[str, object],
     ) -> None:
-        manifest = self._capability_registry.resolve(capability_id, version)
+        try:
+            manifest = self._capability_registry.resolve(capability_id, version)
+        except ValueError as exc:
+            # The registry raises a plain ValueError for unknown capability
+            # ids; wrap it so the plan-repair loop (and the orchestrator's
+            # PlanningError handling) can route it instead of crashing.
+            raise PlanningError(str(exc)) from exc
         endpoint = manifest.runtime_endpoint
         if endpoint == "builtin.search":
             from foundation.services.tools import SearchRequest

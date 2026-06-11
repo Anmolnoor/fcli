@@ -716,3 +716,33 @@ def test_file_write_note_is_normalized_into_content_brief(tmp_path: Path) -> Non
         "path": "notes.md",
         "content_brief": "a short summary of the run",
     }
+
+
+def test_hallucinated_capability_id_routes_through_plan_repair(tmp_path: Path) -> None:
+    """A plan naming a nonexistent capability must repair, not crash.
+
+    Found by hardening stage 7: CapabilityRegistry.resolve raises a plain
+    ValueError, which used to escape both the repair loop and the
+    orchestrator's PlanningError handling.
+    """
+    provider = StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Using a made-up tool.",
+                    "actions": [_tool_action("a1", "foundation.does-not-exist", {"path": "x"})],
+                }
+            ),
+            _provider_response({"assistant_message": "Recovered.", "actions": []}),
+        ]
+    )
+    planner, _registry, workspace_root = _build_planner(tmp_path, provider)
+
+    plan, _metadata = planner.request_plan(
+        UserRequest(message="do a thing"),
+        _context(workspace_root),
+        request_id="req-1",
+    )
+
+    assert plan.assistant_message == "Recovered."
+    assert len(provider.calls) == 2

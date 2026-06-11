@@ -489,3 +489,18 @@ def test_fold_and_render_with_empty_payloads_does_not_crash():
     assert status.strip()
     assert collapsed.strip()
     assert "(no request)" in detail
+
+
+def test_detail_panel_request_text_is_not_parsed_as_markup():
+    """Found by hardening stage 7: raw request text reached Rich as markup.
+
+    A request containing markup-like brackets must render literally, and a
+    malformed closing tag must not raise MarkupError mid-Live.update.
+    """
+    state = TurnLiveState(request_text="[bold]not markup[/bold]")
+    text = _render_to_text(render_detail_panel(state, elapsed_seconds=0.1))
+    assert "[bold]not markup[/bold]" in text
+
+    state_malformed = TurnLiveState(request_text="[/bold]oops")
+    text = _render_to_text(render_detail_panel(state_malformed, elapsed_seconds=0.1))
+    assert "oops" in text
