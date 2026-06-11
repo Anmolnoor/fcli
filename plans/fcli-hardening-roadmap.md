@@ -110,6 +110,17 @@ Add before implementation:
 
 ## Stage 2: Plan-Action Union Validation At The Boundary
 
+**Status: shipped 2026-06-10, with a smaller scope than planned.** The review
+finding this stage was based on was outdated: `PlannedAction` already has a
+`model_validator` enforcing kind/payload presence and most cross-payload
+rejections, and plan validation failures already route through the repair
+loop (`planner.py` catches `(ValidationError, PlanningError)` and retries
+with repair messages). What actually shipped: closing the validator's
+remaining holes — a stray `question` payload was accepted on
+EXPLANATION/SHELL/TOOL_CALL actions, and a stray `explanation` on QUESTION
+actions. Task 4 (removing per-consumer None re-checks) was **rejected**: those
+checks are mypy-strict Optional narrowing, not redundant validation.
+
 ### Goal
 
 Make invalid action shapes unrepresentable at validation time instead of
