@@ -101,6 +101,20 @@ from foundation.services.tools import (
 _SHELL_OUTPUT_PREVIEW_LIMIT = 240
 
 
+class ExecutorInvariantError(RuntimeError):
+    """An internal executor invariant was violated.
+
+    Raised instead of ``assert`` so the guard survives ``python -O`` and
+    surfaces as a typed FAILED result rather than an interpreter crash.
+    """
+
+
+def _require[T](value: T | None, *, description: str) -> T:
+    if value is None:
+        raise ExecutorInvariantError(f"Internal executor invariant violated: {description}")
+    return value
+
+
 def _utcnow() -> str:
     return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -195,15 +209,25 @@ class ActionExecutor:
     ) -> ActionExecutionEnvelope:
         started_at = _utcnow()
         started_monotonic = time.monotonic()
-        execution_result, approval_request, approval_resolution = self._handle_action(
-            action,
-            decision,
-            policy_evaluation=policy_evaluation,
-            plan_only=plan_only,
-            request_cwd=request_cwd,
-            request_id=request_id,
-            session_id=session_id,
-        )
+        try:
+            execution_result, approval_request, approval_resolution = self._handle_action(
+                action,
+                decision,
+                policy_evaluation=policy_evaluation,
+                plan_only=plan_only,
+                request_cwd=request_cwd,
+                request_id=request_id,
+                session_id=session_id,
+            )
+        except ExecutorInvariantError as exc:
+            execution_result = ExecutionResult(
+                action_id=action.id,
+                status=ExecutionStatus.FAILED,
+                summary=f"Internal error: {exc}",
+                error=str(exc),
+            )
+            approval_request = None
+            approval_resolution = None
         completed_at = _utcnow()
         return ActionExecutionEnvelope(
             execution_result=execution_result,
@@ -482,11 +506,14 @@ class ActionExecutor:
             )
 
         if action.kind is ActionKind.QUESTION:
-            assert action.question is not None
+            question = _require(
+                action.question,
+                description=f"QUESTION action {action.id!r} is missing its question payload",
+            )
             return (
                 self._handle_question(
                     action.id,
-                    action.question,
+                    question,
                     request_id=request_id,
                     session_id=session_id,
                 ),
@@ -498,11 +525,14 @@ class ActionExecutor:
             self._policy_engine.register_invocation(policy_evaluation)
 
         if action.kind is ActionKind.TOOL_CALL:
-            assert action.tool_call is not None
+            tool_call = _require(
+                action.tool_call,
+                description=f"TOOL_CALL action {action.id!r} is missing its tool_call payload",
+            )
             return (
                 self._execute_tool_call(
                     action,
-                    action.tool_call,
+                    tool_call,
                     policy_evaluation=policy_evaluation,
                     request_cwd=request_cwd,
                     request_id=request_id,
@@ -512,7 +542,6 @@ class ActionExecutor:
                 approval_resolution,
             )
 
-        assert action.shell is not None
         return (
             self._execute_shell_action(
                 action,
@@ -523,6 +552,18 @@ class ActionExecutor:
             ),
             approval_request,
             approval_resolution,
+        )
+
+    def _require_file_service(self, endpoint: str) -> FileService:
+        return _require(
+            self._file_service,
+            description=f"{endpoint} dispatched without a file service wired",
+        )
+
+    def _require_git_service(self, endpoint: str) -> GitService:
+        return _require(
+            self._git_service,
+            description=f"{endpoint} dispatched without a git service wired",
         )
 
     def _execute_tool_call(
@@ -609,68 +650,62 @@ class ActionExecutor:
                 )
                 artifact_type = ExecutionArtifactType.TLDR
             elif manifest.runtime_endpoint == "builtin.file.read":
-                assert self._file_service is not None
-                result = self._file_service.read(
+                result = self._require_file_service("builtin.file.read").read(
                     FileReadRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.FILE_READ
             elif manifest.runtime_endpoint == "builtin.file.read_chunk":
-                assert self._file_service is not None
-                result = self._file_service.read_chunk(
+                result = self._require_file_service("builtin.file.read_chunk").read_chunk(
                     FileReadChunkRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.FILE_READ_CHUNK
             elif manifest.runtime_endpoint == "builtin.file.write":
-                assert self._file_service is not None
-                result = self._file_service.write(
+                result = self._require_file_service("builtin.file.write").write(
                     FileWriteRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.FILE_WRITE
             elif manifest.runtime_endpoint == "builtin.file.edit":
-                assert self._file_service is not None
-                result = self._file_service.edit(
+                result = self._require_file_service("builtin.file.edit").edit(
                     FileEditRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.FILE_EDIT
             elif manifest.runtime_endpoint == "builtin.file.apply_diff":
-                assert self._file_service is not None
-                result = self._file_service.apply_diff(
+                result = self._require_file_service("builtin.file.apply_diff").apply_diff(
                     FileApplyDiffRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.FILE_APPLY_DIFF
             elif manifest.runtime_endpoint == "builtin.git.status":
-                assert self._git_service is not None
-                result = self._git_service.status(
+                result = self._require_git_service("builtin.git.status").status(
                     GitStatusRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.GIT_STATUS
             elif manifest.runtime_endpoint == "builtin.git.diff":
-                assert self._git_service is not None
-                result = self._git_service.diff(GitDiffRequest.model_validate(tool_call.arguments))
+                result = self._require_git_service("builtin.git.diff").diff(
+                    GitDiffRequest.model_validate(tool_call.arguments)
+                )
                 artifact_type = ExecutionArtifactType.GIT_DIFF
             elif manifest.runtime_endpoint == "builtin.git.show":
-                assert self._git_service is not None
-                result = self._git_service.show(GitShowRequest.model_validate(tool_call.arguments))
+                result = self._require_git_service("builtin.git.show").show(
+                    GitShowRequest.model_validate(tool_call.arguments)
+                )
                 artifact_type = ExecutionArtifactType.GIT_SHOW
             elif manifest.runtime_endpoint == "builtin.git.log":
-                assert self._git_service is not None
-                result = self._git_service.log(GitLogRequest.model_validate(tool_call.arguments))
+                result = self._require_git_service("builtin.git.log").log(
+                    GitLogRequest.model_validate(tool_call.arguments)
+                )
                 artifact_type = ExecutionArtifactType.GIT_LOG
             elif manifest.runtime_endpoint == "builtin.git.stage":
-                assert self._git_service is not None
-                result = self._git_service.stage(
+                result = self._require_git_service("builtin.git.stage").stage(
                     GitStageRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.GIT_STAGE
             elif manifest.runtime_endpoint == "builtin.git.unstage":
-                assert self._git_service is not None
-                result = self._git_service.unstage(
+                result = self._require_git_service("builtin.git.unstage").unstage(
                     GitUnstageRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.GIT_UNSTAGE
             elif manifest.runtime_endpoint == "builtin.git.commit":
-                assert self._git_service is not None
-                result = self._git_service.commit(
+                result = self._require_git_service("builtin.git.commit").commit(
                     GitCommitRequest.model_validate(tool_call.arguments)
                 )
                 artifact_type = ExecutionArtifactType.GIT_COMMIT
@@ -859,8 +894,10 @@ class ActionExecutor:
         request_id: str,
         session_id: str | None,
     ) -> ExecutionResult:
-        assert action.shell is not None
-        shell_action = action.shell
+        shell_action = _require(
+            action.shell,
+            description=f"SHELL action {action.id!r} is missing its shell payload",
+        )
         shell_cwd = request_cwd if shell_action.cwd is None else Path(shell_action.cwd)
         command_preview = shlex.join([shell_action.command, *shell_action.args])
         effective_timeout = shell_action.timeout_seconds

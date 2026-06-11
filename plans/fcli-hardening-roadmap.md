@@ -50,6 +50,17 @@ Findings from the review that were checked against the code and dropped:
 
 ## Stage 1: Executor Invariants Fail Loudly
 
+**Status: shipped 2026-06-10 (branch `feat/fcli-hardening`).** All 16 executor
+asserts replaced with `ExecutorInvariantError` via a `_require` helper; one
+catch site in `ActionExecutor.execute()` converts violations to FAILED
+results. Task 4 sweep outcome: 26 asserts remain across 9 other source files;
+they are plan-time payload narrowing (already enforced by `PlannedAction`'s
+model validator), subprocess API narrowing (`process.stdout` after
+`Popen(..., stdout=PIPE)`), or loop-invariant narrowing (`last_error` after a
+retry loop). None sits on the side-effect execution path the way the executor
+asserts did; converting them is deferred unless a later stage touches those
+files anyway.
+
 ### Goal
 
 Replace production-path `assert` statements with typed errors. `python -O`
