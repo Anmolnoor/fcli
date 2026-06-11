@@ -594,9 +594,18 @@ def run_headless_task(
     sink.phase = "finishing"
 
     verification = _verification_for(result)
+    notice = result.verification_notice
+    # Surface the exact verification command(s) so the supervisor can re-run them
+    # against the patch (contract G10). Additive payload key — the contract
+    # Event keeps unknown payload keys, so this is not a contract change.
+    verification_commands = list(notice.verification_commands_run) if notice is not None else []
     stream.emit(
         EventType.VERIFY_RESULT,
-        {"outcome": verification.outcome.value, "details": verification.details},
+        {
+            "outcome": verification.outcome.value,
+            "details": verification.details,
+            "commands": verification_commands,
+        },
     )
 
     patch_artifact, changed_files = _collect_patch(workspace, task.task_id)

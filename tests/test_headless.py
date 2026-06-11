@@ -234,6 +234,11 @@ def test_happy_path_produces_contract_result_and_patch(
     assert "verify.result" in types
     assert "command.result" in types
 
+    # G10: the verify.result event surfaces the exact verification command(s) so a
+    # supervisor can re-run them against the patch (additive payload key).
+    verify_event = next(e for e in events if e.type.value == "verify.result")
+    assert verify_event.payload["commands"] == ["pytest"]
+
     # Event-log artifact hash covers the file as written.
     event_log = next(a for a in result.artifacts if a.kind == "event_log")
     import hashlib
