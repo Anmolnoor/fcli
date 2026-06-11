@@ -13,6 +13,31 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# Git subcommands that mutate the working tree, index, or history. The planner
+# (preflight review gating) and the guardrail policy engine (write-risk
+# classification) must agree on this set, so it is defined exactly once here.
+GIT_MUTATION_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "add",
+        "apply",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "merge",
+        "mv",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "stash",
+        "switch",
+        "tag",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Error types
 # ---------------------------------------------------------------------------

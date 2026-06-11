@@ -504,3 +504,12 @@ def test_auto_except_commit_gated_helper_passes_workspace_write() -> None:
         side_effects=["workspace_write"],
     )
     assert _auto_except_commit_gated(request) is None
+
+
+def test_git_mutation_subcommands_have_single_source_of_truth() -> None:
+    """Planner and guardrails must share one definition (hardening stage 3)."""
+    from foundation.models.git import GIT_MUTATION_SUBCOMMANDS
+    from foundation.services import guardrails, planner
+
+    assert planner._GIT_MUTATION_SUBCOMMANDS is GIT_MUTATION_SUBCOMMANDS
+    assert guardrails._WRITE_GIT_SUBCOMMANDS is GIT_MUTATION_SUBCOMMANDS

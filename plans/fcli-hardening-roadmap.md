@@ -155,6 +155,10 @@ whose payload fields say another; every consumer then re-checks by hand.
 
 ## Stage 3: One Source Of Truth For Git Mutation Subcommands
 
+**Status: shipped 2026-06-10.** `GIT_MUTATION_SUBCOMMANDS` defined once in
+`models/git.py`; planner and guardrails alias it. Identity test added in
+`tests/test_policy.py`.
+
 ### Goal
 
 `planner.py:91` (`_GIT_MUTATION_SUBCOMMANDS`) and `guardrails.py:52`

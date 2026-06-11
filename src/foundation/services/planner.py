@@ -29,6 +29,7 @@ from foundation.models.file import (
     FileWriteRequest,
 )
 from foundation.models.git import (
+    GIT_MUTATION_SUBCOMMANDS,
     GitCommitRequest,
     GitDiffRequest,
     GitLogRequest,
@@ -88,26 +89,7 @@ _GIT_MUTATION_CAPABILITY_IDS = frozenset(
     }
 )
 _SHELL_MUTATION_COMMANDS = frozenset({*_RELATIVE_PATH_MUTATION_COMMANDS, "git"})
-_GIT_MUTATION_SUBCOMMANDS = frozenset(
-    {
-        "add",
-        "apply",
-        "checkout",
-        "cherry-pick",
-        "clean",
-        "commit",
-        "merge",
-        "mv",
-        "rebase",
-        "reset",
-        "restore",
-        "revert",
-        "rm",
-        "stash",
-        "switch",
-        "tag",
-    }
-)
+_GIT_MUTATION_SUBCOMMANDS = GIT_MUTATION_SUBCOMMANDS
 
 
 class PlanningError(RuntimeError):
