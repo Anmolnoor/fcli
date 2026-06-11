@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -107,7 +108,7 @@ def _build_session_manager(settings: AppSettings) -> SessionManager:
     )
 
 
-def _prompt_for_approval(request: ApprovalRequest) -> bool:
+def _prompt_for_approval(request: ApprovalRequest) -> bool | None:
     risk_text = ", ".join(request.risk_categories) if request.risk_categories else "unknown"
     lines = [
         f"Action: [cyan]{escape(request.action_id)}[/cyan]",
@@ -159,7 +160,22 @@ def _prompt_for_approval(request: ApprovalRequest) -> bool:
         renderer.pause()
     try:
         console.print(Panel.fit(panel_text, title="Approval Required"))
-        return typer.confirm("Approve this action?", default=False)
+        try:
+            return typer.confirm("Approve this action?", default=False)
+        except click.Abort:
+            # A TTY user pressing Ctrl-C/Ctrl-D keeps aborting; EOF on piped
+            # stdin (one-shot non-interactive run) must not kill the turn —
+            # the action resolves as PENDING instead.
+            if sys.stdin.isatty():
+                raise
+            console.print(
+                Text(
+                    "No interactive input available to answer the approval prompt; "
+                    "leaving the action pending approval.",
+                    style="dim",
+                )
+            )
+            return None
     finally:
         if renderer is not None:
             renderer.resume()

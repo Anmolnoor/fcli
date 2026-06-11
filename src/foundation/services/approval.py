@@ -18,7 +18,9 @@ from foundation.models.history import (
 )
 from foundation.settings import ApprovalMode
 
-ApprovalPrompt = Callable[[ApprovalRequest], bool]
+# Returns True/False for an explicit user decision, or None when no
+# interactive input is available (the action then resolves as PENDING).
+ApprovalPrompt = Callable[[ApprovalRequest], bool | None]
 
 
 def _utcnow() -> str:
@@ -136,7 +138,25 @@ class ApprovalService:
                 requested_side_effects=list(request.requested_side_effects),
             )
 
-        approved = bool(self._prompt_callback(request))
+        answer = self._prompt_callback(request)
+        if answer is None:
+            return request, CapabilityApprovalResolution(
+                action_id=action.id,
+                capability_id=request.capability_id,
+                mode=self._mode.value,
+                status=ApprovalDecisionStatus.PENDING,
+                reason=(
+                    "Approval is required but no interactive input was available; "
+                    "re-run interactively to approve."
+                ),
+                requested_at=requested_at,
+                resolved_at=_utcnow(),
+                risk_categories=list(request.risk_categories),
+                reason_codes=list(request.reason_codes),
+                command_preview=request.command_preview,
+                requested_side_effects=list(request.requested_side_effects),
+            )
+        approved = bool(answer)
         return request, CapabilityApprovalResolution(
             action_id=action.id,
             capability_id=request.capability_id,

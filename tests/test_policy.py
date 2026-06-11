@@ -513,3 +513,76 @@ def test_git_mutation_subcommands_have_single_source_of_truth() -> None:
 
     assert planner._GIT_MUTATION_SUBCOMMANDS is GIT_MUTATION_SUBCOMMANDS
     assert guardrails._WRITE_GIT_SUBCOMMANDS is GIT_MUTATION_SUBCOMMANDS
+
+
+def test_prompt_callback_none_answer_resolves_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex smoke finding: EOF at the approval prompt must mean PENDING."""
+    registry, workspace_root = _registry(tmp_path, monkeypatch)
+    engine = CapabilityPolicyEngine(
+        workspace_root=workspace_root,
+        capability_registry=registry,
+    )
+    action = PlannedAction(
+        id="touch_file",
+        kind=ActionKind.SHELL,
+        summary="Create a file",
+        shell=ShellAction(command="touch", args=["note.txt"]),
+    )
+    evaluation = engine.evaluate(
+        action,
+        request_cwd=workspace_root,
+        approval_mode=ApprovalMode.PROMPT,
+    )
+    assert evaluation is not None
+
+    from foundation.models import ApprovalDecisionStatus
+
+    service = ApprovalService(mode=ApprovalMode.PROMPT, prompt_callback=lambda request: None)
+    _request, resolution = service.resolve(action, evaluation, request_cwd=workspace_root)
+
+    assert resolution.status is ApprovalDecisionStatus.PENDING
+    assert "no interactive input" in resolution.reason.lower()
+
+
+def test_prompt_for_approval_with_eof_stdin_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-TTY EOF (piped one-shot run) must not abort the whole turn."""
+    import io
+    import sys as sys_module
+
+    from foundation.cli_runtime import _prompt_for_approval
+
+    request = _make_approval_request(
+        capability_id="foundation.shell.command",
+        side_effects=["subprocess"],
+    )
+    monkeypatch.setattr(sys_module, "stdin", io.StringIO())
+    assert _prompt_for_approval(request) is None
+
+
+def test_prompt_for_approval_tty_abort_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real user pressing Ctrl-C/Ctrl-D at a TTY prompt keeps aborting."""
+    import io
+    import sys as sys_module
+
+    import click
+
+    from foundation.cli_runtime import _prompt_for_approval
+
+    class _TtyEof(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    request = _make_approval_request(
+        capability_id="foundation.shell.command",
+        side_effects=["subprocess"],
+    )
+    monkeypatch.setattr(sys_module, "stdin", _TtyEof())
+    with pytest.raises(click.Abort):
+        _prompt_for_approval(request)

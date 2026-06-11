@@ -45,9 +45,19 @@ that were checked and rejected).
 
 - A plan naming a nonexistent capability id crashed the turn with an
   unwrapped `ValueError`; it now routes through the plan-repair retry.
-- The live detail panel parsed the user's request text as Rich markup,
-  allowing styling injection and a `MarkupError` crash; it renders literally
-  now.
+- Model-generated text was parsed as Rich markup in the live detail panel
+  and both chat renderers, allowing styling injection and a `MarkupError`
+  crash; it renders literally now.
+- In piped, non-interactive runs an approval-gated action died with a bare
+  "Aborted." (exit 1) when the prompt hit EOF; it now resolves as
+  PENDING_APPROVAL with the graceful stop notice. A TTY user pressing
+  Ctrl-C at the prompt still aborts.
+- A turn that failed, repaired itself, and completed no longer reports
+  "stopped: tool failed"; the summary reads "Executed N actions, recovered
+  from M earlier failure(s)". Custom test scripts (any command with "test"
+  in its basename, e.g. `./run_tests.sh`) now count as verification, and
+  the verification outcome across iterations is decided by the latest
+  attempt instead of worst-wins, so a repaired test run reports "passed".
 
 ### Added
 

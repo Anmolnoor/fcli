@@ -4132,3 +4132,140 @@ def test_repeated_successful_file_read_stops_as_no_progress(
         if call.response_format is ProviderResponseFormat.JSON_OBJECT
     ]
     assert len(plan_calls) == 2
+
+
+def test_classify_results_recognizes_custom_test_scripts(tmp_path: Path) -> None:
+    """Codex smoke finding: ./run_tests.sh was not counted as verification."""
+    from foundation.models import (
+        ActionKind,
+        ExecutionResult,
+        ExecutionStatus,
+        PlannedAction,
+        ShellAction,
+        VerificationOutcome,
+    )
+    from foundation.services.orchestrator import RequestOrchestrator
+
+    action = PlannedAction(
+        id="v1",
+        kind=ActionKind.SHELL,
+        summary="run the project test script",
+        shell=ShellAction(command="./run_tests.sh"),
+    )
+    result = ExecutionResult(action_id="v1", status=ExecutionStatus.EXECUTED, summary="ok")
+
+    _changed, _code, outcome, commands = RequestOrchestrator._classify_results([result], [action])
+
+    assert commands == ["./run_tests.sh"]
+    assert outcome is VerificationOutcome.PASSED
+
+
+def test_latest_iteration_verification_wins_across_iterations() -> None:
+    """Codex smoke finding: an early failing test run masked the later pass."""
+    from foundation.models import VerificationOutcome
+    from foundation.services.orchestrator import _combine_iteration_verification
+
+    failed = VerificationOutcome.FAILED
+    passed = VerificationOutcome.PASSED
+    not_attempted = VerificationOutcome.NOT_ATTEMPTED
+
+    assert _combine_iteration_verification(failed, passed) is passed
+    assert _combine_iteration_verification(passed, failed) is failed
+    assert _combine_iteration_verification(failed, not_attempted) is failed
+    assert _combine_iteration_verification(not_attempted, passed) is passed
+
+
+def _summary_fixtures(tmp_path: Path):
+    from foundation.models import (
+        ActionKind,
+        AssistantPlan,
+        ContextSnapshot,
+        ExecutionResult,
+        ExecutionStatus,
+        OrchestrationIteration,
+        PlannedAction,
+        ProviderResponseMetadata,
+        ShellAction,
+        ToolCall,
+    )
+
+    context = ContextSnapshot(
+        workspace_root=str(tmp_path),
+        request_cwd=str(tmp_path),
+        approval_mode="prompt",
+    )
+    metadata = ProviderResponseMetadata(provider="stub", model="stub", latency_seconds=0.0)
+    run_tests = PlannedAction(
+        id="t1",
+        kind=ActionKind.SHELL,
+        summary="run tests",
+        shell=ShellAction(command="./run_tests.sh"),
+    )
+    fix = PlannedAction(
+        id="f1",
+        kind=ActionKind.TOOL_CALL,
+        summary="fix the bug",
+        tool_call=ToolCall(capability_id="foundation.file.edit", arguments={}),
+    )
+    rerun = PlannedAction(
+        id="t2",
+        kind=ActionKind.SHELL,
+        summary="re-run tests",
+        shell=ShellAction(command="./run_tests.sh"),
+    )
+    failed = ExecutionResult(
+        action_id="t1", status=ExecutionStatus.FAILED, summary="tests failed", error="exit 1"
+    )
+    fixed = ExecutionResult(action_id="f1", status=ExecutionStatus.EXECUTED, summary="edited")
+    passed = ExecutionResult(action_id="t2", status=ExecutionStatus.EXECUTED, summary="passed")
+    iterations = [
+        OrchestrationIteration(
+            iteration=1,
+            context=context,
+            plan=AssistantPlan(assistant_message="try the tests", actions=[run_tests]),
+            planning_metadata=metadata,
+            execution_results=[failed],
+        ),
+        OrchestrationIteration(
+            iteration=2,
+            context=context,
+            plan=AssistantPlan(assistant_message="fix and re-run", actions=[fix, rerun]),
+            planning_metadata=metadata,
+            execution_results=[fixed, passed],
+        ),
+    ]
+    return iterations, [failed, fixed, passed]
+
+
+def test_summary_does_not_blame_recovered_failures_on_natural_completion(
+    tmp_path: Path,
+) -> None:
+    """Codex smoke finding: a successful turn said 'stopped: tool failed'."""
+    from foundation.models import LoopStopReason
+    from foundation.services.orchestrator import RequestOrchestrator
+
+    iterations, results = _summary_fixtures(tmp_path)
+    summary = RequestOrchestrator._build_summary(
+        iterations,
+        results,
+        plan_only=False,
+        stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
+    )
+    assert "stopped" not in summary.text.lower()
+    assert summary.text.startswith("Executed 2")
+    assert "recovered" in summary.text
+    assert "(2 iterations)" in summary.text
+
+
+def test_summary_keeps_stop_framing_for_abnormal_stops(tmp_path: Path) -> None:
+    from foundation.models import LoopStopReason
+    from foundation.services.orchestrator import RequestOrchestrator
+
+    iterations, results = _summary_fixtures(tmp_path)
+    summary = RequestOrchestrator._build_summary(
+        iterations,
+        results,
+        plan_only=False,
+        stop_reason=LoopStopReason.FATAL_EXECUTION_FAILURE,
+    )
+    assert "stopped" in summary.text.lower()

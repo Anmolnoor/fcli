@@ -158,6 +158,22 @@ def _worst_verification_outcome(
     return a
 
 
+def _combine_iteration_verification(
+    previous: VerificationOutcome,
+    latest: VerificationOutcome,
+) -> VerificationOutcome:
+    """Combine verification outcomes across iterations: the latest attempt wins.
+
+    Each iteration is a repair attempt, so a later PASSED supersedes an earlier
+    FAILED (and vice versa). An iteration that attempted no verification keeps
+    the previous outcome. Within a single iteration worst-wins still applies —
+    see ``_classify_results``.
+    """
+    if latest is VerificationOutcome.NOT_ATTEMPTED:
+        return previous
+    return latest
+
+
 _CODE_CHANGING_ARTIFACT_TYPES = frozenset(
     {
         ExecutionArtifactType.FILE_WRITE,
@@ -1048,7 +1064,7 @@ class RequestOrchestrator:
                 execution_results, attempted_actions
             )
             had_code_changes = had_code_changes or iter_code_change
-            verification_outcome = _worst_verification_outcome(
+            verification_outcome = _combine_iteration_verification(
                 verification_outcome,
                 iter_outcome,
             )
@@ -1595,7 +1611,9 @@ class RequestOrchestrator:
 
             if action.kind is ActionKind.SHELL and action.shell:
                 cmd_basename = action.shell.command.split("/")[-1]
-                if cmd_basename in _VERIFICATION_COMMANDS:
+                # Custom test scripts (./run_tests.sh, scripts/test.py, …)
+                # count as verification alongside the known tool names.
+                if cmd_basename in _VERIFICATION_COMMANDS or "test" in cmd_basename:
                     display = " ".join([action.shell.command, *action.shell.args])
                     verify_cmds.append(display)
                     cmd_outcome = _verification_outcome_for_result(result)
@@ -2103,7 +2121,11 @@ class RequestOrchestrator:
             if skipped:
                 stop_parts.append(f"{skipped} skipped")
 
-            if blocked or failed:
+            # A ZERO_ACTION_PLAN stop means the loop completed naturally;
+            # failures along the way were repaired, not the stop cause.
+            completed_naturally = stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+            use_stop_framing = (blocked or failed) and not completed_naturally
+            if use_stop_framing:
                 cause = RequestOrchestrator._stop_cause_summary(
                     execution_results,
                     actions_by_id,
@@ -2125,10 +2147,15 @@ class RequestOrchestrator:
                 parts = [f"Executed {RequestOrchestrator._action_count(executed, 'action')}"]
                 if pending:
                     parts.append(RequestOrchestrator._approval_count(pending))
+                if failed:
+                    suffix = "" if failed == 1 else "s"
+                    parts.append(f"recovered from {failed} earlier failure{suffix}")
+                if blocked:
+                    parts.append(f"{blocked} blocked by policy")
                 if skipped:
                     parts.append(f"{skipped} skipped")
                 text = ", ".join(parts) + "."
-            if len(iterations) > 1 and not (blocked or failed):
+            if len(iterations) > 1 and not use_stop_framing:
                 text += f" ({len(iterations)} iterations)"
 
         return OrchestrationSummary(
