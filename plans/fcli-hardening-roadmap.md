@@ -325,6 +325,23 @@ then enforce it at parse time.
 
 ## Stage 7: Test Depth Where It Is Thin
 
+**Status: shipped 2026-06-10.** 41 new tests: `tests/test_planner.py` (21
+isolated PlannerService cases: observation/iteration prompt injection,
+endpoint validation, repair retries for missing/invalid/truncated output,
+commit-intent zero-action guard, shell guards, deferred-write rules,
+preflight reject), 10 Codex failure-path cases in `tests/test_provider.py`
+(missing binary, timeout, auth stderr, usage-limit, nonzero-exit stderr
+preservation, malformed/empty output → ProviderErrorCode mapping), 10 live
+rendering edge cases in `tests/test_live_turn.py` (narrow widths, spinner
+identity across refreshes, markup-literal activity lines, ANSI payloads,
+empty payloads). The sweep found two real bugs, fixed separately right after
+this stage: a hallucinated capability id escaped the plan-repair loop as an
+unwrapped `ValueError`, and `render_detail_panel` parsed user request text
+as Rich markup (crash + styling injection). Known oddities documented in
+tests, not changed: Codex `rc>=2 → retryable` heuristic; stale banners were
+deliberately removed in #12, so `render_status_line`'s `now` parameter is
+vestigial.
+
 ### Goal
 
 Coverage is strong on the orchestrator and providers but thin exactly where

@@ -6,6 +6,7 @@ import io
 from typing import Any
 
 from rich.console import Console
+from rich.spinner import Spinner
 
 from foundation.live_turn import (
     LivePhase,
@@ -195,8 +196,8 @@ def test_state_reducer_approval_pending_path():
     assert state.approval_summary is None
 
 
-def _render_to_text(renderable) -> str:
-    console = Console(file=io.StringIO(), force_terminal=False, width=80, record=True)
+def _render_to_text(renderable, *, width: int = 80) -> str:
+    console = Console(file=io.StringIO(), force_terminal=False, width=width, record=True)
     console.print(renderable)
     return console.export_text()
 
@@ -349,3 +350,142 @@ def test_renderer_pause_resume_safe_when_unmounted(tmp_path):
     # Both should be no-ops when the Live widget hasn't been entered.
     renderer.pause()
     renderer.resume()
+
+
+# --- Stage 7 hardening: renderer edge cases ------------------------------
+
+
+def test_render_status_line_narrow_width_stays_single_line():
+    cases = [
+        TurnLiveState(),  # Starting
+        TurnLiveState(phase=LivePhase.THINKING),
+        TurnLiveState(current_action_id="a1", current_action_tool="foundation.file.read"),
+        TurnLiveState(finished=True, final_status="completed"),
+    ]
+    for state in cases:
+        text = _render_to_text(render_status_line(state, elapsed_seconds=2.0), width=20)
+        lines = [line for line in text.splitlines() if line.strip()]
+        assert len(lines) == 1
+        assert len(lines[0].rstrip()) <= 20
+
+
+def test_render_collapsed_narrow_width_renders_without_crash():
+    state = TurnLiveState()
+    state.fold(
+        EVENT_SHELL_EXECUTION_STARTED,
+        {
+            "action_id": "test",
+            "command_preview": "pytest tests/test_live_turn.py -q --maxfail=1 -k narrow",
+        },
+    )
+    text = _render_to_text(render_collapsed(state, elapsed_seconds=0.3), width=20)
+    assert "Working" in text
+    assert "pytest" in text
+    # Long activity lines wrap within the console width instead of overflowing.
+    assert all(len(line.rstrip()) <= 20 for line in text.splitlines())
+
+
+def test_render_collapsed_reuses_provided_spinner_instance():
+    state = TurnLiveState(iteration=1)
+    spinner = Spinner("dots", style="cyan")
+    first = render_collapsed(state, elapsed_seconds=0.1, spinner=spinner)
+    second = render_collapsed(state, elapsed_seconds=0.2, spinner=spinner)
+    # The same Spinner object must be embedded each time so its animation
+    # clock is not reset between refreshes (regression for 51645f5).
+    assert first.renderables[0] is spinner
+    assert second.renderables[0] is spinner
+
+
+def test_renderer_keeps_one_spinner_object_across_renders():
+    renderer = LiveTurnRenderer(
+        console=Console(file=io.StringIO(), force_terminal=False, width=80),
+        enable_keypress=False,
+    )
+    renderer.on_event(EVENT_SESSION_START, {"request_id": "r"})
+    first = renderer._render()
+    second = renderer._render()
+    assert first.renderables[0] is renderer._spinner
+    assert second.renderables[0] is renderer._spinner
+
+
+def test_render_status_line_terminal_states_never_render_stale():
+    finished = TurnLiveState(finished=True, final_status="completed", last_event_at=1.0)
+    text = _render_to_text(render_status_line(finished, elapsed_seconds=500.0, now=1000.0))
+    assert "completed" in text
+    assert "No live events" not in text
+
+    failed = TurnLiveState(phase=LivePhase.FAILED, final_status="failed", last_event_at=1.0)
+    text = _render_to_text(render_status_line(failed, elapsed_seconds=500.0, now=1000.0))
+    assert "failed" in text
+    assert "No live events" not in text
+
+
+def test_render_status_line_running_tool_at_hard_stale_age_keeps_plain_label():
+    # Staleness banners were removed in 635b496; even far past the old hard
+    # threshold the active phase label renders unchanged and `now` is ignored.
+    state = TurnLiveState(
+        phase=LivePhase.RUNNING_TOOL,
+        current_action_id="a1",
+        current_action_tool="shell",
+        last_event_at=10.0,
+    )
+    text = _render_to_text(render_status_line(state, elapsed_seconds=120.0, now=130.0))
+    assert text.strip() == "Working"
+    assert "No live events" not in text
+
+
+def test_collapsed_activity_renders_markup_brackets_literally():
+    state = TurnLiveState()
+    state.fold(EVENT_TOOL_CALL_STARTED, {"action_id": "a1", "tool": "[bold]not markup[/bold]"})
+    text = _render_to_text(render_collapsed(state, elapsed_seconds=0.1))
+    # Activity lines go through Text(), so Rich markup is rendered literally.
+    assert "next: [bold]not markup[/bold]" in text
+
+
+def test_collapsed_activity_with_ansi_escapes_renders_without_error():
+    state = TurnLiveState()
+    state.fold(
+        EVENT_SHELL_EXECUTION_STARTED,
+        {"action_id": "a1", "command_preview": "echo \x1b[31mred\x1b[0m"},
+    )
+    state.fold(
+        EVENT_SHELL_EXECUTION_FINISHED,
+        {"action_id": "a1", "stdout_preview": "\x1b[31mred\x1b[0m"},
+    )
+    text = _render_to_text(render_collapsed(state, elapsed_seconds=0.1))
+    assert "red" in text
+
+
+def test_detail_panel_with_ansi_error_text_renders_without_error():
+    state = TurnLiveState(request_text="plain request")
+    state.fold(EVENT_TOOL_CALL_STARTED, {"action_id": "a1", "tool": "shell"})
+    state.fold(EVENT_TOOL_CALL_FAILED, {"action_id": "a1", "error": "\x1b[31mboom\x1b[0m"})
+    text = _render_to_text(render_detail_panel(state, elapsed_seconds=0.5))
+    assert "boom" in text
+    assert "plain request" in text
+
+
+def test_fold_and_render_with_empty_payloads_does_not_crash():
+    state = TurnLiveState()
+    for event in (
+        EVENT_USER_REQUEST,
+        EVENT_SESSION_START,
+        EVENT_ITERATION_STARTED,
+        EVENT_PLAN_STARTED,
+        EVENT_PLAN_FINISHED,
+        EVENT_TOOL_CALL_STARTED,
+        EVENT_TOOL_CALL_FINISHED,
+        EVENT_SHELL_EXECUTION_STARTED,
+        EVENT_SHELL_EXECUTION_FINISHED,
+        EVENT_APPROVAL_REQUESTED,
+        EVENT_APPROVAL_RESOLVED,
+        EVENT_ITERATION_COMPLETED,
+        EVENT_SESSION_END,
+    ):
+        state.fold(event, {})
+    status = _render_to_text(render_status_line(state, elapsed_seconds=0.1))
+    collapsed = _render_to_text(render_collapsed(state, elapsed_seconds=0.1))
+    detail = _render_to_text(render_detail_panel(state, elapsed_seconds=0.1))
+    assert status.strip()
+    assert collapsed.strip()
+    assert "(no request)" in detail

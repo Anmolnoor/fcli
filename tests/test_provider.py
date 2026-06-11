@@ -89,6 +89,45 @@ class FakeCodexRunner:
         )
 
 
+class ScriptedCodexRunner:
+    """Codex runner fake for failure paths: raises or returns a scripted result."""
+
+    def __init__(
+        self,
+        *,
+        exception: Exception | None = None,
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+        final_message: str | None = None,
+    ) -> None:
+        self._exception = exception
+        self._returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self._final_message = final_message
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: Path,
+        input_text: str,
+        timeout_seconds: int,
+    ) -> subprocess.CompletedProcess[str]:
+        if self._exception is not None:
+            raise self._exception
+        if self._final_message is not None:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text(self._final_message, encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=self._returncode,
+            stdout=self._stdout,
+            stderr=self._stderr,
+        )
+
+
 def _structured_prompt() -> ProviderPrompt:
     return ProviderPrompt(
         messages=[
@@ -221,6 +260,163 @@ def test_codex_adapter_omits_output_schema_for_open_ended_json_schema(
     assert "--output-schema" not in runner.calls[0]["args"]
     assert runner.calls[0]["schema"] is None
     assert '"additionalProperties": true' in runner.calls[0]["input_text"]
+
+
+def _codex_adapter(
+    tmp_path: Path,
+    runner: ScriptedCodexRunner,
+    *,
+    timeout_seconds: int = 60,
+) -> CodexExecAdapter:
+    return CodexExecAdapter(
+        model="gpt-5.5",
+        workspace_root=tmp_path,
+        timeout_seconds=timeout_seconds,
+        runner=runner,
+    )
+
+
+def test_codex_adapter_missing_binary_maps_to_bad_request(tmp_path: Path) -> None:
+    runner = ScriptedCodexRunner(exception=FileNotFoundError("codex"))
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.BAD_REQUEST
+    assert exc_info.value.retryable is False
+    assert "Codex CLI was not found on PATH" in str(exc_info.value)
+
+
+def test_codex_adapter_timeout_maps_to_retryable_network_error(tmp_path: Path) -> None:
+    runner = ScriptedCodexRunner(
+        exception=subprocess.TimeoutExpired(cmd=["codex", "exec"], timeout=5)
+    )
+    adapter = _codex_adapter(tmp_path, runner, timeout_seconds=5)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.NETWORK
+    assert exc_info.value.retryable is True
+    assert "timed out after 5s" in str(exc_info.value)
+
+
+def test_codex_adapter_launch_oserror_maps_to_retryable_network_error(
+    tmp_path: Path,
+) -> None:
+    runner = ScriptedCodexRunner(exception=OSError("argument list too long"))
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.NETWORK
+    assert exc_info.value.retryable is True
+    assert "failed to start" in str(exc_info.value)
+    assert "argument list too long" in str(exc_info.value)
+
+
+def test_codex_adapter_auth_failure_stderr_maps_to_authentication(
+    tmp_path: Path,
+) -> None:
+    stderr = "Error: not logged in. Run `codex login` and sign in with ChatGPT."
+    runner = ScriptedCodexRunner(returncode=1, stderr=stderr)
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.AUTHENTICATION
+    assert exc_info.value.retryable is False
+    assert str(exc_info.value) == stderr
+
+
+def test_codex_adapter_usage_limit_stderr_maps_to_retryable_rate_limit(
+    tmp_path: Path,
+) -> None:
+    stderr = "You've hit your usage limit. Try again later."
+    runner = ScriptedCodexRunner(returncode=1, stderr=stderr)
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.RATE_LIMIT
+    assert exc_info.value.retryable is True
+    assert str(exc_info.value) == stderr
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected_retryable"),
+    [(1, False), (2, True)],
+)
+def test_codex_adapter_nonzero_exit_preserves_stderr_in_server_error(
+    tmp_path: Path,
+    returncode: int,
+    expected_retryable: bool,
+) -> None:
+    stderr = "stream disconnected before completion: unexpected status"
+    runner = ScriptedCodexRunner(returncode=returncode, stderr=stderr)
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.SERVER_ERROR
+    assert exc_info.value.retryable is expected_retryable
+    assert str(exc_info.value) == stderr
+
+
+def test_codex_adapter_nonzero_exit_prefers_error_event_from_stdout(
+    tmp_path: Path,
+) -> None:
+    runner = ScriptedCodexRunner(
+        returncode=1,
+        stdout='{"type":"error","message":"model stream closed unexpectedly"}\n',
+        stderr="exit status 1",
+    )
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.SERVER_ERROR
+    assert str(exc_info.value) == "model stream closed unexpectedly"
+    assert "exit status 1" in (exc_info.value.response_text or "")
+
+
+def test_codex_adapter_malformed_json_output_maps_to_invalid_response(
+    tmp_path: Path,
+) -> None:
+    runner = ScriptedCodexRunner(final_message="Sorry, I cannot produce JSON for that request.")
+    adapter = _codex_adapter(tmp_path, runner)
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(_structured_prompt())
+
+    assert exc_info.value.code is ProviderErrorCode.INVALID_RESPONSE
+    assert "invalid JSON" in str(exc_info.value)
+    assert "Sorry, I cannot produce JSON" in str(exc_info.value)
+
+
+def test_codex_adapter_empty_output_maps_to_invalid_response(tmp_path: Path) -> None:
+    runner = ScriptedCodexRunner(returncode=0, stdout="")
+    adapter = _codex_adapter(tmp_path, runner)
+    prompt = ProviderPrompt(
+        messages=[
+            ProviderMessage(
+                role=ProviderMessageRole.USER,
+                content="Say hello.",
+            )
+        ],
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        adapter.complete(prompt)
+
+    assert exc_info.value.code is ProviderErrorCode.INVALID_RESPONSE
+    assert "no final assistant message" in str(exc_info.value)
 
 
 def test_openai_adapter_parses_structured_output_and_usage() -> None:
