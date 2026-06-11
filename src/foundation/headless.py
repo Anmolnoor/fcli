@@ -246,7 +246,9 @@ def _collect_patch(workspace: Path, task_id: str) -> tuple[Artifact | None, list
     _git(workspace, "add", "-N", "--", ".", *excludes)
     changed_proc = _git(workspace, "diff", "--name-only", "--", ".", *excludes)
     changed_files = [line for line in changed_proc.stdout.splitlines() if line.strip()]
-    diff_proc = _git(workspace, "diff", "--", ".", *excludes)
+    # --binary keeps the patch appliable (git apply --index) even when untracked
+    # binary files were intent-added; applying the patch is the approval action (Q5).
+    diff_proc = _git(workspace, "diff", "--binary", "--", ".", *excludes)
     if not diff_proc.stdout.strip():
         return None, changed_files
     artifacts_dir = workspace / ".artifacts"
