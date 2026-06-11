@@ -159,12 +159,12 @@ def _provider_readiness_check(settings: AppSettings) -> DoctorCheck:
             summary="Provider name is missing.",
             detail="Set [provider].name to a supported provider.",
         )
-    if provider_name not in {"codex", "openai", "ollama"}:
+    if provider_name not in {"codex", "openai", "ollama", "mock"}:
         return DoctorCheck(
             name="Provider readiness",
             status=DoctorStatus.FAIL,
             summary=f"Provider {settings.provider.name!r} is not supported.",
-            detail="Supported providers: codex, openai, ollama.",
+            detail="Supported providers: codex, openai, ollama, mock.",
         )
     if not settings.provider.model.strip():
         return DoctorCheck(

@@ -209,6 +209,8 @@ class ProviderSection(BaseModel):
     num_ctx: PositiveInt | None = None
     api_key_env_var: str | None = OPENAI_DEFAULT_API_KEY_ENV_VAR
     api_key_keychain: KeychainSecretRef | None = Field(default_factory=KeychainSecretRef)
+    # Used only by the deterministic mock provider (provider.name = "mock").
+    scenario_file: Path | None = None
 
     def normalized_name(self) -> str:
         """Return the normalized provider name."""
