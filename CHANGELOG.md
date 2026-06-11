@@ -4,6 +4,58 @@ All notable changes to Foundation CLI are documented here. This project follows
 semantic-ish versioning: feature releases bump the minor version; bug fixes and
 small enhancements land on patch releases.
 
+## [Unreleased] — hardening batch (2026-06)
+
+Closes the gaps found in the 2026-06-10 full-project review (see
+`plans/fcli-hardening-roadmap.md` for stage-by-stage detail and the findings
+that were checked and rejected).
+
+### Changed
+
+- **Executor invariants fail loudly.** All 16 `assert` statements in the
+  action executor (kind/payload narrowing, file/git service wiring) were
+  replaced with a typed `ExecutorInvariantError`; violations now surface as
+  FAILED execution results in the trace instead of interpreter crashes, and
+  survive `python -O`.
+- **Plan-action validation closed its last holes.** A stray `question`
+  payload on EXPLANATION/SHELL/TOOL_CALL actions (and a stray `explanation`
+  on QUESTION actions) is now rejected at validation time and routed through
+  the existing plan-repair retry.
+- **One source of truth for git mutation subcommands.**
+  `GIT_MUTATION_SUBCOMMANDS` lives in `models/git.py`; the planner and the
+  guardrail policy engine both alias it, so they can no longer diverge.
+- **Audit-trail failures are visible.** Event-sink failures are counted and
+  warned about; a sink failing 3 consecutive times is disabled with one
+  final warning instead of spamming. A crash inside the NDJSON event-log
+  writer now marks the session `write_truncated` in `sessions.jsonl` instead
+  of letting the index claim a complete log. Gap-message phrasing fallbacks
+  log their reason (provider-error / empty / json-or-fenced / plan-shaped).
+- **History migrations have safety rails.** Before any schema migration the
+  database file is backed up to `<db>.pre-v<target>.bak` (newest kept). The
+  v6 rebuild validates row counts before dropping the source table; failures
+  raise `HistoryMigrationError` naming the backup, with the original data
+  intact.
+- **Diff applier leniency is bounded and reported.** Hunks whose declared
+  source-line count disagrees with their body, and hunks with no additions
+  or removals, are rejected at parse time. Bare context lines and
+  newline-normalized matching remain accepted but are reported through
+  `FileMutationResult.leniency_notes` into the trace.
+
+### Fixed
+
+- A plan naming a nonexistent capability id crashed the turn with an
+  unwrapped `ValueError`; it now routes through the plan-repair retry.
+- The live detail panel parsed the user's request text as Rich markup,
+  allowing styling injection and a `MarkupError` crash; it renders literally
+  now.
+
+### Added
+
+- 100+ new tests, including isolated `PlannerService` unit tests
+  (`tests/test_planner.py`), Codex provider failure-path coverage, live
+  rendering edge cases, sink failure/circuit-breaker tests, and migration
+  backup/sabotage tests.
+
 ## [0.2.0] — unreleased (v3)
 
 v3 makes `foundation` behave like a real coding-agent shell on top of the v2

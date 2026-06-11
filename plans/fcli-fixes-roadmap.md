@@ -1,5 +1,14 @@
 # FCLI Fixes Roadmap
 
+## Status
+
+**Complete (verified 2026-06-10).** All five stages shipped: command error
+recovery (`_COMMAND_USAGE_ERROR_PATTERNS` in `gap_handoff.py` + repair
+notices in `orchestrator.py`), static gates restored (ruff check/format and
+strict mypy all green), and live loading UX (`LivePhase` model in
+`live_turn.py`, landed via #11/#12). Superseded by
+`plans/fcli-hardening-roadmap.md` for the next fix batch.
+
 ## Purpose
 
 Track the near-term fixes needed to get Foundation CLI back to a clean,

@@ -376,6 +376,23 @@ implementation strings.
 
 ## Stage 8: Orchestrator Slimming
 
+**Status: evaluated and descoped 2026-06-10.** Inspection refuted both
+premises. (1) The helpers are not misplaced: `_tool_result_preview` and
+`_format_tool_call_log_entry` are called only from inside `orchestrator.py`
+(observation/log building at lines ~1081 and ~1467), and
+`_unwrap_generated_file_body` is called by `_generate_file_body`, which
+itself lives in the orchestrator — moving any of them would separate code
+from its only caller. (2) The 14 constructor parameters are mostly optional
+dependency-injection seams (policy engine, approval service, history store,
+registry, callbacks) that default sensibly and that tests inject through;
+bundling them into a frozen context object moves the same kwargs one level
+down without removing any responsibility from the class. The real
+god-object concern (≈40 methods spanning context gathering, deferred-write
+generation, classification, and observation formatting) is a behavioral
+redesign, not a mechanical move, and is out of scope for a hardening batch
+per this stage's own "strictly mechanical" rule. Revisit only if/when the
+deferred-write generation is extracted into its own service.
+
 ### Goal
 
 `RequestOrchestrator` (`orchestrator.py`) takes 14 constructor parameters and
@@ -411,6 +428,13 @@ concerns. Shrink it incrementally — no behavior change, no big-bang rewrite.
 - Diff shows moves and signature changes only — no logic edits.
 
 ## Stage 9: Docs And Plans Hygiene
+
+**Status: shipped 2026-06-10.** `fcli-fixes-roadmap.md` marked complete;
+status headers added to the v0.1 roadmap, all five v2 stage plans, and the
+v4 roadmap (v3 already had one); CHANGELOG gained an "Unreleased — hardening
+batch" section covering stages 1–7 and the two bug fixes; TECHNICAL.md
+documents the `write_truncated` degradation semantics, the sink
+circuit-breaker, and pre-migration backups.
 
 ### Goal
 

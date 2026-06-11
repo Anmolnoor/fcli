@@ -1,5 +1,9 @@
 # Foundation CLI v0.1 Roadmap
 
+## Status
+
+**v0.1 shipped** — superseded by the v2/v3/v4 roadmaps and the fix/hardening batches.
+
 ## Purpose
 This planning set is the stage-zero baseline for Foundation CLI. It turns the MVP direction into an execution sequence with explicit gates so implementation can move from an empty repository to a usable v0.1 without scope drift.
 

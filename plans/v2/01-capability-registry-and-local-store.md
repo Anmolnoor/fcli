@@ -1,5 +1,7 @@
 # Stage 1: Capability Registry and Local Store
 
+**Status: shipped (v2 complete; see git history).**
+
 ## Goal
 Replace the hardcoded tool surface with a first-class capability system that can represent built-in tools, future skills, and user-created extensions through one typed registry. This stage establishes the local store and metadata model that every later v2 policy, audit, and execution path will depend on.
 

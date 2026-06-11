@@ -1,5 +1,7 @@
 # Stage 3: Trace, Audit, and Runtime Split
 
+**Status: shipped (v2 complete; see git history).**
+
 ## Goal
 Split the runtime into explicit subsystems and persist a full causal trace for each request so users can inspect why a capability was chosen, why policy allowed or blocked it, and what side effects followed. This stage prioritizes audit-first traceability while storing enough detail to support future replay-oriented features without redesigning persistence later.
 
