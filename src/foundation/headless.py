@@ -466,44 +466,61 @@ def run_headless_task(
         return _reject(f"task envelope failed validation: {exc}")
 
     workspace = Path(task.workspace).expanduser().resolve()
-    tool_service = LocalToolService(
-        workspace_root=workspace,
-        default_timeout_seconds=min(settings.shell.default_timeout_seconds, 30),
-        capture_limit_kb=settings.shell.capture_limit_kb,
-        pass_through_foundation_env=settings.shell.pass_through_foundation_env,
-    )
-    shell_runtime = ShellRuntime(
-        workspace_root=workspace,
-        default_timeout_seconds=settings.shell.default_timeout_seconds,
-        max_timeout_seconds=settings.shell.max_timeout_seconds,
-        allow_pty=False,
-        capture_limit_kb=settings.shell.capture_limit_kb,
-        enforce_workspace_boundary=True,
-    )
-    capability_registry = CapabilityRegistry(
-        store=CapabilityStore(settings.app.data_dir / "capabilities"),
-        tool_service=tool_service,
-    )
-    history_store = TraceStore(
-        database_path=settings.history.database_path,
-        retention_days=settings.history.retention_days,
-        max_entries=settings.history.max_entries,
-    )
-    resolved_provider = provider if provider is not None else build_provider_adapter(settings)
+    try:
+        tool_service = LocalToolService(
+            workspace_root=workspace,
+            default_timeout_seconds=min(settings.shell.default_timeout_seconds, 30),
+            capture_limit_kb=settings.shell.capture_limit_kb,
+            pass_through_foundation_env=settings.shell.pass_through_foundation_env,
+        )
+        shell_runtime = ShellRuntime(
+            workspace_root=workspace,
+            default_timeout_seconds=settings.shell.default_timeout_seconds,
+            max_timeout_seconds=settings.shell.max_timeout_seconds,
+            allow_pty=False,
+            capture_limit_kb=settings.shell.capture_limit_kb,
+            enforce_workspace_boundary=True,
+        )
+        capability_registry = CapabilityRegistry(
+            store=CapabilityStore(settings.app.data_dir / "capabilities"),
+            tool_service=tool_service,
+        )
+        history_store = TraceStore(
+            database_path=settings.history.database_path,
+            retention_days=settings.history.retention_days,
+            max_entries=settings.history.max_entries,
+        )
+        resolved_provider = provider if provider is not None else build_provider_adapter(settings)
 
-    orchestrator = RequestOrchestrator(
-        workspace_root=workspace,
-        approval_mode=ApprovalMode.MANUAL,
-        provider=resolved_provider,
-        shell_runtime=shell_runtime,
-        tool_service=tool_service,
-        history_store=history_store,
-        capability_registry=capability_registry,
-        event_sink=sink,
-        question_callback=None,
-        max_loop_iterations=task.budget.max_iterations,
-        max_total_actions=task.budget.max_actions,
-    )
+        orchestrator = RequestOrchestrator(
+            workspace_root=workspace,
+            approval_mode=ApprovalMode.MANUAL,
+            provider=resolved_provider,
+            shell_runtime=shell_runtime,
+            tool_service=tool_service,
+            history_store=history_store,
+            capability_registry=capability_registry,
+            event_sink=sink,
+            question_callback=None,
+            max_loop_iterations=task.budget.max_iterations,
+            max_total_actions=task.budget.max_actions,
+        )
+    except Exception as exc:  # noqa: BLE001 — setup failures must still leave evidence
+        return _finalize(
+            task=task,
+            out_path=out_path,
+            stream=stream,
+            sink=sink,
+            status=TaskState.FAILED,
+            summary=f"worker setup failed: {exc}",
+            verification=Verification(
+                outcome=ContractVerificationOutcome.NOT_ATTEMPTED,
+                details="failed before execution (provider/services construction)",
+            ),
+            changed_files=[],
+            extra_artifacts=[],
+            terminal_reason="worker_setup_failed",
+        )
 
     stream.emit(
         EventType.TASK_START,
