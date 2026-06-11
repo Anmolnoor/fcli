@@ -115,8 +115,26 @@ def _diff_summary(old_content: str | None, new_content: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _parse_and_apply_diff(original: str, diff_text: str, *, file_path: str) -> str:
+def _norm_line(line: str) -> str:
+    return line.rstrip("\n\r")
+
+
+def _parse_and_apply_diff(
+    original: str, diff_text: str, *, file_path: str
+) -> tuple[str, list[str]]:
     """Parse a unified diff and apply it atomically to *original*.
+
+    Returns ``(new_content, leniency_notes)``. The notes name every tolerance
+    that was exercised so callers can surface them in the execution artifact.
+
+    Deliberate tolerances for model-generated diffs (each recorded when used):
+    - body lines without a leading ``+``/``-``/space are treated as context;
+    - a hunk that only matches after trailing-newline normalization (CRLF vs
+      LF) is accepted as a fallback when the exact match fails.
+
+    Never-valid shapes are rejected at parse time: hunks whose declared
+    source-line count disagrees with their body, hunks containing no
+    additions or removals, rename-style and delete-only diffs.
 
     Raises FileServiceError on malformed diffs, context mismatches, or
     policy violations (delete-only, rename-style).
@@ -183,6 +201,43 @@ def _parse_and_apply_diff(original: str, diff_text: str, *, file_path: str) -> s
             path=file_path,
         )
 
+    # Parse-time validation: each hunk's body must agree with its declared
+    # source-line count and actually change something.
+    leniency_notes: list[str] = []
+    for hunk_idx, (_old_start, old_count, hunk_lines) in enumerate(hunks):
+        old_side_lines = 0
+        has_change = False
+        bare_lines = 0
+        for hl in hunk_lines:
+            if hl.startswith("+"):
+                has_change = True
+            elif hl.startswith("-"):
+                has_change = True
+                old_side_lines += 1
+            elif hl.startswith(" "):
+                old_side_lines += 1
+            else:
+                bare_lines += 1
+                old_side_lines += 1
+        if not has_change:
+            _raise(
+                FileErrorCode.DIFF_REJECTED,
+                f"Hunk {hunk_idx + 1} contains no additions or removals.",
+                path=file_path,
+            )
+        if old_side_lines != old_count:
+            _raise(
+                FileErrorCode.DIFF_REJECTED,
+                f"Hunk {hunk_idx + 1} declares {old_count} source lines "
+                f"but its body has {old_side_lines}.",
+                path=file_path,
+            )
+        if bare_lines:
+            leniency_notes.append(
+                f"hunk {hunk_idx + 1}: {bare_lines} line(s) without a diff "
+                "prefix treated as context"
+            )
+
     # Reject delete-only diffs (all hunks contain only removals, no additions)
     has_addition = False
     for _, _, hunk_lines in hunks:
@@ -221,18 +276,26 @@ def _parse_and_apply_diff(original: str, diff_text: str, *, file_path: str) -> s
         src_start = old_start - 1
         src_slice = original_lines[src_start : src_start + len(expected)]
 
-        # Normalise trailing newlines for comparison
-        def _norm(s: str) -> str:
-            return s.rstrip("\n\r")
-
-        if len(src_slice) != len(expected) or any(
-            _norm(a) != _norm(b) for a, b in zip(src_slice, expected, strict=True)
-        ):
+        if len(src_slice) != len(expected):
             _raise(
                 FileErrorCode.DIFF_APPLY_FAILED,
                 f"Hunk {hunk_idx + 1} does not match the source file at line {old_start}.",
                 path=file_path,
             )
+        if all(a == b for a, b in zip(src_slice, expected, strict=True)):
+            continue
+        # Fallback: accept the hunk when only trailing newlines (CRLF vs LF,
+        # missing final newline) differ — but say so.
+        if all(_norm_line(a) == _norm_line(b) for a, b in zip(src_slice, expected, strict=True)):
+            leniency_notes.append(
+                f"hunk {hunk_idx + 1} matched only after trailing-newline normalization"
+            )
+            continue
+        _raise(
+            FileErrorCode.DIFF_APPLY_FAILED,
+            f"Hunk {hunk_idx + 1} does not match the source file at line {old_start}.",
+            path=file_path,
+        )
 
     # Apply hunks in reverse order to preserve line indices
     result_lines = list(original_lines)
@@ -254,7 +317,7 @@ def _parse_and_apply_diff(original: str, diff_text: str, *, file_path: str) -> s
         src_start = old_start - 1
         result_lines[src_start : src_start + remove_count] = new_lines
 
-    return "".join(result_lines)
+    return "".join(result_lines), leniency_notes
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +573,7 @@ class FileService:
         if not resolved.exists():
             _raise_not_found(request.path, resolved)
         old_content, _ = self._read_raw(resolved)
-        new_content = _parse_and_apply_diff(
+        new_content, leniency_notes = _parse_and_apply_diff(
             old_content,
             request.diff,
             file_path=request.path,
@@ -522,4 +585,5 @@ class FileService:
             line_count=_line_count(new_content),
             size_bytes=len(new_content.encode("utf-8")),
             diff_summary=_diff_summary(old_content, new_content),
+            leniency_notes=leniency_notes,
         )

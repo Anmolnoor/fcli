@@ -283,6 +283,14 @@ every future migration.
 
 ## Stage 6: Diff Applier Strictness Decision
 
+**Status: shipped 2026-06-10.** Decisions made: bare context lines kept
+(counted and reported), newline normalization demoted to a fallback after an
+exact match fails (reported when used), declared-count mismatches and no-op
+hunks rejected at parse time with `DIFF_REJECTED`. Tolerances surface via a
+new `FileMutationResult.leniency_notes` field, which flows into the trace
+artifact automatically; the contract is documented on
+`_parse_and_apply_diff`'s docstring.
+
 ### Goal
 
 The unified-diff applier (`file_service.py` ~118–257) is lenient: bare lines

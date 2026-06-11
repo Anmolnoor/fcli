@@ -743,3 +743,61 @@ def test_read_not_found_lists_sibling_files(tmp_path: Path) -> None:
     # The error names the real sibling so the model can self-correct.
     assert "anmolnoor-github-report.md" in exc.value.error.message
     assert exc.value.error.suggestion is not None
+
+
+# ===================================================================
+# file.apply_diff — strictness contract (hardening stage 6)
+# ===================================================================
+
+
+class TestFileApplyDiffStrictness:
+    def test_declared_count_mismatch_rejected_at_parse_time(self, tmp_path: Path) -> None:
+        svc, ws = _make_service(tmp_path)
+        (ws / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+        # Header declares 3 source lines; body carries only 2.
+        diff = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n"
+        with pytest.raises(FileServiceError) as exc_info:
+            svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
+        assert exc_info.value.error.code == FileErrorCode.DIFF_REJECTED
+        assert "declares" in exc_info.value.error.message
+
+    def test_noop_hunk_rejected(self, tmp_path: Path) -> None:
+        svc, ws = _make_service(tmp_path)
+        (ws / "file.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
+
+        diff = "@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -3,2 +3,2 @@\n c\n d\n"
+        with pytest.raises(FileServiceError) as exc_info:
+            svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
+        assert exc_info.value.error.code == FileErrorCode.DIFF_REJECTED
+        assert "no additions or removals" in exc_info.value.error.message
+
+    def test_crlf_file_with_lf_diff_applies_and_reports_normalization(self, tmp_path: Path) -> None:
+        svc, ws = _make_service(tmp_path)
+        (ws / "file.txt").write_bytes(b"a\r\nb\r\nc\r\n")
+
+        diff = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
+        result = svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
+
+        assert "B" in (ws / "file.txt").read_text(encoding="utf-8")
+        assert any("normaliz" in note for note in result.leniency_notes)
+
+    def test_bare_context_lines_apply_and_are_reported(self, tmp_path: Path) -> None:
+        svc, ws = _make_service(tmp_path)
+        (ws / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+        # "a" and "c" lack the leading space a strict unified diff requires.
+        diff = "@@ -1,3 +1,3 @@\na\n-b\n+B\nc\n"
+        result = svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
+
+        assert (ws / "file.txt").read_text(encoding="utf-8") == "a\nB\nc\n"
+        assert any("without a diff prefix" in note for note in result.leniency_notes)
+
+    def test_exact_match_produces_no_leniency_notes(self, tmp_path: Path) -> None:
+        svc, ws = _make_service(tmp_path)
+        (ws / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+        diff = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
+        result = svc.apply_diff(FileApplyDiffRequest(path="file.txt", diff=diff))
+
+        assert result.leniency_notes == []
