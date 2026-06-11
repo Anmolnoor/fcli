@@ -1,5 +1,7 @@
 # Stage 00: Conversational Brain and Persistent Sessions
 
+**Status: shipped (v2 complete; see git history).**
+
 ## Goal
 Turn `foundation chat` into a real terminal-first agent shell on top of the existing v1 runtime. This stage should let a user talk to Foundation continuously, use the current v1 tools and approvals during the conversation, and persist memory and session state across turns and restarts in a way that feels closer to modern terminal coding agents.
 

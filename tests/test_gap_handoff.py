@@ -259,3 +259,29 @@ def test_write_gap_report_round_trips(tmp_path) -> None:
     # Deterministic id: a second write of the same report reuses the same file.
     again = write_gap_report(handoff.report, gaps_dir=tmp_path / "gaps")
     assert again == path
+
+
+def test_make_provider_phraser_logs_provider_error_at_warning(
+    caplog,
+) -> None:
+    """Hardening stage 4: a phrasing fallback must say why it happened."""
+    import logging
+
+    phraser = make_provider_phraser(_StubProvider(error=True))
+    with caplog.at_level(logging.WARNING, logger="foundation.services.gap_handoff"):
+        assert phraser(CapabilityGapKind.STUCK_NO_PROGRESS, "r", "", "fallback") is None
+    assert any("phrasing" in record.message for record in caplog.records)
+
+
+def test_make_provider_phraser_logs_rejection_category(
+    caplog,
+) -> None:
+    """Hardening stage 4: sanitizer rejections are logged with a category."""
+    import logging
+
+    provider = _StubProvider(body='{"assistant_message": "Done.", "actions": []}')
+    phraser = make_provider_phraser(provider)
+    with caplog.at_level(logging.WARNING, logger="foundation.services.gap_handoff"):
+        assert phraser(CapabilityGapKind.MISSING_CAPABILITY, "r", "d", "fallback") is None
+    messages = [record.message for record in caplog.records]
+    assert any("rejected" in message for message in messages)

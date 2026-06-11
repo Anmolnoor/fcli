@@ -1,5 +1,7 @@
 # Stage 2: Capability Policies and Governance
 
+**Status: shipped (v2 complete; see git history).**
+
 ## Goal
 Move policy enforcement from shell-specific guardrails to a capability-wide governance layer. This stage ensures that every tool, skill, and shell-backed capability is evaluated through the same policy engine before execution, with explicit approval and audit behavior based on capability metadata and invocation context.
 

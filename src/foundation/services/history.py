@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +39,17 @@ logger = logging.getLogger("foundation.services.history")
 
 _SCHEMA_VERSION = 6
 _DEFAULT_MAX_BLOB_BYTES = 64 * 1024
+
+
+class HistoryMigrationError(RuntimeError):
+    """A schema migration failed; the original database was left untouched."""
+
+
+def _backup_hint(backup_path: Path | None) -> str:
+    if backup_path is None:
+        return ""
+    return f" Pre-migration backup: {backup_path}"
+
 
 _SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -1340,16 +1352,44 @@ class HistoryStore:
         return connection
 
     def _ensure_schema(self) -> None:
-        with self._connect() as connection:
-            current_version = connection.execute("PRAGMA user_version").fetchone()[0]
-            connection.executescript(_SCHEMA_SQL)
-            if current_version < 4:
-                self._migrate_to_v4(connection)
-            if current_version < 5:
-                self._migrate_to_v5(connection)
-            if current_version < 6:
-                self._migrate_to_v6(connection)
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        probe = self._connect()
+        try:
+            current_version = probe.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            probe.close()
+        backup_path: Path | None = None
+        if current_version < _SCHEMA_VERSION:
+            backup_path = self._backup_before_migration()
+        try:
+            with self._connect() as connection:
+                connection.executescript(_SCHEMA_SQL)
+                if current_version < 4:
+                    self._migrate_to_v4(connection)
+                if current_version < 5:
+                    self._migrate_to_v5(connection)
+                if current_version < 6:
+                    self._migrate_to_v6(connection, backup_path=backup_path)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        except HistoryMigrationError:
+            raise
+        except sqlite3.Error as exc:
+            raise HistoryMigrationError(
+                f"History schema migration to v{_SCHEMA_VERSION} failed and was "
+                f"rolled back: {exc}.{_backup_hint(backup_path)}"
+            ) from exc
+
+    def _backup_before_migration(self) -> Path | None:
+        """Copy the DB file aside before migrating; keep only the newest backup."""
+        if not self._database_path.exists() or self._database_path.stat().st_size == 0:
+            return None
+        backup_path = self._database_path.with_name(
+            f"{self._database_path.name}.pre-v{_SCHEMA_VERSION}.bak"
+        )
+        shutil.copy2(self._database_path, backup_path)
+        for stale in self._database_path.parent.glob(f"{self._database_path.name}.pre-v*.bak"):
+            if stale != backup_path:
+                stale.unlink(missing_ok=True)
+        return backup_path
 
     @staticmethod
     def _migrate_to_v4(connection: sqlite3.Connection) -> None:
@@ -1379,7 +1419,11 @@ class HistoryStore:
         )
 
     @staticmethod
-    def _migrate_to_v6(connection: sqlite3.Connection) -> None:
+    def _migrate_to_v6(
+        connection: sqlite3.Connection,
+        *,
+        backup_path: Path | None = None,
+    ) -> None:
         """Migrate v5 → v6: ensure ``assistant_plans`` is keyed per iteration.
 
         Pre-v6 databases that were upgraded from v3 may carry the older
@@ -1388,6 +1432,11 @@ class HistoryStore:
         latest iteration's plan was preserved per session. v6 rebuilds the
         table with ``UNIQUE(session_id, iteration)`` so per-iteration plans
         are inspectable for the first time.
+
+        Rebuild-style migrations must validate the copy before dropping the
+        source table (see this method for the pattern): the original table is
+        only dropped after the rebuilt row count matches, so a failure can
+        never destroy history.
         """
         # Cheapest probe: try to insert a duplicate sentinel pair under the
         # same session_id with a different iteration. If the existing schema
@@ -1411,7 +1460,9 @@ class HistoryStore:
         if already_correct:
             return
 
-        connection.executescript(
+        source_count = connection.execute("SELECT COUNT(*) FROM assistant_plans").fetchone()[0]
+        connection.execute("DROP TABLE IF EXISTS assistant_plans_new")
+        connection.execute(
             """
             CREATE TABLE assistant_plans_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1423,21 +1474,37 @@ class HistoryStore:
                 planning_metadata_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 UNIQUE(session_id, iteration)
-            );
-
-            INSERT INTO assistant_plans_new (
-                id, session_id, iteration, assistant_message,
-                context_json, plan_json, planning_metadata_json, created_at
             )
-            SELECT
-                id, session_id, iteration, assistant_message,
-                context_json, plan_json, planning_metadata_json, created_at
-            FROM assistant_plans;
-
-            DROP TABLE assistant_plans;
-            ALTER TABLE assistant_plans_new RENAME TO assistant_plans;
             """
         )
+        try:
+            connection.execute(
+                """
+                INSERT INTO assistant_plans_new (
+                    id, session_id, iteration, assistant_message,
+                    context_json, plan_json, planning_metadata_json, created_at
+                )
+                SELECT
+                    id, session_id, iteration, assistant_message,
+                    context_json, plan_json, planning_metadata_json, created_at
+                FROM assistant_plans
+                """
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HistoryMigrationError(
+                "History migration to v6 failed: assistant_plans contains rows "
+                "that violate UNIQUE(session_id, iteration). The original table "
+                f"was left untouched.{_backup_hint(backup_path)}"
+            ) from exc
+        rebuilt_count = connection.execute("SELECT COUNT(*) FROM assistant_plans_new").fetchone()[0]
+        if rebuilt_count != source_count:
+            raise HistoryMigrationError(
+                f"History migration to v6 failed: rebuilt assistant_plans has "
+                f"{rebuilt_count} rows but the source has {source_count}. The "
+                f"original table was left untouched.{_backup_hint(backup_path)}"
+            )
+        connection.execute("DROP TABLE assistant_plans")
+        connection.execute("ALTER TABLE assistant_plans_new RENAME TO assistant_plans")
 
     def _encode_json_blob(self, payload: object) -> str:
         raw = _json_dumps(payload)

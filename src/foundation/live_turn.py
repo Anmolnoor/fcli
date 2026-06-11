@@ -346,7 +346,9 @@ def render_detail_panel(state: TurnLiveState, *, elapsed_seconds: float) -> Rend
     table.add_column(no_wrap=False)
 
     request = _truncate(state.request_text or "(no request)", limit=80)
-    table.add_row("request", request)
+    # Text() keeps user-controlled request text literal — raw strings would be
+    # parsed as Rich markup (styling injection, MarkupError on stray tags).
+    table.add_row("request", Text(request))
     phase_elapsed = max(now - state.phase_started_at, 0.0) if state.phase_started_at else 0.0
     table.add_row("phase", f"{state.phase.value} · {_format_duration(phase_elapsed)}")
     table.add_row("last event", state.last_event_name or "(none)")
@@ -534,7 +536,14 @@ class LiveTurnRenderer:
         self.tick()
 
     def pause(self) -> None:
-        """Stop the Live widget so other prompts can render normally."""
+        """Stop the Live widget and fully release stdin for other prompts.
+
+        The keypress reader competes with ``input()`` for stdin bytes — left
+        running, it eats the user's answer at approval/question prompts and
+        the prompt resolves to its default. Pausing must stop the reader
+        thread, restore canonical terminal mode, and flush any type-ahead
+        that the raw-mode reader may have left behind.
+        """
         if self._live is None or self._paused:
             return
         self._paused = True
@@ -542,12 +551,22 @@ class LiveTurnRenderer:
             self._live.stop()
         except Exception:  # pragma: no cover - defensive
             pass
+        stdin_fd = self._stdin_fd
+        self._teardown_keypress_reader()
+        if stdin_fd is not None:
+            try:
+                import termios
+
+                termios.tcflush(stdin_fd, termios.TCIFLUSH)
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     def resume(self) -> None:
-        """Re-enter the Live widget after a paused prompt."""
+        """Re-enter the Live widget (and the keypress reader) after a prompt."""
         if self._live is None or not self._paused:
             return
         self._paused = False
+        self._install_keypress_reader()
         try:
             self._live.start(refresh=True)
         except Exception:  # pragma: no cover - defensive

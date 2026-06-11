@@ -104,24 +104,35 @@ class EventLogWriter:
 
     def write_event(self, event_name: str, payload: Mapping[str, Any]) -> None:
         """Sink callback wired into ``ObserverService.event_sink``."""
-        with self._lock:
-            if event_name == EVENT_USER_REQUEST and self._request_summary == "":
-                summary = payload.get("request_text") or ""
-                self._request_summary = str(summary)[:200]
-            if event_name == EVENT_SESSION_START:
-                session_id = self._coerce_session_id(payload)
-                if session_id is not None:
-                    self._open_session(
-                        session_id=session_id,
-                        request_id=str(payload.get("request_id") or ""),
-                        timestamp_payload=payload,
-                    )
-            envelope = build_envelope(event_name, payload)
-            self._write_envelope(envelope)
-            if event_name == EVENT_SESSION_END:
-                ended_at = envelope["ts"]
-                status = str(payload.get("status") or "completed")
-                self._close_session(ended_at=ended_at, status=status)
+        try:
+            with self._lock:
+                if event_name == EVENT_USER_REQUEST and self._request_summary == "":
+                    summary = payload.get("request_text") or ""
+                    self._request_summary = str(summary)[:200]
+                if event_name == EVENT_SESSION_START:
+                    session_id = self._coerce_session_id(payload)
+                    if session_id is not None:
+                        self._open_session(
+                            session_id=session_id,
+                            request_id=str(payload.get("request_id") or ""),
+                            timestamp_payload=payload,
+                        )
+                envelope = build_envelope(event_name, payload)
+                self._write_envelope(envelope)
+                if event_name == EVENT_SESSION_END:
+                    ended_at = envelope["ts"]
+                    status = str(payload.get("status") or "completed")
+                    self._close_session(ended_at=ended_at, status=status)
+        except Exception:
+            # An unexpected bug must not break the turn, but the index row
+            # must not claim a complete event log either.
+            self._truncated = True
+            logger.warning(
+                "event_log_write_event_failed event=%s session_id=%s",
+                event_name,
+                self._session_id,
+                exc_info=True,
+            )
 
     def close(self, *, status: str | None = None) -> None:
         """Force-close any open session (e.g. on KeyboardInterrupt)."""

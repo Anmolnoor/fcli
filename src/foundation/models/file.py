@@ -154,3 +154,6 @@ class FileMutationResult(StrictModel):
     size_bytes: int = Field(ge=0)
     diff_summary: str
     created: bool = False
+    # Tolerances the diff applier exercised (bare context lines, newline
+    # normalization); empty when the diff applied exactly.
+    leniency_notes: list[str] = Field(default_factory=list)

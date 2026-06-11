@@ -243,6 +243,18 @@ Retention defaults to 200 sessions / 500 MB; oldest sessions are pruned
 automatically on session end. Configure under `[monitor]` in
 `config.toml`.
 
+**Degradation is recorded, never silent.** A session whose event log lost
+writes — whether from an I/O error or a crash inside the writer — closes
+with `status=write_truncated` in `sessions.jsonl`, so consumers can tell a
+complete log from a partial one. An event sink that fails on 3 consecutive
+events is disabled for the rest of the session with one final warning.
+
+**History migrations back up first.** Before any schema migration runs, the
+SQLite history database is copied to `<db>.pre-v<target>.bak` next to the
+original (only the newest backup is kept). A failed migration raises
+`HistoryMigrationError` naming the backup and leaves the original data
+untouched.
+
 **Opt-out:** pass `--no-monitor` for one invocation, set
 `FOUNDATION_MONITOR=0`, or `monitor.enabled = false` in `config.toml`.
 Override the directory with `--events-dir <path>`.

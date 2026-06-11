@@ -22,6 +22,7 @@ from foundation.monitor.transports import (
     TransportStartError,
     UnixSocketTransport,
 )
+from foundation.observability import SINK_DISABLE_AFTER_CONSECUTIVE_FAILURES
 
 EventSink = Callable[[str, Mapping[str, Any]], None]
 
@@ -33,21 +34,39 @@ def compose_event_sink(*sinks: EventSink | None) -> EventSink:
 
     ``None`` entries are skipped. A sink raising an exception is logged at
     WARNING and the remaining sinks still receive the event — orchestration
-    must never break because of a misbehaving observer.
+    must never break because of a misbehaving observer. A sink that fails on
+    several consecutive events is disabled for the rest of the session (with
+    one final warning) so a flapping sink cannot flood the log.
     """
     active: list[EventSink] = [sink for sink in sinks if sink is not None]
+    consecutive_failures = [0] * len(active)
+    disabled = [False] * len(active)
 
     def _fanout(event_name: str, payload: Mapping[str, Any]) -> None:
-        for sink in active:
+        for index, sink in enumerate(active):
+            if disabled[index]:
+                continue
             try:
                 sink(event_name, payload)
             except Exception:  # noqa: BLE001 - sink errors must not propagate
-                logger.warning(
-                    "event_sink_failed event=%s sink=%r",
-                    event_name,
-                    sink,
-                    exc_info=True,
-                )
+                consecutive_failures[index] += 1
+                if consecutive_failures[index] >= SINK_DISABLE_AFTER_CONSECUTIVE_FAILURES:
+                    disabled[index] = True
+                    logger.warning(
+                        "event_sink_disabled sink=%r after %d consecutive failures",
+                        sink,
+                        consecutive_failures[index],
+                        exc_info=True,
+                    )
+                else:
+                    logger.warning(
+                        "event_sink_failed event=%s sink=%r",
+                        event_name,
+                        sink,
+                        exc_info=True,
+                    )
+            else:
+                consecutive_failures[index] = 0
 
     return _fanout
 

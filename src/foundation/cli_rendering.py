@@ -293,7 +293,9 @@ def _render_help_lookup(result: HelpLookupResult) -> None:
 
 
 def _render_assistant_message(result: OrchestrationResult) -> None:
-    console.print(Panel.fit(result.assistant_message.content, title="Assistant"))
+    # Text() keeps model-generated content literal — raw strings would be
+    # parsed as Rich markup (styling injection, MarkupError on stray tags).
+    console.print(Panel.fit(Text(result.assistant_message.content), title="Assistant"))
 
 
 def _chat_surface_policy(render_mode: RenderMode) -> ChatSurfacePolicy:
@@ -789,7 +791,9 @@ def _render_concise_chat_turn(
     primary_text = presentation.primary_text
     if interactive:
         primary_text = _format_interactive_concise_text(primary_text)
-    console.print(primary_text)
+    # Text() keeps model-generated content literal — raw strings would be
+    # parsed as Rich markup (styling injection, MarkupError on stray tags).
+    console.print(Text(primary_text))
     style_map = {
         PresentationNoticeLevel.INFO: "cyan",
         PresentationNoticeLevel.WARNING: "yellow",

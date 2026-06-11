@@ -1,5 +1,10 @@
 # Foundation CLI v4 Roadmap
 
+## Status
+
+**v4 complete** — all three stages shipped (see the stage table below);
+verified 2026-05-27 with the full suite green.
+
 ## Purpose
 
 v4 turns Foundation CLI from a fast-to-use coding agent into a **transparent, observable one**. The v3 runtime already has the event plumbing (22 `EVENT_*` constants across orchestrator, executor, shell, provider, observer) and a structured audit trail. What's missing is a live UX that tells the user what's happening *while* a turn runs, and an external stream so a separate monitoring tool — GUI or terminal — can subscribe to the agent's activity in real time.

@@ -3,6 +3,14 @@ revision = 3
 requires-python = "==3.12.*"
 
 [[package]]
+name = "agent-task-contract"
+version = "0.1.0"
+source = { git = "https://github.com/Anmolnoor/agent-task-contract?tag=v0.1.0#f1caec7db4fddca347fa4e64e36fb464ebf706ea" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -148,6 +156,7 @@ name = "foundation-cli"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "agent-task-contract" },
     { name = "click" },
     { name = "keyring" },
     { name = "pathspec" },
@@ -170,6 +179,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-task-contract", git = "https://github.com/Anmolnoor/agent-task-contract?tag=v0.1.0" },
     { name = "click", specifier = ">=8.0,<9.0" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=7.6,<8.0" },
     { name = "keyring", specifier = ">=25.5,<26.0" },

@@ -158,6 +158,22 @@ def _worst_verification_outcome(
     return a
 
 
+def _combine_iteration_verification(
+    previous: VerificationOutcome,
+    latest: VerificationOutcome,
+) -> VerificationOutcome:
+    """Combine verification outcomes across iterations: the latest attempt wins.
+
+    Each iteration is a repair attempt, so a later PASSED supersedes an earlier
+    FAILED (and vice versa). An iteration that attempted no verification keeps
+    the previous outcome. Within a single iteration worst-wins still applies —
+    see ``_classify_results``.
+    """
+    if latest is VerificationOutcome.NOT_ATTEMPTED:
+        return previous
+    return latest
+
+
 _CODE_CHANGING_ARTIFACT_TYPES = frozenset(
     {
         ExecutionArtifactType.FILE_WRITE,
@@ -578,9 +594,13 @@ class RequestOrchestrator:
         max_plan_attempts: int = 2,
         event_sink: EventSink | None = None,
         question_callback: Callable[[QuestionAction], str | None] | None = None,
+        max_loop_iterations: int = _MAX_LOOP_ITERATIONS,
+        max_total_actions: int = _MAX_TOTAL_ACTIONS,
     ) -> None:
         self._workspace_root = Path(workspace_root).expanduser().resolve()
         self._approval_mode = approval_mode
+        self._max_loop_iterations = max_loop_iterations
+        self._max_total_actions = max_total_actions
         self._provider = provider
         self._shell_runtime = shell_runtime
         self._tool_service = tool_service
@@ -889,7 +909,7 @@ class RequestOrchestrator:
         progress_detector = NoProgressDetector()
         prev_last_step_id: str | None = None
 
-        for iteration_index in range(1, _MAX_LOOP_ITERATIONS + 1):
+        for iteration_index in range(1, self._max_loop_iterations + 1):
             self._observer.emit(
                 EVENT_ITERATION_STARTED,
                 payload={
@@ -905,7 +925,7 @@ class RequestOrchestrator:
             context = self._planner.gather_context(request_cwd=str(resolved_request_cwd))
 
             # 2. Request plan
-            remaining_actions = _MAX_TOTAL_ACTIONS - total_actions_executed
+            remaining_actions = self._max_total_actions - total_actions_executed
             planning_started_at = _utcnow()
             planning_started_monotonic = time.monotonic()
             self._observer.emit(
@@ -1011,7 +1031,7 @@ class RequestOrchestrator:
                 break
 
             # 4. Enforce action budget
-            budget = _MAX_TOTAL_ACTIONS - total_actions_executed
+            budget = self._max_total_actions - total_actions_executed
             actions_to_execute = plan.actions[:budget]
 
             # 4b. Materialize deferred file bodies (content_brief -> content) via a
@@ -1048,7 +1068,7 @@ class RequestOrchestrator:
                 execution_results, attempted_actions
             )
             had_code_changes = had_code_changes or iter_code_change
-            verification_outcome = _worst_verification_outcome(
+            verification_outcome = _combine_iteration_verification(
                 verification_outcome,
                 iter_outcome,
             )
@@ -1111,9 +1131,9 @@ class RequestOrchestrator:
                 stop_reason = LoopStopReason.BLOCKED
             elif has_fatal:
                 stop_reason = LoopStopReason.FATAL_EXECUTION_FAILURE
-            elif total_actions_executed >= _MAX_TOTAL_ACTIONS:
+            elif total_actions_executed >= self._max_total_actions:
                 stop_reason = LoopStopReason.MAX_ACTIONS
-            elif iteration_index >= _MAX_LOOP_ITERATIONS:
+            elif iteration_index >= self._max_loop_iterations:
                 stop_reason = LoopStopReason.MAX_ITERATIONS
 
             # 8. Build observation
@@ -1122,8 +1142,8 @@ class RequestOrchestrator:
                 execution_results,
                 attempted_actions,
                 iter_changed,
-                remaining_iterations=_MAX_LOOP_ITERATIONS - iteration_index,
-                remaining_actions=_MAX_TOTAL_ACTIONS - total_actions_executed,
+                remaining_iterations=self._max_loop_iterations - iteration_index,
+                remaining_actions=self._max_total_actions - total_actions_executed,
             )
 
             iterations.append(
@@ -1595,7 +1615,9 @@ class RequestOrchestrator:
 
             if action.kind is ActionKind.SHELL and action.shell:
                 cmd_basename = action.shell.command.split("/")[-1]
-                if cmd_basename in _VERIFICATION_COMMANDS:
+                # Custom test scripts (./run_tests.sh, scripts/test.py, …)
+                # count as verification alongside the known tool names.
+                if cmd_basename in _VERIFICATION_COMMANDS or "test" in cmd_basename:
                     display = " ".join([action.shell.command, *action.shell.args])
                     verify_cmds.append(display)
                     cmd_outcome = _verification_outcome_for_result(result)
@@ -2103,7 +2125,11 @@ class RequestOrchestrator:
             if skipped:
                 stop_parts.append(f"{skipped} skipped")
 
-            if blocked or failed:
+            # A ZERO_ACTION_PLAN stop means the loop completed naturally;
+            # failures along the way were repaired, not the stop cause.
+            completed_naturally = stop_reason is LoopStopReason.ZERO_ACTION_PLAN
+            use_stop_framing = (blocked or failed) and not completed_naturally
+            if use_stop_framing:
                 cause = RequestOrchestrator._stop_cause_summary(
                     execution_results,
                     actions_by_id,
@@ -2125,10 +2151,15 @@ class RequestOrchestrator:
                 parts = [f"Executed {RequestOrchestrator._action_count(executed, 'action')}"]
                 if pending:
                     parts.append(RequestOrchestrator._approval_count(pending))
+                if failed:
+                    suffix = "" if failed == 1 else "s"
+                    parts.append(f"recovered from {failed} earlier failure{suffix}")
+                if blocked:
+                    parts.append(f"{blocked} blocked by policy")
                 if skipped:
                     parts.append(f"{skipped} skipped")
                 text = ", ".join(parts) + "."
-            if len(iterations) > 1 and not (blocked or failed):
+            if len(iterations) > 1 and not use_stop_framing:
                 text += f" ({len(iterations)} iterations)"
 
         return OrchestrationSummary(

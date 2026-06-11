@@ -1,5 +1,7 @@
 # Stage 4: Quiet Chat Surface and Audit-First Output
 
+**Status: shipped (v2 complete; see git history).**
+
 ## Goal
 Make `foundation chat` feel like a normal terminal assistant: the user asks a question, the assistant answers, and the next prompt appears. Internal orchestration detail such as planned actions, policy tables, execution summaries, provider metadata, token counts, and raw structured log lines should stop dominating the default terminal view. Those details must still be preserved in logs, history, and audit surfaces.
 

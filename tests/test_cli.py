@@ -2355,3 +2355,21 @@ def test_approval_required_notice_fires_only_for_pending_approval_stop() -> None
         stop_reason=LoopStopReason.ZERO_ACTION_PLAN,
     )
     assert _approval_required_notice(completed) is None
+
+
+def test_chat_rendering_keeps_model_markup_literal() -> None:
+    """Found by the codex smoke test (hardening batch): assistant text that
+    starts with a stray Rich closing tag crashed both chat renderers with
+    MarkupError. Model output must render literally.
+    """
+    from foundation.cli_rendering import _render_chat_turn, console
+    from foundation.models import AssistantMessage
+
+    result = _chat_result("say something").model_copy(
+        update={"assistant_message": AssistantMessage(content="[/bold]oops [red]x[/red]")}
+    )
+    with console.capture() as capture:
+        _render_chat_turn(result, render_mode=RenderMode.CONCISE)
+        _render_chat_turn(result, render_mode=RenderMode.VERBOSE)
+    output = capture.get()
+    assert "[/bold]oops" in output

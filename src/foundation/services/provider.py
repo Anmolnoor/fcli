@@ -1160,14 +1160,30 @@ def build_provider_adapter(
 ) -> ProviderAdapter:
     """Build the configured provider adapter for Stage 5."""
     provider_name = settings.provider.normalized_name()
-    if provider_name not in {"codex", "openai", "ollama"}:
+    if provider_name not in {"codex", "openai", "ollama", "mock"}:
         raise ProviderError(
             (
                 f"Provider {settings.provider.name!r} is not supported in Foundation CLI v0.1. "
-                "Supported providers: codex, openai, ollama."
+                "Supported providers: codex, openai, ollama, mock."
             ),
             code=ProviderErrorCode.UNSUPPORTED_PROVIDER,
         )
+
+    if provider_name == "mock":
+        from foundation.services.mock_provider import MockProvider, MockScenarioError
+
+        if settings.provider.scenario_file is None:
+            raise ProviderError(
+                "Provider 'mock' requires provider.scenario_file to point at a scenario JSON file.",
+                code=ProviderErrorCode.UNSUPPORTED_PROVIDER,
+            )
+        try:
+            return MockProvider(settings.provider.scenario_file)
+        except MockScenarioError as exc:
+            raise ProviderError(
+                str(exc),
+                code=ProviderErrorCode.UNSUPPORTED_PROVIDER,
+            ) from exc
 
     if provider_name == "codex":
         return CodexExecAdapter(

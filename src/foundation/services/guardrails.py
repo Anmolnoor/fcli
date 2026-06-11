@@ -35,6 +35,7 @@ from foundation.models import (
     ToolCall,
     TrustTier,
 )
+from foundation.models.git import GIT_MUTATION_SUBCOMMANDS
 from foundation.services.capabilities import SHELL_CAPABILITY_ID, CapabilityRegistry
 from foundation.services.scope_grants import ScopeGrantStore
 from foundation.settings import ApprovalMode
@@ -49,24 +50,7 @@ _NETWORK_COMMANDS = {"brew", "curl", "git-lfs", "npm", "pip", "scp", "ssh", "uv"
 _PERMISSION_COMMANDS = {"chmod", "chown"}
 _UNKNOWN_RISK_COMMANDS = {"python", "python3"}
 _READONLY_GIT_SUBCOMMANDS = {"branch", "diff", "log", "rev-parse", "show", "status"}
-_WRITE_GIT_SUBCOMMANDS = {
-    "add",
-    "apply",
-    "checkout",
-    "cherry-pick",
-    "clean",
-    "commit",
-    "merge",
-    "mv",
-    "rebase",
-    "reset",
-    "restore",
-    "revert",
-    "rm",
-    "stash",
-    "switch",
-    "tag",
-}
+_WRITE_GIT_SUBCOMMANDS = GIT_MUTATION_SUBCOMMANDS
 _NETWORK_GIT_SUBCOMMANDS = {"clone", "fetch", "pull", "push", "submodule"}
 _UNSAFE_GIT_OPTIONS = {
     "-C",

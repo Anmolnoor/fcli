@@ -266,23 +266,35 @@ class PlannedAction(StrictModel):
         if self.kind is ActionKind.EXPLANATION:
             if not self.explanation:
                 raise ValueError("Explanation actions require the explanation field")
-            if self.shell is not None or self.tool_call is not None:
-                raise ValueError("Explanation actions cannot include shell or tool payloads")
+            if self.shell is not None or self.tool_call is not None or self.question is not None:
+                raise ValueError(
+                    "Explanation actions cannot include shell, tool, or question payloads"
+                )
         elif self.kind is ActionKind.SHELL:
             if self.shell is None:
                 raise ValueError("Shell actions require the shell field")
-            if self.explanation is not None or self.tool_call is not None:
-                raise ValueError("Shell actions cannot include explanation or tool payloads")
+            if (
+                self.explanation is not None
+                or self.tool_call is not None
+                or self.question is not None
+            ):
+                raise ValueError(
+                    "Shell actions cannot include explanation, tool, or question payloads"
+                )
         elif self.kind is ActionKind.TOOL_CALL:
             if self.tool_call is None:
                 raise ValueError("Tool-call actions require the tool_call field")
-            if self.explanation is not None or self.shell is not None:
-                raise ValueError("Tool-call actions cannot include explanation or shell payloads")
+            if self.explanation is not None or self.shell is not None or self.question is not None:
+                raise ValueError(
+                    "Tool-call actions cannot include explanation, shell, or question payloads"
+                )
         elif self.kind is ActionKind.QUESTION:
             if self.question is None:
                 raise ValueError("Question actions require the question field")
-            if self.shell is not None or self.tool_call is not None:
-                raise ValueError("Question actions cannot include shell or tool payloads")
+            if self.shell is not None or self.tool_call is not None or self.explanation is not None:
+                raise ValueError(
+                    "Question actions cannot include shell, tool, or explanation payloads"
+                )
 
         if self.requires_approval and not self.approval_reason:
             raise ValueError("Approval-required actions must include approval_reason")

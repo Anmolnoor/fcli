@@ -446,9 +446,40 @@ def run(
             help="Set NAME=VALUE in the command environment. May be repeated.",
         ),
     ] = None,
+    headless: Annotated[
+        bool,
+        typer.Option(
+            "--headless",
+            help="Run one contract task noninteractively (worker mode).",
+        ),
+    ] = False,
+    task_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--task-file",
+            help="Path to the contract task.json envelope (requires --headless).",
+        ),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help="Path to write the contract result.json (requires --headless).",
+        ),
+    ] = None,
 ) -> None:
     """Execute a shell command inside the configured workspace."""
     settings = _load_runtime_settings(ctx)
+    if headless or task_file is not None or out is not None:
+        if not headless or task_file is None or out is None:
+            console.print(
+                "[bold red]Execution error:[/bold red] headless mode requires "
+                "--headless, --task-file, and --out together."
+            )
+            raise typer.Exit(code=2)
+        from foundation.headless import run_headless_task
+
+        raise typer.Exit(code=run_headless_task(task_file, out, settings=settings))
     history_store = _build_history_store(settings)
     command_argv = list(ctx.args)
     if command_argv and command_argv[0] == "--":

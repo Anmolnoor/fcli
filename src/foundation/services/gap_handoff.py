@@ -295,12 +295,25 @@ def make_provider_phraser(provider: ProviderAdapter) -> GapMessagePhraser:
     ) -> str | None:
         try:
             response = provider.complete(_build_phrasing_prompt(kind, request, detail, fallback))
-        except ProviderError:
+        except ProviderError as exc:
+            logger.warning(
+                "gap-message phrasing failed (provider error: %s); using deterministic fallback",
+                exc,
+            )
             return None
         except Exception:  # pragma: no cover - defensive on the recovery path
-            logger.debug("gap-message phrasing failed", exc_info=True)
+            logger.warning(
+                "gap-message phrasing failed; using deterministic fallback",
+                exc_info=True,
+            )
             return None
-        return _sanitize_phrased_message(response.content)
+        sanitized, rejection = _sanitize_phrased_message(response.content)
+        if rejection is not None:
+            logger.warning(
+                "gap-message phrasing rejected (%s); using deterministic fallback",
+                rejection,
+            )
+        return sanitized
 
     return phrase
 
@@ -335,19 +348,20 @@ def _build_phrasing_prompt(
     )
 
 
-def _sanitize_phrased_message(content: str | None) -> str | None:
+def _sanitize_phrased_message(content: str | None) -> tuple[str | None, str | None]:
+    """Return ``(sanitized_text, rejection_category)``; exactly one is None."""
     text = (content or "").strip()
     if not text:
-        return None
+        return None, "empty"
     # Reject anything that looks like a JSON plan or fenced code rather than prose.
     if text[0] in "{[" or text.startswith("```"):
-        return None
+        return None, "json-or-fenced"
     if '"actions"' in text or '"assistant_message"' in text:
-        return None
+        return None, "plan-shaped"
     text = " ".join(text.split())
     if len(text) > _MAX_PHRASED_CHARS:
         text = text[:_MAX_PHRASED_CHARS].rsplit(" ", 1)[0].rstrip() + "…"
-    return text
+    return text, None
 
 
 def build_issue_body(report: CapabilityGapReport) -> str:

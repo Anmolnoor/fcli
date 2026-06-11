@@ -31,6 +31,7 @@ dependencies = [
   "prompt-toolkit>=3.0,<4.0",
   "rich>=13.7,<14.0",
   "typer>=0.12,<1.0",
+  "agent-task-contract",
 ]
 
 [project.optional-dependencies]
@@ -91,3 +92,6 @@ strict = true
 warn_unused_configs = true
 mypy_path = ["src"]
 packages = ["foundation"]
+
+[tool.uv.sources]
+agent-task-contract = { git = "https://github.com/Anmolnoor/agent-task-contract", tag = "v0.1.0" }
