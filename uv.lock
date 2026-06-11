@@ -3,6 +3,24 @@ revision = 3
 requires-python = "==3.12.*"
 
 [[package]]
+name = "agent-task-contract"
+version = "0.1.0"
+source = { editable = "../agent-task-contract" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=1.13" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.8" },
+]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -148,6 +166,7 @@ name = "foundation-cli"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "agent-task-contract" },
     { name = "click" },
     { name = "keyring" },
     { name = "pathspec" },
@@ -170,6 +189,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-task-contract", editable = "../agent-task-contract" },
     { name = "click", specifier = ">=8.0,<9.0" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=7.6,<8.0" },
     { name = "keyring", specifier = ">=25.5,<26.0" },
