@@ -30,6 +30,7 @@ from agent_task_contract import (
     CommandRecord,
     EventType,
     TaskState,
+    Usage,
     Verification,
     check_supported,
 )
@@ -39,7 +40,13 @@ from agent_task_contract import (
 from pydantic import ValidationError
 
 from foundation import __version__ as WORKER_VERSION
-from foundation.models import LoopStopReason, OrchestrationResult, UserRequest
+from foundation.models import (
+    LoopStopReason,
+    OrchestrationResult,
+    ProviderPrompt,
+    ProviderResponse,
+    UserRequest,
+)
 from foundation.observability import (
     EVENT_APPROVAL_REQUESTED,
     EVENT_ITERATION_COMPLETED,
@@ -280,6 +287,48 @@ def _registry_manifest_fingerprint(registry: CapabilityRegistry) -> str:
     return digest.hexdigest()
 
 
+class _MeteredProvider:
+    """Wrap a provider to meter per-task usage (G8): call count + token totals.
+
+    The contract reserves ``Usage`` in the result envelope; this fills it from
+    every ``complete`` call (planning *and* preflight review) so the supervisor
+    can answer cost per task. ``cost_usd`` stays None — turning tokens into
+    dollars needs a per-model price map, which is supervisor-side and later.
+    """
+
+    def __init__(self, inner: ProviderAdapter) -> None:
+        self._inner = inner
+        self._calls = 0
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._saw_tokens = False
+
+    def complete(self, prompt: ProviderPrompt) -> ProviderResponse:
+        response = self._inner.complete(prompt)
+        self._calls += 1
+        usage = response.metadata.usage
+        if usage is not None:
+            if usage.input_tokens is not None:
+                self._input_tokens += usage.input_tokens
+                self._saw_tokens = True
+            if usage.output_tokens is not None:
+                self._output_tokens += usage.output_tokens
+                self._saw_tokens = True
+        return response
+
+    def snapshot(self) -> Usage:
+        return Usage(
+            provider_calls=self._calls,
+            input_tokens=self._input_tokens if self._saw_tokens else None,
+            output_tokens=self._output_tokens if self._saw_tokens else None,
+            cost_usd=None,
+        )
+
+
+def _usage_snapshot(metered: _MeteredProvider | None) -> Usage | None:
+    return metered.snapshot() if metered is not None else None
+
+
 class _Finalizer:
     """Single-shot guard so the deadline thread and the main path never both finalize."""
 
@@ -338,6 +387,7 @@ def _finalize(
     changed_files: list[str],
     extra_artifacts: list[Artifact],
     terminal_reason: str | None = None,
+    usage: Usage | None = None,
 ) -> int:
     workspace = Path(task.workspace)
     terminal_payload: dict[str, Any] = {"status": status.value, "summary": summary}
@@ -361,6 +411,7 @@ def _finalize(
         commands=list(sink.commands),
         verification=verification,
         artifacts=[event_log, *extra_artifacts],
+        usage=usage,
     )
     _write_result(out_path, result)
     return _EXIT_BY_STATUS.get(status, EXIT_FAILED)
@@ -466,6 +517,7 @@ def run_headless_task(
         return _reject(f"task envelope failed validation: {exc}")
 
     workspace = Path(task.workspace).expanduser().resolve()
+    metered_provider: _MeteredProvider | None = None
     try:
         tool_service = LocalToolService(
             workspace_root=workspace,
@@ -491,6 +543,7 @@ def run_headless_task(
             max_entries=settings.history.max_entries,
         )
         resolved_provider = provider if provider is not None else build_provider_adapter(settings)
+        metered_provider = _MeteredProvider(resolved_provider)  # G8: per-task usage
 
         # Q8 true resume: a supervisor-granted approval verdict lets this run
         # proceed past the policy gate that previously stopped it. We use
@@ -506,7 +559,7 @@ def run_headless_task(
         orchestrator = RequestOrchestrator(
             workspace_root=workspace,
             approval_mode=approval_mode,
-            provider=resolved_provider,
+            provider=metered_provider,
             shell_runtime=shell_runtime,
             tool_service=tool_service,
             history_store=history_store,
@@ -531,6 +584,7 @@ def run_headless_task(
             changed_files=[],
             extra_artifacts=[],
             terminal_reason="worker_setup_failed",
+            usage=_usage_snapshot(metered_provider),
         )
 
     stream.emit(
@@ -567,6 +621,7 @@ def run_headless_task(
             changed_files=[],
             extra_artifacts=[],
             terminal_reason="wall_clock_exceeded",
+            usage=_usage_snapshot(metered_provider),
         )
         os._exit(exit_code)
 
@@ -596,6 +651,7 @@ def run_headless_task(
             changed_files=[],
             extra_artifacts=[],
             terminal_reason="exception",
+            usage=_usage_snapshot(metered_provider),
         )
 
     deadline.cancel()
@@ -632,4 +688,5 @@ def run_headless_task(
         verification=verification,
         changed_files=changed_files,
         extra_artifacts=extra_artifacts,
+        usage=_usage_snapshot(metered_provider),
     )

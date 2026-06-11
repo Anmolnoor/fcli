@@ -239,6 +239,11 @@ def test_happy_path_produces_contract_result_and_patch(
     verify_event = next(e for e in events if e.type.value == "verify.result")
     assert verify_event.payload["commands"] == ["pytest"]
 
+    # G8: the reserved usage block is populated — at least the provider-call count
+    # (the stub reports no tokens, so those stay None; cost is supervisor-side).
+    assert result.usage is not None
+    assert result.usage.provider_calls is not None and result.usage.provider_calls >= 1
+
     # Event-log artifact hash covers the file as written.
     event_log = next(a for a in result.artifacts if a.kind == "event_log")
     import hashlib
