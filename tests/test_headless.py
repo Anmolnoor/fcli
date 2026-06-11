@@ -306,6 +306,83 @@ def test_approval_required_action_ends_pending_approval(
     assert events[-1].payload["status"] == "pending_approval"
 
 
+def _gated_fix_provider() -> StubProvider:
+    """A benign, in-workspace action marked requires_approval (not a commit)."""
+    return StubProvider(
+        [
+            _provider_response(
+                {
+                    "assistant_message": "Applying the gated fix and verifying.",
+                    "actions": [
+                        {
+                            "id": "a1",
+                            "kind": "tool_call",
+                            "summary": "Apply the fix (approval-gated)",
+                            "requires_approval": True,
+                            "approval_reason": "policy gate the supervisor must clear",
+                            "tool_call": {
+                                "capability_id": "foundation.file.write",
+                                "arguments": {
+                                    "path": "existing.py",
+                                    "content": "value = 1\n",
+                                    "overwrite": True,
+                                },
+                            },
+                        },
+                        {
+                            "id": "a2",
+                            "kind": "shell",
+                            "summary": "Run the suite",
+                            "shell": {"command": "pytest"},
+                        },
+                    ],
+                }
+            ),
+            _provider_response({"assistant_message": "Fixed and verified.", "actions": []}),
+        ]
+    )
+
+
+def test_gated_action_without_verdict_stops_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q8 baseline: with no approval verdict the gate stops the run (v1 behaviour)."""
+    workspace = _git_workspace(tmp_path)
+    _install_fake_pytest(tmp_path, monkeypatch)
+
+    code, out_path, _ = _run(tmp_path, _gated_fix_provider(), _task_envelope(workspace))
+
+    assert code == EXIT_PENDING_APPROVAL
+    result = CodingWorkerResult.model_validate_json(out_path.read_text())
+    assert result.status is TaskState.PENDING_APPROVAL
+
+
+def test_resume_with_approval_verdict_proceeds_past_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q8 true resume: a granted verdict makes the SAME plan run to completion."""
+    workspace = _git_workspace(tmp_path)
+    _install_fake_pytest(tmp_path, monkeypatch)
+    envelope = _task_envelope(
+        workspace,
+        resume_of="01976e10-0000-7000-8000-0000000000aa",
+        approval_verdict={
+            "approved": True,
+            "actor": "anmol",
+            "ts": "2026-06-11T00:00:00Z",
+            "reason": "approved via review --approve",
+        },
+    )
+
+    code, out_path, _ = _run(tmp_path, _gated_fix_provider(), envelope)
+
+    assert code == EXIT_COMPLETED, "a granted approval verdict must let the gated plan proceed"
+    result = CodingWorkerResult.model_validate_json(out_path.read_text())
+    assert result.status is TaskState.COMPLETED
+    assert result.verification.outcome.value == "passed"
+    assert result.changed_files == ["existing.py"]
+
+
 def test_contract_version_skew_rejects_task(tmp_path: Path) -> None:
     workspace = _git_workspace(tmp_path)
     provider = StubProvider([])

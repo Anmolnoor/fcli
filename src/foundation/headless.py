@@ -492,9 +492,20 @@ def run_headless_task(
         )
         resolved_provider = provider if provider is not None else build_provider_adapter(settings)
 
+        # Q8 true resume: a supervisor-granted approval verdict lets this run
+        # proceed past the policy gate that previously stopped it. We use
+        # AUTO_EXCEPT_COMMIT (not blanket AUTO): commit, network, and
+        # outside-workspace actions still require explicit approval and will
+        # re-stop pending_approval — the resume is bounded, not a blank cheque.
+        # No verdict (a fresh task) keeps the v1 MANUAL behaviour.
+        resume_approved = task.approval_verdict is not None and task.approval_verdict.approved
+        approval_mode = (
+            ApprovalMode.AUTO_EXCEPT_COMMIT if resume_approved else ApprovalMode.MANUAL
+        )
+
         orchestrator = RequestOrchestrator(
             workspace_root=workspace,
-            approval_mode=ApprovalMode.MANUAL,
+            approval_mode=approval_mode,
             provider=resolved_provider,
             shell_runtime=shell_runtime,
             tool_service=tool_service,
