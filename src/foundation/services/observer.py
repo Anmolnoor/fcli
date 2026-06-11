@@ -28,7 +28,12 @@ from foundation.models import (
     TraceEdgeKind,
 )
 from foundation.models.trace import ExecutionStep, PlanningStep
-from foundation.observability import emit_event, emit_exception, redact_payload
+from foundation.observability import (
+    SINK_DISABLE_AFTER_CONSECUTIVE_FAILURES,
+    emit_event,
+    emit_exception,
+    redact_payload,
+)
 from foundation.services.capabilities import SHELL_CAPABILITY_ID, CapabilityRegistry
 from foundation.services.guardrails import POLICY_SNAPSHOT_VERSION
 from foundation.services.history import HistoryStore
@@ -51,18 +56,53 @@ class ObserverService:
         self._history_store = history_store
         self._capability_registry = capability_registry
         self._event_sink: EventSink | None = event_sink
+        self._sink_failure_count = 0
+        self._sink_consecutive_failures = 0
+        self._sink_disabled = False
 
     def set_event_sink(self, event_sink: EventSink | None) -> None:
         """Replace the event sink callback (or clear it with ``None``)."""
         self._event_sink = event_sink
+        self._sink_consecutive_failures = 0
+        self._sink_disabled = False
+
+    @property
+    def sink_failure_count(self) -> int:
+        """Total sink failures suppressed so far (for surfacing degradation)."""
+        return self._sink_failure_count
+
+    @property
+    def sink_disabled(self) -> bool:
+        """Whether the sink was disabled after repeated consecutive failures."""
+        return self._sink_disabled
 
     def _dispatch_to_sink(self, event_name: str, payload: Mapping[str, Any]) -> None:
-        if self._event_sink is None:
+        if self._event_sink is None or self._sink_disabled:
             return
         try:
             self._event_sink(event_name, payload)
-        except Exception:  # pragma: no cover - sink errors must not break runtime
-            logger.exception("event_sink raised; suppressing", extra={"event": event_name})
+        except Exception:
+            # A sink failure must never break the turn, but it must not be
+            # silent either: events are the audit surface.
+            self._sink_failure_count += 1
+            self._sink_consecutive_failures += 1
+            if self._sink_consecutive_failures >= SINK_DISABLE_AFTER_CONSECUTIVE_FAILURES:
+                self._sink_disabled = True
+                logger.warning(
+                    "event sink disabled after %d consecutive failures; further "
+                    "events will not reach monitor surfaces (event=%s)",
+                    self._sink_consecutive_failures,
+                    event_name,
+                    exc_info=True,
+                )
+            else:
+                logger.warning(
+                    "event sink failed; monitor surfaces may be missing events (event=%s)",
+                    event_name,
+                    exc_info=True,
+                )
+        else:
+            self._sink_consecutive_failures = 0
 
     def emit(
         self,

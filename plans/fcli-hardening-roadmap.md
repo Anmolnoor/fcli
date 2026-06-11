@@ -185,6 +185,19 @@ miss what the planner emits.
 
 ## Stage 4: Audit-Trail Failures Become Visible
 
+**Status: shipped 2026-06-10.** Scope notes vs the plan: `compose_event_sink`
+(the production fanout) already logged per-sink failures at WARNING, so the
+work focused on what was missing — failure counting and a disable-after-3
+breaker in both `ObserverService._dispatch_to_sink` and `compose_event_sink`
+(shared constant `SINK_DISABLE_AFTER_CONSECUTIVE_FAILURES` in
+`observability.py`), a catch-all in `EventLogWriter.write_event` that marks
+the session `write_truncated` in `sessions.jsonl` when the writer itself
+crashes, and WARNING-with-category logging for gap-phraser fallbacks
+(provider-error / empty / json-or-fenced / plan-shaped). Degradation is
+exposed via `ObserverService.sink_failure_count` / `.sink_disabled` for
+future CLI notices; a stderr notice was not wired into the turn result (kept
+out of scope to avoid touching the presenter mid-batch).
+
 ### Goal
 
 The trace/event pipeline is the project's accountability story, but failures

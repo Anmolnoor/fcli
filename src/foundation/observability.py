@@ -19,6 +19,11 @@ except Exception:  # pragma: no cover - optional dependency.
 
 STRUCTURED_LOG_SCHEMA_VERSION = "1.0.0"
 
+# After this many consecutive failures an event sink is disabled for the rest
+# of the session (with one final warning) so a flapping sink cannot spam logs.
+# Shared by ObserverService and compose_event_sink.
+SINK_DISABLE_AFTER_CONSECUTIVE_FAILURES = 3
+
 EVENT_SESSION_START = "session_start"
 EVENT_SESSION_END = "session_end"
 EVENT_USER_REQUEST = "user_request"
