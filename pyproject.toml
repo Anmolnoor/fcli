@@ -94,7 +94,4 @@ mypy_path = ["src"]
 packages = ["foundation"]
 
 [tool.uv.sources]
-# v3 dev consumes the contract from the local sibling checkout (branch v0.2),
-# because v0.2.0 is not yet tagged/pushed. Re-pin to the pushed tag at publish:
-#   agent-task-contract = { git = "https://github.com/Anmolnoor/agent-task-contract", tag = "v0.2.0" }
-agent-task-contract = { path = "../agent-task-contract", editable = true }
+agent-task-contract = { git = "https://github.com/Anmolnoor/agent-task-contract", tag = "v0.2.0" }
